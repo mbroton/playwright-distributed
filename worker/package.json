@@ -15,7 +15,7 @@
   "dependencies": {
     "dotenv": "^17.2.0",
     "playwright": "1.55.0",
-    "redis": "^4.6.15",
+    "redis": "^5.8.2",
     "zod": "^4.0.5"
   }
 }
