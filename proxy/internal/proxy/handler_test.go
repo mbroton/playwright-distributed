@@ -492,7 +492,7 @@ func TestProxyHandler_BackendDialFailure(t *testing.T) {
 	}
 }
 
-func TestProxyHandler_WebSocketUpgradeFailureDoesNotIncreaseCounters(t *testing.T) {
+func TestProxyHandler_WebSocketUpgradeFailureRollsBackCounters(t *testing.T) {
 	atomic.StoreInt64(&activeConnections, 0)
 	t.Cleanup(func() {
 		atomic.StoreInt64(&activeConnections, 0)
@@ -510,13 +510,18 @@ func TestProxyHandler_WebSocketUpgradeFailureDoesNotIncreaseCounters(t *testing.
 
 	workerEndpoint := "ws" + strings.TrimPrefix(backend.URL, "http")
 
-	modifyCalls := make(chan int64, 1)
+	activeRollbacks := make(chan int64, 1)
+	lifetimeRollbacks := make(chan int64, 1)
 	fake := &fakeRedisClient{
 		selectWorkerFunc: func(ctx context.Context, browserType string) (redis.ServerInfo, error) {
 			return redis.ServerInfo{ID: "worker-1", Endpoint: workerEndpoint}, nil
 		},
 		modifyActiveConnectionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
-			modifyCalls <- delta
+			activeRollbacks <- delta
+			return nil
+		},
+		modifyLifetimeConnectionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
+			lifetimeRollbacks <- delta
 			return nil
 		},
 	}
@@ -537,9 +542,21 @@ func TestProxyHandler_WebSocketUpgradeFailureDoesNotIncreaseCounters(t *testing.
 	}
 
 	select {
-	case delta := <-modifyCalls:
-		t.Fatalf("ModifyActiveConnections should not be called, got delta %d", delta)
-	default:
+	case delta := <-activeRollbacks:
+		if delta != -1 {
+			t.Fatalf("expected ModifyActiveConnections rollback delta -1, got %d", delta)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected ModifyActiveConnections rollback")
+	}
+
+	select {
+	case delta := <-lifetimeRollbacks:
+		if delta != -1 {
+			t.Fatalf("expected ModifyLifetimeConnections rollback delta -1, got %d", delta)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected ModifyLifetimeConnections rollback")
 	}
 }
 
