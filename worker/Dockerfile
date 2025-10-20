@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/playwright:v1.56.0
+FROM mcr.microsoft.com/playwright:v1.56.1
 
 WORKDIR /browser_server
 
