@@ -9,6 +9,10 @@ services:
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+      # Optional: Redis password authentication
+      # - REDIS_PASSWORD=yourpassword
+      # Optional: Enable TLS for secure connections (managed Redis with public certs)
+      # - REDIS_TLS=true
       - LOG_LEVEL=info
       - LOG_FORMAT=text
       # Maximum number of concurrent browser sessions allowed
@@ -25,6 +29,7 @@ services:
       context: ./worker
       dockerfile: Dockerfile
     environment:
+      # For password + TLS: redis://[:password@]host:port or rediss://[:password@]host:port (note double 's')
       - REDIS_URL=redis://redis:6379
       # Port for the worker to listen on for browser connections
       - PORT=3131

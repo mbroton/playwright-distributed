@@ -2,6 +2,7 @@ package redis
 
 import (
 	"context"
+	"crypto/tls"
 	_ "embed"
 	"errors"
 	"fmt"
@@ -34,9 +35,19 @@ type Client struct {
 }
 
 func NewClient(cfg *config.Config) (*Client, error) {
-	rd := redis.NewClient(&redis.Options{
-		Addr: fmt.Sprintf("%s:%d", cfg.RedisHost, cfg.RedisPort),
-	})
+	opts := &redis.Options{
+		Addr:     fmt.Sprintf("%s:%d", cfg.RedisHost, cfg.RedisPort),
+		Password: cfg.RedisPassword, // empty string = no auth
+	}
+
+	// Enable TLS if configured (uses system CA pool for public certificates)
+	if cfg.RedisTLS {
+		opts.TLSConfig = &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		}
+	}
+
+	rd := redis.NewClient(opts)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -45,7 +56,11 @@ func NewClient(cfg *config.Config) (*Client, error) {
 		return nil, fmt.Errorf("failed to connect to Redis: %w", err)
 	}
 
-	logger.Info("Connected to Redis")
+	if cfg.RedisTLS {
+		logger.Info("Connected to Redis with TLS enabled")
+	} else {
+		logger.Info("Connected to Redis")
+	}
 
 	selector := redis.NewScript(selectorScriptSource)
 	reaper := redis.NewScript(reaperScriptSource)
