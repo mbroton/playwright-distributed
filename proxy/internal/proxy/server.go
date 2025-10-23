@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"proxy/internal/models"
 	"proxy/internal/redis"

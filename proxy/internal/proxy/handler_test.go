@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -63,8 +64,9 @@ func (f *fakeRedisClient) ModifyLifetimeConnections(ctx context.Context, serverI
 
 func newTestConfig() *config.Config {
 	return &config.Config{
-		DefaultBrowserType:  "chromium",
-		WorkerSelectTimeout: 0,
+		DefaultBrowserType:    "chromium",
+		WorkerSelectTimeout:   0,
+		MaxConnectionAttempts: 3,
 	}
 }
 
@@ -431,9 +433,11 @@ func TestProxyHandler_SuccessfulConnectionLifecycle(t *testing.T) {
 }
 
 func TestProxyHandler_BackendDialFailure(t *testing.T) {
+	cfg := newTestConfig()
+
 	shutdownCalled := make(chan struct{}, 1)
-	modifyActiveCalls := make(chan int64, 1)
-	modifyLifetimeCalls := make(chan int64, 1)
+	modifyActiveCalls := make(chan int64, cfg.MaxConnectionAttempts)
+	modifyLifetimeCalls := make(chan int64, cfg.MaxConnectionAttempts)
 
 	fake := &fakeRedisClient{
 		selectWorkerFunc: func(ctx context.Context, browserType string) (redis.ServerInfo, error) {
@@ -452,7 +456,7 @@ func TestProxyHandler_BackendDialFailure(t *testing.T) {
 		},
 	}
 
-	handler := proxyHandler(fake, newTestConfig())
+	handler := proxyHandler(fake, cfg)
 
 	req := httptest.NewRequest("GET", "/", nil)
 	req.Header.Set("Connection", "Upgrade")
@@ -476,22 +480,43 @@ func TestProxyHandler_BackendDialFailure(t *testing.T) {
 		// Expected: shutdown should not be triggered
 	}
 
+	// Verify we get exactly cfg.MaxConnectionAttempts rollback calls for active connections
+	for i := 0; i < cfg.MaxConnectionAttempts; i++ {
+		select {
+		case delta := <-modifyActiveCalls:
+			if delta != -1 {
+				t.Fatalf("expected ModifyActiveConnections delta -1 on attempt %d, got %d", i+1, delta)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("expected ModifyActiveConnections rollback for attempt %d", i+1)
+		}
+	}
+
+	// Verify we get exactly cfg.MaxConnectionAttempts rollback calls for lifetime connections
+	for i := 0; i < cfg.MaxConnectionAttempts; i++ {
+		select {
+		case delta := <-modifyLifetimeCalls:
+			if delta != -1 {
+				t.Fatalf("expected ModifyLifetimeConnections delta -1 on attempt %d, got %d", i+1, delta)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("expected ModifyLifetimeConnections rollback for attempt %d", i+1)
+		}
+	}
+
+	// Verify no unexpected extra calls
 	select {
 	case delta := <-modifyActiveCalls:
-		if delta != -1 {
-			t.Fatalf("expected ModifyActiveConnections delta -1, got %d", delta)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("expected ModifyActiveConnections rollback")
+		t.Fatalf("unexpected extra ModifyActiveConnections call with delta %d", delta)
+	case <-time.After(100 * time.Millisecond):
+		// Expected: no more calls
 	}
 
 	select {
 	case delta := <-modifyLifetimeCalls:
-		if delta != -1 {
-			t.Fatalf("expected ModifyLifetimeConnections delta -1, got %d", delta)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("expected ModifyLifetimeConnections rollback")
+		t.Fatalf("unexpected extra ModifyLifetimeConnections call with delta %d", delta)
+	case <-time.After(100 * time.Millisecond):
+		// Expected: no more calls
 	}
 }
 
@@ -882,4 +907,286 @@ func (s *stubReaperClient) callCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.calls
+}
+
+func TestSelectAndConnectWorker_SuccessFirstAttempt(t *testing.T) {
+	backendUpgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := backendUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("backend upgrade failed: %v", err)
+			return
+		}
+		conn.Close()
+	}))
+	defer backend.Close()
+
+	workerEndpoint := "ws" + strings.TrimPrefix(backend.URL, "http")
+
+	fake := &fakeRedisClient{
+		selectWorkerFunc: func(ctx context.Context, browserType string) (redis.ServerInfo, error) {
+			return redis.ServerInfo{ID: "worker-1", BrowserType: "chromium", Endpoint: workerEndpoint}, nil
+		},
+	}
+
+	ctx := context.Background()
+	server, conn, err := selectAndConnectWorker(ctx, fake, time.Second, "chromium", 3)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer conn.Close()
+
+	if server.ID != "worker-1" {
+		t.Fatalf("expected worker ID 'worker-1', got %s", server.ID)
+	}
+}
+
+func TestSelectAndConnectWorker_SuccessSecondAttempt(t *testing.T) {
+	backendUpgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	goodBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := backendUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("backend upgrade failed: %v", err)
+			return
+		}
+		conn.Close()
+	}))
+	defer goodBackend.Close()
+
+	goodEndpoint := "ws" + strings.TrimPrefix(goodBackend.URL, "http")
+	badEndpoint := "ws://127.0.0.1:1" // unreachable
+
+	attempts := 0
+	activeRollbacks := make(chan int64, 2)
+	lifetimeRollbacks := make(chan int64, 2)
+
+	fake := &fakeRedisClient{
+		selectWorkerFunc: func(ctx context.Context, browserType string) (redis.ServerInfo, error) {
+			attempts++
+			if attempts == 1 {
+				return redis.ServerInfo{ID: "bad-worker", BrowserType: "chromium", Endpoint: badEndpoint}, nil
+			}
+			return redis.ServerInfo{ID: "good-worker", BrowserType: "chromium", Endpoint: goodEndpoint}, nil
+		},
+		modifyActiveConnectionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
+			activeRollbacks <- delta
+			return nil
+		},
+		modifyLifetimeConnectionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
+			lifetimeRollbacks <- delta
+			return nil
+		},
+	}
+
+	ctx := context.Background()
+	server, conn, err := selectAndConnectWorker(ctx, fake, time.Second, "chromium", 3)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer conn.Close()
+
+	if server.ID != "good-worker" {
+		t.Fatalf("expected worker ID 'good-worker', got %s", server.ID)
+	}
+
+	// Verify rollback was called for the failed worker
+	select {
+	case delta := <-activeRollbacks:
+		if delta != -1 {
+			t.Fatalf("expected ModifyActiveConnections delta -1, got %d", delta)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected ModifyActiveConnections rollback")
+	}
+
+	select {
+	case delta := <-lifetimeRollbacks:
+		if delta != -1 {
+			t.Fatalf("expected ModifyLifetimeConnections delta -1, got %d", delta)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected ModifyLifetimeConnections rollback")
+	}
+}
+
+func TestSelectAndConnectWorker_SuccessThirdAttempt(t *testing.T) {
+	backendUpgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	goodBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := backendUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("backend upgrade failed: %v", err)
+			return
+		}
+		conn.Close()
+	}))
+	defer goodBackend.Close()
+
+	goodEndpoint := "ws" + strings.TrimPrefix(goodBackend.URL, "http")
+	badEndpoint := "ws://127.0.0.1:1" // unreachable
+
+	attempts := 0
+	rollbackCount := int32(0)
+
+	fake := &fakeRedisClient{
+		selectWorkerFunc: func(ctx context.Context, browserType string) (redis.ServerInfo, error) {
+			attempts++
+			if attempts <= 2 {
+				return redis.ServerInfo{ID: fmt.Sprintf("bad-worker-%d", attempts), BrowserType: "chromium", Endpoint: badEndpoint}, nil
+			}
+			return redis.ServerInfo{ID: "good-worker", BrowserType: "chromium", Endpoint: goodEndpoint}, nil
+		},
+		modifyActiveConnectionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
+			atomic.AddInt32(&rollbackCount, 1)
+			return nil
+		},
+		modifyLifetimeConnectionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
+			atomic.AddInt32(&rollbackCount, 1)
+			return nil
+		},
+	}
+
+	ctx := context.Background()
+	server, conn, err := selectAndConnectWorker(ctx, fake, time.Second, "chromium", 3)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer conn.Close()
+
+	if server.ID != "good-worker" {
+		t.Fatalf("expected worker ID 'good-worker', got %s", server.ID)
+	}
+
+	// Should have rolled back 2 failed workers (2 workers × 2 counters each = 4 rollbacks)
+	if got := atomic.LoadInt32(&rollbackCount); got != 4 {
+		t.Fatalf("expected 4 rollback calls (2 workers × 2 counters), got %d", got)
+	}
+}
+
+func TestSelectAndConnectWorker_AllAttemptsFail(t *testing.T) {
+	badEndpoint := "ws://127.0.0.1:1" // unreachable
+
+	attempts := 0
+	rollbackCount := int32(0)
+
+	fake := &fakeRedisClient{
+		selectWorkerFunc: func(ctx context.Context, browserType string) (redis.ServerInfo, error) {
+			attempts++
+			return redis.ServerInfo{ID: fmt.Sprintf("worker-%d", attempts), BrowserType: "chromium", Endpoint: badEndpoint}, nil
+		},
+		modifyActiveConnectionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
+			atomic.AddInt32(&rollbackCount, 1)
+			return nil
+		},
+		modifyLifetimeConnectionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
+			atomic.AddInt32(&rollbackCount, 1)
+			return nil
+		},
+	}
+
+	ctx := context.Background()
+	_, _, err := selectAndConnectWorker(ctx, fake, time.Second, "chromium", 3)
+	if err == nil {
+		t.Fatal("expected error when all attempts fail, got nil")
+	}
+
+	expectedMsg := "failed to connect to any worker after 3 attempts"
+	if !strings.Contains(err.Error(), expectedMsg) {
+		t.Fatalf("expected error to contain %q, got %q", expectedMsg, err.Error())
+	}
+
+	// Should have attempted 3 workers
+	if attempts != 3 {
+		t.Fatalf("expected 3 selection attempts, got %d", attempts)
+	}
+
+	// Should have rolled back all 3 failed workers (3 workers × 2 counters each = 6 rollbacks)
+	if got := atomic.LoadInt32(&rollbackCount); got != 6 {
+		t.Fatalf("expected 6 rollback calls (3 workers × 2 counters), got %d", got)
+	}
+}
+
+func TestSelectAndConnectWorker_NoWorkersAvailable(t *testing.T) {
+	fake := &fakeRedisClient{
+		selectWorkerFunc: func(ctx context.Context, browserType string) (redis.ServerInfo, error) {
+			return redis.ServerInfo{}, redis.ErrNoAvailableWorkers
+		},
+	}
+
+	ctx := context.Background()
+	_, _, err := selectAndConnectWorker(ctx, fake, time.Second, "chromium", 3)
+	if !errors.Is(err, redis.ErrNoAvailableWorkers) {
+		t.Fatalf("expected ErrNoAvailableWorkers, got %v", err)
+	}
+}
+
+func TestSelectAndConnectWorker_CountersRolledBackForEachFailure(t *testing.T) {
+	badEndpoint := "ws://127.0.0.1:1" // unreachable
+
+	type rollbackCall struct {
+		workerID string
+		delta    int64
+	}
+
+	activeRollbacks := make(chan rollbackCall, 10)
+	lifetimeRollbacks := make(chan rollbackCall, 10)
+
+	attempts := 0
+	fake := &fakeRedisClient{
+		selectWorkerFunc: func(ctx context.Context, browserType string) (redis.ServerInfo, error) {
+			attempts++
+			return redis.ServerInfo{ID: fmt.Sprintf("worker-%d", attempts), BrowserType: "chromium", Endpoint: badEndpoint}, nil
+		},
+		modifyActiveConnectionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
+			activeRollbacks <- rollbackCall{workerID: serverInfo.WorkerID(), delta: delta}
+			return nil
+		},
+		modifyLifetimeConnectionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
+			lifetimeRollbacks <- rollbackCall{workerID: serverInfo.WorkerID(), delta: delta}
+			return nil
+		},
+	}
+
+	ctx := context.Background()
+	_, _, err := selectAndConnectWorker(ctx, fake, time.Second, "chromium", 2)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	// Verify rollbacks for worker-1
+	select {
+	case call := <-activeRollbacks:
+		if call.workerID != "chromium:worker-1" || call.delta != -1 {
+			t.Fatalf("expected worker-1 active rollback -1, got %+v", call)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected active rollback for worker-1")
+	}
+
+	select {
+	case call := <-lifetimeRollbacks:
+		if call.workerID != "chromium:worker-1" || call.delta != -1 {
+			t.Fatalf("expected worker-1 lifetime rollback -1, got %+v", call)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected lifetime rollback for worker-1")
+	}
+
+	// Verify rollbacks for worker-2
+	select {
+	case call := <-activeRollbacks:
+		if call.workerID != "chromium:worker-2" || call.delta != -1 {
+			t.Fatalf("expected worker-2 active rollback -1, got %+v", call)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected active rollback for worker-2")
+	}
+
+	select {
+	case call := <-lifetimeRollbacks:
+		if call.workerID != "chromium:worker-2" || call.delta != -1 {
+			t.Fatalf("expected worker-2 lifetime rollback -1, got %+v", call)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected lifetime rollback for worker-2")
+	}
 }

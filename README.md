@@ -73,7 +73,7 @@ That's it! The same `ws://localhost:8080` endpoint works with any Playwright cli
 | **Web scraping / data collection** | Crawl at scale; add workers to raise throughput, remove them to save money. |
 | **CI end-to-end tests** | Parallelise test runs across many browsers and cut build times dramatically. |
 | **Synthetic monitoring** | Continuously exercise critical user journeys from multiple regions. |
-| **Shared “browser-as-a-service”** | One endpoint for your whole team – no more local browser zoo. |
+| **Shared "browser-as-a-service"** | One endpoint for your whole team – no more local browser zoo. |
 
 
 ## ⚙️ Production Deployment
@@ -173,6 +173,26 @@ flowchart TD
 2. **Concurrent sessions** – each worker serves several contexts in parallel.
 3. **Recycling** – after serving a configurable number of sessions the worker shuts down; Docker/K8s restarts it, guaranteeing a fresh browser.
 4. **Smart worker selection** – the proxy's algorithm keeps workers from hitting their restart threshold at the same time and still favours the busiest eligible worker.
+
+
+## ⚙️ Configuration
+
+The proxy and workers can be configured via environment variables. All settings have sensible defaults for local development.
+
+### Proxy Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `REDIS_HOST` | `localhost` | Redis server hostname |
+| `REDIS_PORT` | `6379` | Redis server port |
+| `REDIS_PASSWORD` | `""` | Redis password (empty = no auth) |
+| `REDIS_TLS` | `false` | Enable TLS for Redis connection |
+| `MAX_CONNECTION_ATTEMPTS` | `3` | Number of worker connection attempts before failing |
+| `MAX_CONCURRENT_SESSIONS` | `5` | Maximum concurrent sessions per worker |
+| `MAX_LIFETIME_SESSIONS` | `50` | Maximum sessions before worker restart |
+| `WORKER_SELECT_TIMEOUT` | `5` | Worker selection timeout (seconds) |
+
+> **Note:** For production deployments with managed Redis services (AWS ElastiCache, Azure Cache, etc.), you can optionally enable `REDIS_TLS=true` and `REDIS_PASSWORD` to harden your Redis connection. Many deployments run Redis in trusted networks without these settings.
 
 
 ## 🗺️ Roadmap

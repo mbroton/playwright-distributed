@@ -11,6 +11,7 @@ type Config struct {
 	RedisPort             int    `mapstructure:"REDIS_PORT"`
 	MaxConcurrentSessions int    `mapstructure:"MAX_CONCURRENT_SESSIONS"`
 	MaxLifetimeSessions   int    `mapstructure:"MAX_LIFETIME_SESSIONS"`
+	MaxConnectionAttempts int    `mapstructure:"MAX_CONNECTION_ATTEMPTS"`
 	ReaperRunInterval     int    `mapstructure:"REAPER_RUN_INTERVAL"`
 	ShutdownCommandTTL    int    `mapstructure:"SHUTDOWN_COMMAND_TTL"`
 	WorkerSelectTimeout   int    `mapstructure:"WORKER_SELECT_TIMEOUT"`
@@ -26,6 +27,7 @@ func LoadConfig() (*Config, error) {
 	viper.BindEnv("LOG_FORMAT")
 	viper.BindEnv("MAX_CONCURRENT_SESSIONS")
 	viper.BindEnv("MAX_LIFETIME_SESSIONS")
+	viper.BindEnv("MAX_CONNECTION_ATTEMPTS")
 	viper.BindEnv("REAPER_RUN_INTERVAL")
 	viper.BindEnv("SHUTDOWN_COMMAND_TTL")
 	viper.BindEnv("WORKER_SELECT_TIMEOUT")
@@ -33,6 +35,7 @@ func LoadConfig() (*Config, error) {
 
 	viper.SetDefault("MAX_CONCURRENT_SESSIONS", 5)
 	viper.SetDefault("MAX_LIFETIME_SESSIONS", 50)
+	viper.SetDefault("MAX_CONNECTION_ATTEMPTS", 3)
 	viper.SetDefault("REAPER_RUN_INTERVAL", 300)
 	viper.SetDefault("SHUTDOWN_COMMAND_TTL", 60)
 	viper.SetDefault("WORKER_SELECT_TIMEOUT", 5)

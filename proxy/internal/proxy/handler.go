@@ -72,6 +72,54 @@ func selectWorkerWithRetry(ctx context.Context, rd redisClient, timeout time.Dur
 	}
 }
 
+func selectAndConnectWorker(ctx context.Context, rd redisClient, timeout time.Duration, browserType string, maxAttempts int) (redis.ServerInfo, *websocket.Conn, error) {
+	var lastErr error
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		// Select a worker from the pool
+		server, err := selectWorkerWithRetry(ctx, rd, timeout, browserType)
+		if err != nil {
+			// No workers available at all - no point retrying
+			return redis.ServerInfo{}, nil, err
+		}
+
+		// Attempt to connect to the selected worker
+		backendURL, _ := url.Parse(server.Endpoint)
+		serverConn, _, err := websocket.DefaultDialer.Dial(backendURL.String(), nil)
+		if err == nil {
+			// Success!
+			if attempt > 1 {
+				logger.Info("Successfully connected to worker %s on attempt %d/%d", server.WorkerID(), attempt, maxAttempts)
+			}
+			return server, serverConn, nil
+		}
+
+		// Connection failed - log and rollback counters
+		lastErr = err
+		logger.Error(
+			"Failed to connect to worker %s (attempt %d/%d): %v",
+			server.WorkerID(),
+			attempt,
+			maxAttempts,
+			err,
+		)
+		rollbackWorkerCounters(ctx, rd, &server)
+
+		// If we have more attempts, log that we're retrying
+		if attempt < maxAttempts {
+			logger.Info("Retrying with a different worker...")
+		}
+	}
+
+	// All attempts exhausted
+	logger.Error(
+		"Exhausted all %d connection attempts. Last error: %v",
+		maxAttempts,
+		lastErr,
+	)
+	return redis.ServerInfo{}, nil, fmt.Errorf("failed to connect to any worker after %d attempts: %w", maxAttempts, lastErr)
+}
+
 func proxyHandler(rd redisClient, cfg *config.Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
@@ -101,7 +149,7 @@ func proxyHandler(rd redisClient, cfg *config.Config) http.HandlerFunc {
 		}
 
 		timeout := time.Duration(cfg.WorkerSelectTimeout) * time.Second
-		server, err := selectWorkerWithRetry(r.Context(), rd, timeout, browserType)
+		server, serverConn, err := selectAndConnectWorker(r.Context(), rd, timeout, browserType, cfg.MaxConnectionAttempts)
 		if err != nil {
 			if errors.Is(err, redis.ErrNoAvailableWorkers) {
 				logger.Error(
@@ -113,21 +161,12 @@ func proxyHandler(rd redisClient, cfg *config.Config) http.HandlerFunc {
 				httputils.ErrorResponse(w, http.StatusServiceUnavailable, "No available servers")
 			} else {
 				logger.Error(
-					"Connection from %s rejected. An unexpected error occurred while selecting a worker: %v",
+					"Connection from %s rejected. Failed to connect to any worker: %v",
 					r.RemoteAddr,
 					err,
 				)
-				httputils.ErrorResponse(w, http.StatusInternalServerError, "An internal error occurred")
+				httputils.ErrorResponse(w, http.StatusInternalServerError, "Browser server error")
 			}
-			return
-		}
-
-		backendURL, _ := url.Parse(server.Endpoint)
-		serverConn, _, err := websocket.DefaultDialer.Dial(backendURL.String(), nil)
-		if err != nil {
-			logger.Error("Connection from %s rejected. Failed to connect to browser server: %v", r.RemoteAddr, err)
-			rollbackWorkerCounters(r.Context(), rd, &server)
-			httputils.ErrorResponse(w, http.StatusInternalServerError, "Browser server error")
 			return
 		}
 		defer serverConn.Close()

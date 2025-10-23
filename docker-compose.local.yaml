@@ -11,10 +11,13 @@ services:
       - REDIS_PORT=6379
       - LOG_LEVEL=info
       - LOG_FORMAT=text
-      # Maximum number of concurrent browser sessions allowed
+      # Maximum number of concurrent browser sessions allowed per worker
       - MAX_CONCURRENT_SESSIONS=5
       # Maximum number of sessions a worker will handle before it is recycled. The proxy tracks this for each worker.
       - MAX_LIFETIME_SESSIONS=50
+      # Maximum number of connection attempts to different workers before returning an error to the client (default: 3)
+      # If the first selected worker fails to connect, the proxy will automatically try up to this many workers before giving up
+      - MAX_CONNECTION_ATTEMPTS=3
     ports:
       - "8080:8080"
     depends_on:
