@@ -16,12 +16,12 @@
 
 `node scripts/check-playwright-version.js` verifies that `worker/package.json` and `worker/Dockerfile` use the same Playwright version.
 
-`cd worker && npm run start` runs a worker directly once `REDIS_URL`, `PORT`, and related env vars are set.
+`cd worker && npm run start` runs a worker directly once `REDIS_URL`, `PORT`, and related env vars are set, but host-native startup also requires matching Playwright browser binaries to already be installed outside this repo.
 
 ## Coding Style & Naming Conventions
 Follow existing language conventions rather than introducing repo-wide tooling. Go code should stay `gofmt`-clean, use lowercase package names, and keep `internal/` boundaries intact. TypeScript uses ES modules, explicit `.js` import suffixes, strict typing, and 4-space indentation. Use `PascalCase` for types/classes, `camelCase` for functions and variables, and uppercase names for env vars.
 
-Keep Playwright versions synchronized across `worker/package.json` and `worker/Dockerfile`; CI enforces this.
+Keep the worker Playwright package version synchronized across `worker/package.json` and `worker/Dockerfile`; CI enforces this.
 
 ## Testing Guidelines
 Add Go tests beside the code they cover as `*_test.go`. Prefer table-driven tests for handler and selection logic. CI currently checks proxy tests, Docker image builds, and Playwright version sync; there is no dedicated worker unit suite yet, so worker changes should include a manual smoke test with `docker-compose.local.yaml`.

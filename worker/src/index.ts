@@ -1,4 +1,4 @@
-import { chromium, firefox, webkit, type BrowserServer } from 'playwright';
+import { chromium, firefox, webkit, type BrowserServer } from 'playwright-core';
 import { createClient, type RedisClientType } from 'redis';
 import { loadConfig } from './config.js';
 import type { WorkerConfig } from './config.js';
@@ -395,4 +395,4 @@ if (process.argv[1] === new URL(import.meta.url).pathname) {
         }));
         process.exit(1);
     });
-} 
+}
