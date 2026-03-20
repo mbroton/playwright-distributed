@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
 /**
- * Ensures the Playwright version declared in worker/package.json matches
- * the Playwright image tag used in worker/Dockerfile.
+ * Ensures the Playwright package version declared in worker/package.json
+ * matches the Playwright image tag used in worker/Dockerfile.
  */
 
 const { readFileSync } = require('node:fs');
@@ -28,18 +28,21 @@ function getDockerfileVersion() {
 function getPackageJsonVersion() {
   const pkg = JSON.parse(readFileSync(packageJsonPath, 'utf-8'));
   const version =
+    pkg.dependencies?.['playwright-core'] ??
+    pkg.devDependencies?.['playwright-core'] ??
+    pkg.peerDependencies?.['playwright-core'] ??
     pkg.dependencies?.playwright ??
     pkg.devDependencies?.playwright ??
     pkg.peerDependencies?.playwright;
 
   if (!version) {
-    throw new Error(`Playwright dependency not found in ${packageJsonPath}`);
+    throw new Error(`Playwright package dependency not found in ${packageJsonPath}`);
   }
 
   const versionMatch = String(version).match(/(\d+\.\d+\.\d+)/);
 
   if (!versionMatch) {
-    throw new Error(`Unable to parse Playwright version "${version}" from ${packageJsonPath}`);
+    throw new Error(`Unable to parse Playwright package version "${version}" from ${packageJsonPath}`);
   }
 
   return versionMatch[1];

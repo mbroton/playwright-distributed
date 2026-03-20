@@ -80,6 +80,7 @@ That's it! The same `ws://localhost:8080` endpoint works with any Playwright cli
 
 Run each component (proxy, Redis, workers) as independent services (Docker/K8s). Checklist:
 
+- **Worker runtime** – workers are intended to run in the official Playwright Docker image. If you run `worker/` directly on a host instead, install matching Playwright browser binaries separately.
 - **Networking**
   - Workers ➜ Redis (register, heartbeats)
   - Proxy ➜ Redis (worker discovery)
