@@ -1,4 +1,7 @@
 .env
 node_modules/
 *.log
-__*
+examples/
+.*cache
+.DS_Store
+__*.sh
