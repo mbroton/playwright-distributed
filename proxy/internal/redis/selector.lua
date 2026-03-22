@@ -5,14 +5,13 @@
 
 local max_concurrent_sessions = tonumber(ARGV[1])
 local max_lifetime_sessions = tonumber(ARGV[2])
--- Require a valid browser type argument
+-- Require a non-empty browser type argument. Unknown types naturally yield no matches.
 local browser_type = nil
 if ARGV[3] ~= nil and tostring(ARGV[3]) ~= '' then
     browser_type = tostring(ARGV[3])
 end
 
--- Only allow known types; if missing or unknown, treat as no available workers
-if browser_type ~= 'chromium' and browser_type ~= 'firefox' and browser_type ~= 'webkit' then
+if browser_type == nil then
     return nil
 end
 

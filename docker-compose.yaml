@@ -13,6 +13,14 @@ services:
       - MAX_CONCURRENT_SESSIONS=5
       # Maximum number of sessions a worker will handle before it is recycled. The proxy tracks this for each worker.
       - MAX_LIFETIME_SESSIONS=50
+      # Maximum time to read client request headers before the proxy handler runs.
+      - PROXY_READ_HEADER_TIMEOUT=5
+      # Maximum time to keep retrying until a matching worker becomes available.
+      - PROXY_WORKER_SELECTION_TIMEOUT=5
+      # Maximum time to finish backend dial and client upgrade after a worker is selected.
+      - PROXY_CONNECT_TIMEOUT=5
+      # Browser used when the client omits ?browser=
+      - DEFAULT_BROWSER_TYPE=chromium
     ports:
       - "8080:8080"
     depends_on:
