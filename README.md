@@ -18,7 +18,7 @@
 ## Why use playwright-distributed?
 - Single WebSocket endpoint routes each session through a smart selector that balances load *and* staggers worker restarts.
 - Warm browser instances (Chrome, Firefox, WebKit) - no waiting for browser startup.
-- Each connection gets a fresh, isolated browser context.
+- Each client connection gets isolated browser state while keeping normal Playwright APIs like `browser.newContext()` and `browser.newPage()`.
 - Stateless design: add or remove workers at any time; Redis is the only shared component.
 - Works with any Playwright client.
 
@@ -64,6 +64,37 @@ await browser.close();
 > Want Firefox or WebKit? Append `?browser=firefox` or `?browser=webkit` to the WebSocket URL and use the matching Playwright client (`p.firefox.connect`, `p.webkit.connect`, etc.).
 That's it! The same `ws://localhost:8080` endpoint works with any Playwright client (Node.js, Python, Java, .NET, etc.).
 
+## 🔌 Connect Contract
+
+- Connect to `GET /` over WebSocket.
+- The only supported query parameter is `browser=chromium|firefox|webkit`.
+- If `browser` is omitted, the proxy uses `DEFAULT_BROWSER_TYPE`, which defaults to `chromium`.
+- Use the matching Playwright client for the browser you request.
+- A successful `connect()` returns a normal Playwright `Browser`. Create contexts with `browser.newContext()` or use `browser.newPage()` as the single-page convenience path.
+- Contexts created through one client connection are isolated from other client connections.
+- `PROXY_READ_HEADER_TIMEOUT` limits how long the server waits for request headers.
+- `PROXY_WORKER_SELECTION_TIMEOUT` is the main queue-wait timeout: if no matching worker is eligible on a given attempt, the proxy keeps retrying until this timeout expires.
+- `PROXY_CONNECT_TIMEOUT` starts only after a worker is selected and covers backend worker dial plus the client handshake response write.
+- Breaking change: `PROXY_CONNECT_TIMEOUT` no longer means the whole pre-upgrade path.
+- Proxy-owned failures are returned as JSON until the client WebSocket upgrade begins:
+
+```json
+{"error":{"code":503,"message":"worker selection timed out"}}
+```
+
+- Stable JSON error messages are:
+  - `unsupported browser; allowed values: chromium, firefox, webkit`
+  - `unsupported query parameters; only browser is allowed`
+  - `websocket upgrade required`
+  - `worker selection timed out`
+  - `connect timed out after selecting worker`
+  - `selected worker unavailable`
+- If Gorilla has already started the client upgrade handshake, the proxy still logs the exact failure and rolls back worker bookkeeping, but it may close the connection instead of returning a fresh JSON error body.
+- Malformed WebSocket handshakes after upgrade headers are present use standards-aligned HTTP responses instead of JSON:
+  - `405 Method Not Allowed` for non-`GET` requests
+  - `400 Bad Request` for invalid `Sec-WebSocket-Version` or `Sec-WebSocket-Key`
+  - version failures include `Sec-Websocket-Version: 13`
+
 
 ## 🛠 Use Cases
 
@@ -96,7 +127,7 @@ Run each component (proxy, Redis, workers) as independent services (Docker/K8s).
 ```js
 import { chromium, firefox, webkit } from 'playwright';
 
-// Chromium workers connect without any query parameters.
+// connect() returns a Browser; create a context explicitly.
 const browser = await chromium.connect('ws://localhost:8080');
 const context = await browser.newContext();
 const page = await context.newPage();
@@ -170,10 +201,11 @@ flowchart TD
 
 ### Session Handling
 
-1. **One connection → One context** – every websocket maps to a unique browser context.
-2. **Concurrent sessions** – each worker serves several contexts in parallel.
-3. **Recycling** – after serving a configurable number of sessions the worker shuts down; Docker/K8s restarts it, guaranteeing a fresh browser.
-4. **Smart worker selection** – the proxy's algorithm keeps workers from hitting their restart threshold at the same time and still favours the busiest eligible worker.
+1. **One connection → One isolated Playwright session** – each websocket connection gets an isolated view of its own contexts.
+2. **Contexts are created by the client** – use `browser.newContext()` or `browser.newPage()` after `connect()`.
+3. **Concurrent sessions** – each worker serves several client connections and contexts in parallel.
+4. **Recycling** – after serving a configurable number of sessions the worker shuts down; Docker/K8s restarts it to keep browser processes fresh.
+5. **Smart worker selection** – the proxy's algorithm keeps workers from hitting their restart threshold at the same time and still favours the busiest eligible worker.
 
 
 ## 🗺️ Roadmap

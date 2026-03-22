@@ -10,17 +10,15 @@ import (
 	"proxy/pkg/logger"
 	"sync/atomic"
 	"time"
-
-	"github.com/gorilla/websocket"
 )
 
 var (
-	upgrader = websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool {
-			return true
-		},
-	}
 	activeConnections int64
+)
+
+const (
+	httpWriteTimeoutSlack = 1 * time.Second
+	httpIdleTimeout       = 60 * time.Second
 )
 
 type reaperClient interface {
@@ -67,16 +65,46 @@ func runReaperLoop(ctx context.Context, cfg *config.Config, rd reaperClient, tic
 	}
 }
 
+func proxyReadHeaderTimeout(cfg *config.Config) time.Duration {
+	return time.Duration(cfg.ProxyReadHeaderTimeout) * time.Second
+}
+
+func proxyWorkerSelectionTimeout(cfg *config.Config) time.Duration {
+	return time.Duration(cfg.ProxyWorkerSelectionTimeout) * time.Second
+}
+
+func proxyConnectTimeout(cfg *config.Config) time.Duration {
+	return time.Duration(cfg.ProxyConnectTimeout) * time.Second
+}
+
+func maxDuration(left, right time.Duration) time.Duration {
+	if left > right {
+		return left
+	}
+
+	return right
+}
+
+func proxyHTTPWriteTimeout(cfg *config.Config) time.Duration {
+	// Keep these deadlines request-scoped. Connection-scoped timeout accounting
+	// breaks on keep-alive reuse because later requests inherit stale timing.
+	return maxDuration(proxyWorkerSelectionTimeout(cfg), proxyConnectTimeout(cfg)) + httpWriteTimeoutSlack
+}
+
+func newHTTPServer(cfg *config.Config, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              ":8080",
+		ReadHeaderTimeout: proxyReadHeaderTimeout(cfg),
+		WriteTimeout:      proxyHTTPWriteTimeout(cfg),
+		IdleTimeout:       httpIdleTimeout,
+		Handler:           handler,
+	}
+}
+
 func StartProxyServer(cfg *config.Config, rd *redis.Client) {
 	mux := newProxyMux(cfg, rd)
 
-	server := &http.Server{
-		Addr:         ":8080",
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
-		Handler:      mux,
-	}
+	server := newHTTPServer(cfg, mux)
 
 	go func() {
 		ticker := time.NewTicker(time.Duration(cfg.ReaperRunInterval) * time.Second)
