@@ -31,22 +31,34 @@ func init() {
 const validWebSocketKey = "dGhlIHNhbXBsZSBub25jZQ=="
 
 type fakeRedisClient struct {
-	selectWorkerFunc              func(ctx context.Context, browserType string) (redis.ServerInfo, error)
-	triggerWorkerShutdownFunc     func(ctx context.Context, serverInfo *redis.ServerInfo)
-	modifyActiveConnectionsFunc   func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error
-	modifyLifetimeConnectionsFunc func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error
+	selectWorkerFunc                              func(ctx context.Context, browserType string, excludedWorkerIDs []string) (redis.ServerInfo, error)
+	recordSuccessfulSessionAndTriggerShutdownFunc func(ctx context.Context, serverInfo *redis.ServerInfo)
+	modifyActiveConnectionsFunc                   func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error
+	modifyAllocatedSessionsFunc                   func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error
 }
 
-func (f *fakeRedisClient) SelectWorker(ctx context.Context, browserType string) (redis.ServerInfo, error) {
+func (f *fakeRedisClient) SelectWorker(ctx context.Context, browserType string, excludedWorkerIDs []string) (redis.ServerInfo, error) {
 	if f.selectWorkerFunc != nil {
-		return f.selectWorkerFunc(ctx, browserType)
+		server, err := f.selectWorkerFunc(ctx, browserType, excludedWorkerIDs)
+		if err != nil {
+			return redis.ServerInfo{}, err
+		}
+
+		for _, excludedWorkerID := range excludedWorkerIDs {
+			if server.WorkerID() == excludedWorkerID {
+				return redis.ServerInfo{}, redis.ErrNoAvailableWorkers
+			}
+		}
+
+		return server, nil
 	}
+
 	return redis.ServerInfo{}, nil
 }
 
-func (f *fakeRedisClient) TriggerWorkerShutdownIfNeeded(ctx context.Context, serverInfo *redis.ServerInfo) {
-	if f.triggerWorkerShutdownFunc != nil {
-		f.triggerWorkerShutdownFunc(ctx, serverInfo)
+func (f *fakeRedisClient) RecordSuccessfulSessionAndTriggerShutdownIfNeeded(ctx context.Context, serverInfo *redis.ServerInfo) {
+	if f.recordSuccessfulSessionAndTriggerShutdownFunc != nil {
+		f.recordSuccessfulSessionAndTriggerShutdownFunc(ctx, serverInfo)
 	}
 }
 
@@ -57,9 +69,9 @@ func (f *fakeRedisClient) ModifyActiveConnections(ctx context.Context, serverInf
 	return nil
 }
 
-func (f *fakeRedisClient) ModifyLifetimeConnections(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
-	if f.modifyLifetimeConnectionsFunc != nil {
-		return f.modifyLifetimeConnectionsFunc(ctx, serverInfo, delta)
+func (f *fakeRedisClient) ModifyAllocatedSessions(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
+	if f.modifyAllocatedSessionsFunc != nil {
+		return f.modifyAllocatedSessionsFunc(ctx, serverInfo, delta)
 	}
 	return nil
 }
@@ -67,6 +79,7 @@ func (f *fakeRedisClient) ModifyLifetimeConnections(ctx context.Context, serverI
 func newTestConfig() *config.Config {
 	return &config.Config{
 		DefaultBrowserType:          "chromium",
+		SelectorFreshnessTimeout:    60,
 		ProxyReadHeaderTimeout:      1,
 		ProxyWorkerSelectionTimeout: 1,
 		ProxyConnectTimeout:         1,
@@ -86,8 +99,8 @@ func TestProxyHandler_InvalidBrowserType(t *testing.T) {
 
 func TestProxyHandler_NonRootPathReturnsNotFound(t *testing.T) {
 	fake := &fakeRedisClient{
-		selectWorkerFunc: func(ctx context.Context, browserType string) (redis.ServerInfo, error) {
-			t.Fatalf("selectWorker should not be called, got browserType %s", browserType)
+		selectWorkerFunc: func(ctx context.Context, browserType string, excludedWorkerIDs []string) (redis.ServerInfo, error) {
+			t.Fatalf("SelectWorker should not be called, got browserType %s", browserType)
 			return redis.ServerInfo{}, nil
 		},
 	}
@@ -108,7 +121,7 @@ func TestProxyHandler_DefaultBrowserTypeIsUsedWhenMissing(t *testing.T) {
 
 	browserCh := make(chan string, 1)
 	fake := &fakeRedisClient{
-		selectWorkerFunc: func(ctx context.Context, browserType string) (redis.ServerInfo, error) {
+		selectWorkerFunc: func(ctx context.Context, browserType string, excludedWorkerIDs []string) (redis.ServerInfo, error) {
 			browserCh <- browserType
 			return redis.ServerInfo{}, errors.New("boom")
 		},
@@ -154,7 +167,7 @@ func TestProxyHandler_AllowsKnownBrowserQueryValues(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			browserCh := make(chan string, 1)
 			fake := &fakeRedisClient{
-				selectWorkerFunc: func(ctx context.Context, browserType string) (redis.ServerInfo, error) {
+				selectWorkerFunc: func(ctx context.Context, browserType string, excludedWorkerIDs []string) (redis.ServerInfo, error) {
 					browserCh <- browserType
 					return redis.ServerInfo{}, errors.New("boom")
 				},
@@ -222,7 +235,7 @@ func TestProxyHandler_NonWebSocketRequest(t *testing.T) {
 
 func TestProxyHandler_HandshakePreflightRejectsNonGETMethod(t *testing.T) {
 	fake := &fakeRedisClient{
-		selectWorkerFunc: func(ctx context.Context, browserType string) (redis.ServerInfo, error) {
+		selectWorkerFunc: func(ctx context.Context, browserType string, excludedWorkerIDs []string) (redis.ServerInfo, error) {
 			t.Fatal("SelectWorker should not be called for invalid method")
 			return redis.ServerInfo{}, nil
 		},
@@ -247,7 +260,7 @@ func TestProxyHandler_HandshakePreflightRejectsNonGETMethod(t *testing.T) {
 
 func TestProxyHandler_HandshakePreflightRejectsUnsupportedVersion(t *testing.T) {
 	fake := &fakeRedisClient{
-		selectWorkerFunc: func(ctx context.Context, browserType string) (redis.ServerInfo, error) {
+		selectWorkerFunc: func(ctx context.Context, browserType string, excludedWorkerIDs []string) (redis.ServerInfo, error) {
 			t.Fatal("SelectWorker should not be called for unsupported version")
 			return redis.ServerInfo{}, nil
 		},
@@ -272,7 +285,7 @@ func TestProxyHandler_HandshakePreflightRejectsUnsupportedVersion(t *testing.T) 
 
 func TestProxyHandler_HandshakePreflightRejectsInvalidKey(t *testing.T) {
 	fake := &fakeRedisClient{
-		selectWorkerFunc: func(ctx context.Context, browserType string) (redis.ServerInfo, error) {
+		selectWorkerFunc: func(ctx context.Context, browserType string, excludedWorkerIDs []string) (redis.ServerInfo, error) {
 			t.Fatal("SelectWorker should not be called for invalid key")
 			return redis.ServerInfo{}, nil
 		},
@@ -368,7 +381,7 @@ func TestValidateClientHandshake_ParallelsGorillaForMalformedRequests(t *testing
 
 func TestProxyHandler_WorkerSelectionTimeoutReturnsStructuredError(t *testing.T) {
 	fake := &fakeRedisClient{
-		selectWorkerFunc: func(ctx context.Context, browserType string) (redis.ServerInfo, error) {
+		selectWorkerFunc: func(ctx context.Context, browserType string, excludedWorkerIDs []string) (redis.ServerInfo, error) {
 			return redis.ServerInfo{}, redis.ErrNoAvailableWorkers
 		},
 	}
@@ -385,7 +398,7 @@ func TestProxyHandler_WorkerSelectionTimeoutReturnsStructuredError(t *testing.T)
 
 func TestProxyHandler_CanceledSelectionDoesNotWriteStructuredResponse(t *testing.T) {
 	fake := &fakeRedisClient{
-		selectWorkerFunc: func(ctx context.Context, browserType string) (redis.ServerInfo, error) {
+		selectWorkerFunc: func(ctx context.Context, browserType string, excludedWorkerIDs []string) (redis.ServerInfo, error) {
 			t.Fatal("SelectWorker should not be called for an already canceled request")
 			return redis.ServerInfo{}, nil
 		},
@@ -412,7 +425,7 @@ func TestProxyHandler_CanceledSelectionDoesNotWriteStructuredResponse(t *testing
 func TestProxyHandler_SelectWorkerUnexpectedError(t *testing.T) {
 	expectedErr := errors.New("boom")
 	fake := &fakeRedisClient{
-		selectWorkerFunc: func(ctx context.Context, browserType string) (redis.ServerInfo, error) {
+		selectWorkerFunc: func(ctx context.Context, browserType string, excludedWorkerIDs []string) (redis.ServerInfo, error) {
 			return redis.ServerInfo{}, expectedErr
 		},
 	}
@@ -433,7 +446,7 @@ func TestProxyHandler_SelectWorkerUnexpectedError(t *testing.T) {
 func TestSelectWorkerWithRetryRetriesUntilSuccess(t *testing.T) {
 	attempts := 0
 	fake := &fakeRedisClient{
-		selectWorkerFunc: func(ctx context.Context, browserType string) (redis.ServerInfo, error) {
+		selectWorkerFunc: func(ctx context.Context, browserType string, excludedWorkerIDs []string) (redis.ServerInfo, error) {
 			attempts++
 			if attempts < 2 {
 				return redis.ServerInfo{}, redis.ErrNoAvailableWorkers
@@ -461,7 +474,7 @@ func TestSelectWorkerWithRetryRetriesUntilSuccess(t *testing.T) {
 
 func TestSelectWorkerWithRetryTimeout(t *testing.T) {
 	fake := &fakeRedisClient{
-		selectWorkerFunc: func(ctx context.Context, browserType string) (redis.ServerInfo, error) {
+		selectWorkerFunc: func(ctx context.Context, browserType string, excludedWorkerIDs []string) (redis.ServerInfo, error) {
 			return redis.ServerInfo{}, redis.ErrNoAvailableWorkers
 		},
 	}
@@ -484,7 +497,7 @@ func TestSelectWorkerWithRetryTimeout(t *testing.T) {
 func TestSelectWorkerWithRetryCanceledContext(t *testing.T) {
 	calls := int32(0)
 	fake := &fakeRedisClient{
-		selectWorkerFunc: func(ctx context.Context, browserType string) (redis.ServerInfo, error) {
+		selectWorkerFunc: func(ctx context.Context, browserType string, excludedWorkerIDs []string) (redis.ServerInfo, error) {
 			atomic.AddInt32(&calls, 1)
 			return redis.ServerInfo{}, redis.ErrNoAvailableWorkers
 		},
@@ -506,7 +519,7 @@ func TestSelectWorkerWithRetryCanceledContext(t *testing.T) {
 func TestSelectWorkerWithRetryUnexpectedError(t *testing.T) {
 	expectedErr := errors.New("boom")
 	fake := &fakeRedisClient{
-		selectWorkerFunc: func(ctx context.Context, browserType string) (redis.ServerInfo, error) {
+		selectWorkerFunc: func(ctx context.Context, browserType string, excludedWorkerIDs []string) (redis.ServerInfo, error) {
 			return redis.ServerInfo{}, expectedErr
 		},
 	}
@@ -517,6 +530,33 @@ func TestSelectWorkerWithRetryUnexpectedError(t *testing.T) {
 	_, err := selectWorkerWithRetry(ctx, fake, "chromium")
 	if !errors.Is(err, expectedErr) {
 		t.Fatalf("expected unexpected selector error %v, got %v", expectedErr, err)
+	}
+}
+
+func TestSelectWorkerWithRetryPassesExcludedWorkerIDs(t *testing.T) {
+	expectedExcludedWorkerIDs := []string{"chromium:worker-1"}
+	fake := &fakeRedisClient{
+		selectWorkerFunc: func(ctx context.Context, browserType string, excludedWorkerIDs []string) (redis.ServerInfo, error) {
+			if browserType != "chromium" {
+				t.Fatalf("expected browser type chromium, got %s", browserType)
+			}
+			if len(excludedWorkerIDs) != len(expectedExcludedWorkerIDs) || excludedWorkerIDs[0] != expectedExcludedWorkerIDs[0] {
+				t.Fatalf("expected excluded worker IDs %v, got %v", expectedExcludedWorkerIDs, excludedWorkerIDs)
+			}
+			return redis.ServerInfo{ID: "worker-2"}, nil
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	server, err := selectWorkerWithRetryExcluding(ctx, fake, "chromium", expectedExcludedWorkerIDs)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if server.ID != "worker-2" {
+		t.Fatalf("expected worker ID worker-2, got %q", server.ID)
 	}
 }
 
@@ -558,10 +598,10 @@ func TestProxyHandler_SuccessfulConnectionLifecycle(t *testing.T) {
 	modifyCalls := make(chan int64, 1)
 
 	fake := &fakeRedisClient{
-		selectWorkerFunc: func(ctx context.Context, browserType string) (redis.ServerInfo, error) {
+		selectWorkerFunc: func(ctx context.Context, browserType string, excludedWorkerIDs []string) (redis.ServerInfo, error) {
 			return redis.ServerInfo{ID: "worker-1", Endpoint: workerEndpoint}, nil
 		},
-		triggerWorkerShutdownFunc: func(ctx context.Context, serverInfo *redis.ServerInfo) {
+		recordSuccessfulSessionAndTriggerShutdownFunc: func(ctx context.Context, serverInfo *redis.ServerInfo) {
 			shutdownCalled <- struct{}{}
 		},
 		modifyActiveConnectionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
@@ -604,7 +644,7 @@ func TestProxyHandler_SuccessfulConnectionLifecycle(t *testing.T) {
 	select {
 	case <-shutdownCalled:
 	case <-time.After(2 * time.Second):
-		t.Fatal("expected TriggerWorkerShutdownIfNeeded to be called")
+		t.Fatal("expected RecordSuccessfulSessionAndTriggerShutdownIfNeeded to be called")
 	}
 
 	select {
@@ -653,7 +693,7 @@ func TestProxyHandler_SuccessfulConnectionCleanupUsesDetachedBookkeepingContext(
 	modifyCalls := make(chan redisModifyCall, 1)
 
 	fake := &fakeRedisClient{
-		selectWorkerFunc: func(ctx context.Context, browserType string) (redis.ServerInfo, error) {
+		selectWorkerFunc: func(ctx context.Context, browserType string, excludedWorkerIDs []string) (redis.ServerInfo, error) {
 			return redis.ServerInfo{ID: "worker-1", Endpoint: workerEndpoint}, nil
 		},
 		modifyActiveConnectionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
@@ -740,10 +780,10 @@ func TestProxyHandler_TriggerWorkerShutdownUsesDetachedBookkeepingContext(t *tes
 	triggerCtxErr := make(chan error, 1)
 
 	fake := &fakeRedisClient{
-		selectWorkerFunc: func(ctx context.Context, browserType string) (redis.ServerInfo, error) {
+		selectWorkerFunc: func(ctx context.Context, browserType string, excludedWorkerIDs []string) (redis.ServerInfo, error) {
 			return redis.ServerInfo{ID: "worker-1", Endpoint: workerEndpoint}, nil
 		},
-		triggerWorkerShutdownFunc: func(ctx context.Context, serverInfo *redis.ServerInfo) {
+		recordSuccessfulSessionAndTriggerShutdownFunc: func(ctx context.Context, serverInfo *redis.ServerInfo) {
 			time.Sleep(1200 * time.Millisecond)
 			triggerCtxErr <- ctx.Err()
 		},
@@ -782,7 +822,7 @@ func TestProxyHandler_TriggerWorkerShutdownUsesDetachedBookkeepingContext(t *tes
 			t.Fatalf("expected detached bookkeeping context, got %v", err)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("expected TriggerWorkerShutdownIfNeeded to be called")
+		t.Fatal("expected RecordSuccessfulSessionAndTriggerShutdownIfNeeded to be called")
 	}
 }
 
@@ -792,17 +832,17 @@ func TestProxyHandler_BackendDialFailure(t *testing.T) {
 	modifyLifetimeCalls := make(chan int64, 1)
 
 	fake := &fakeRedisClient{
-		selectWorkerFunc: func(ctx context.Context, browserType string) (redis.ServerInfo, error) {
+		selectWorkerFunc: func(ctx context.Context, browserType string, excludedWorkerIDs []string) (redis.ServerInfo, error) {
 			return redis.ServerInfo{ID: "worker-1", Endpoint: "ws://127.0.0.1:1"}, nil
 		},
-		triggerWorkerShutdownFunc: func(ctx context.Context, serverInfo *redis.ServerInfo) {
+		recordSuccessfulSessionAndTriggerShutdownFunc: func(ctx context.Context, serverInfo *redis.ServerInfo) {
 			shutdownCalled <- struct{}{}
 		},
 		modifyActiveConnectionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
 			modifyActiveCalls <- delta
 			return nil
 		},
-		modifyLifetimeConnectionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
+		modifyAllocatedSessionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
 			modifyLifetimeCalls <- delta
 			return nil
 		},
@@ -821,11 +861,11 @@ func TestProxyHandler_BackendDialFailure(t *testing.T) {
 
 	assertJSONErrorResponse(t, resp, http.StatusServiceUnavailable, selectedWorkerUnavailableMessage)
 
-	// TriggerWorkerShutdownIfNeeded should NOT be called on backend dial failure
+	// RecordSuccessfulSessionAndTriggerShutdownIfNeeded should NOT be called on backend dial failure
 	// because the connection never succeeded and counters will be rolled back
 	select {
 	case <-shutdownCalled:
-		t.Fatal("TriggerWorkerShutdownIfNeeded should not be called when backend dial fails")
+		t.Fatal("RecordSuccessfulSessionAndTriggerShutdownIfNeeded should not be called when backend dial fails")
 	case <-time.After(100 * time.Millisecond):
 		// Expected: shutdown should not be triggered
 	}
@@ -842,19 +882,19 @@ func TestProxyHandler_BackendDialFailure(t *testing.T) {
 	select {
 	case delta := <-modifyLifetimeCalls:
 		if delta != -1 {
-			t.Fatalf("expected ModifyLifetimeConnections delta -1, got %d", delta)
+			t.Fatalf("expected ModifyAllocatedSessions delta -1, got %d", delta)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("expected ModifyLifetimeConnections rollback")
+		t.Fatal("expected ModifyAllocatedSessions rollback")
 	}
 }
 
 func TestProxyHandler_BackendDialFailureRollbackUsesDetachedBookkeepingContext(t *testing.T) {
 	activeRollback := make(chan redisModifyCall, 1)
-	lifetimeRollback := make(chan redisModifyCall, 1)
+	allocatedRollback := make(chan redisModifyCall, 1)
 
 	fake := &fakeRedisClient{
-		selectWorkerFunc: func(ctx context.Context, browserType string) (redis.ServerInfo, error) {
+		selectWorkerFunc: func(ctx context.Context, browserType string, excludedWorkerIDs []string) (redis.ServerInfo, error) {
 			return redis.ServerInfo{
 				ID:          "worker-1",
 				BrowserType: "chromium",
@@ -865,8 +905,8 @@ func TestProxyHandler_BackendDialFailureRollbackUsesDetachedBookkeepingContext(t
 			activeRollback <- redisModifyCall{delta: delta, ctxErr: ctx.Err()}
 			return nil
 		},
-		modifyLifetimeConnectionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
-			lifetimeRollback <- redisModifyCall{delta: delta, ctxErr: ctx.Err()}
+		modifyAllocatedSessionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
+			allocatedRollback <- redisModifyCall{delta: delta, ctxErr: ctx.Err()}
 			return nil
 		},
 	}
@@ -907,15 +947,104 @@ func TestProxyHandler_BackendDialFailureRollbackUsesDetachedBookkeepingContext(t
 	}
 
 	select {
-	case call := <-lifetimeRollback:
+	case call := <-allocatedRollback:
 		if call.delta != -1 {
-			t.Fatalf("expected ModifyLifetimeConnections delta -1, got %d", call.delta)
+			t.Fatalf("expected ModifyAllocatedSessions delta -1, got %d", call.delta)
 		}
 		if call.ctxErr != nil {
-			t.Fatalf("expected detached bookkeeping context for lifetime rollback, got %v", call.ctxErr)
+			t.Fatalf("expected detached bookkeeping context for allocated rollback, got %v", call.ctxErr)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("expected ModifyLifetimeConnections rollback")
+		t.Fatal("expected ModifyAllocatedSessions rollback")
+	}
+}
+
+func TestProxyHandler_ReselectsAfterFastSelectedWorkerFailure(t *testing.T) {
+	backendUpgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := backendUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Fatalf("backend upgrade failed: %v", err)
+		}
+		defer conn.Close()
+
+		for {
+			msgType, payload, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			if err := conn.WriteMessage(msgType, payload); err != nil {
+				return
+			}
+		}
+	}))
+	defer backend.Close()
+
+	workerEndpoint := "ws" + strings.TrimPrefix(backend.URL, "http")
+	var (
+		mu             sync.Mutex
+		selectionCalls [][]string
+	)
+
+	fake := &fakeRedisClient{
+		selectWorkerFunc: func(ctx context.Context, browserType string, excludedWorkerIDs []string) (redis.ServerInfo, error) {
+			mu.Lock()
+			selectionCalls = append(selectionCalls, append([]string(nil), excludedWorkerIDs...))
+			mu.Unlock()
+
+			if len(excludedWorkerIDs) == 0 {
+				return redis.ServerInfo{
+					ID:          "worker-1",
+					BrowserType: "chromium",
+					Endpoint:    "ws://127.0.0.1:1/playwright",
+				}, nil
+			}
+
+			if len(excludedWorkerIDs) == 1 && excludedWorkerIDs[0] == "chromium:worker-1" {
+				return redis.ServerInfo{
+					ID:          "worker-2",
+					BrowserType: "chromium",
+					Endpoint:    workerEndpoint,
+				}, nil
+			}
+
+			t.Fatalf("unexpected excluded worker IDs: %v", excludedWorkerIDs)
+			return redis.ServerInfo{}, nil
+		},
+	}
+
+	proxyServer := httptest.NewServer(http.HandlerFunc(proxyHandler(fake, newTestConfig())))
+	defer proxyServer.Close()
+
+	proxyURL := "ws" + strings.TrimPrefix(proxyServer.URL, "http")
+	clientConn, _, err := websocket.DefaultDialer.Dial(proxyURL, nil)
+	if err != nil {
+		t.Fatalf("failed to dial proxy: %v", err)
+	}
+	defer clientConn.Close()
+
+	if err := clientConn.WriteMessage(websocket.TextMessage, []byte("hello")); err != nil {
+		t.Fatalf("failed to write message: %v", err)
+	}
+
+	_, payload, err := clientConn.ReadMessage()
+	if err != nil {
+		t.Fatalf("failed to read echoed message: %v", err)
+	}
+	if string(payload) != "hello" {
+		t.Fatalf("expected echoed payload hello, got %q", payload)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(selectionCalls) < 2 {
+		t.Fatalf("expected reselection after fast selected-worker failure, got %d selection calls", len(selectionCalls))
+	}
+	if len(selectionCalls[0]) != 0 {
+		t.Fatalf("expected first selection to have no exclusions, got %v", selectionCalls[0])
+	}
+	if len(selectionCalls[1]) != 1 || selectionCalls[1][0] != "chromium:worker-1" {
+		t.Fatalf("expected second selection to exclude chromium:worker-1, got %v", selectionCalls[1])
 	}
 }
 
@@ -938,17 +1067,17 @@ func TestProxyHandler_WebSocketUpgradeFailureRollsBackCounters(t *testing.T) {
 	workerEndpoint := "ws" + strings.TrimPrefix(backend.URL, "http")
 
 	activeRollbacks := make(chan int64, 1)
-	lifetimeRollbacks := make(chan int64, 1)
+	allocatedRollbacks := make(chan int64, 1)
 	fake := &fakeRedisClient{
-		selectWorkerFunc: func(ctx context.Context, browserType string) (redis.ServerInfo, error) {
+		selectWorkerFunc: func(ctx context.Context, browserType string, excludedWorkerIDs []string) (redis.ServerInfo, error) {
 			return redis.ServerInfo{ID: "worker-1", Endpoint: workerEndpoint}, nil
 		},
 		modifyActiveConnectionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
 			activeRollbacks <- delta
 			return nil
 		},
-		modifyLifetimeConnectionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
-			lifetimeRollbacks <- delta
+		modifyAllocatedSessionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
+			allocatedRollbacks <- delta
 			return nil
 		},
 	}
@@ -966,8 +1095,8 @@ func TestProxyHandler_WebSocketUpgradeFailureRollsBackCounters(t *testing.T) {
 
 	assertPlainTextStatusResponse(t, resp, http.StatusInternalServerError)
 
-	if got := atomic.LoadInt64(&activeConnections); got != 0 {
-		t.Fatalf("expected activeConnections to remain 0, got %d", got)
+	if got := atomic.LoadInt64(&activeConnections); got > 0 {
+		t.Fatalf("expected activeConnections not to increase, got %d", got)
 	}
 
 	select {
@@ -980,12 +1109,12 @@ func TestProxyHandler_WebSocketUpgradeFailureRollsBackCounters(t *testing.T) {
 	}
 
 	select {
-	case delta := <-lifetimeRollbacks:
+	case delta := <-allocatedRollbacks:
 		if delta != -1 {
-			t.Fatalf("expected ModifyLifetimeConnections rollback delta -1, got %d", delta)
+			t.Fatalf("expected ModifyAllocatedSessions rollback delta -1, got %d", delta)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("expected ModifyLifetimeConnections rollback")
+		t.Fatal("expected ModifyAllocatedSessions rollback")
 	}
 }
 
@@ -1019,7 +1148,7 @@ func TestProxyHandler_ModifyActiveConnectionsErrorIsIgnored(t *testing.T) {
 
 	modifyCalls := make(chan int64, 1)
 	fake := &fakeRedisClient{
-		selectWorkerFunc: func(ctx context.Context, browserType string) (redis.ServerInfo, error) {
+		selectWorkerFunc: func(ctx context.Context, browserType string, excludedWorkerIDs []string) (redis.ServerInfo, error) {
 			return redis.ServerInfo{ID: "worker-1", Endpoint: workerEndpoint}, nil
 		},
 		modifyActiveConnectionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
@@ -1061,7 +1190,7 @@ func TestProxyHandler_ModifyActiveConnectionsErrorIsIgnored(t *testing.T) {
 func TestProxyHandler_BackendDialHonorsRequestDeadline(t *testing.T) {
 	dialStarted := make(chan struct{}, 1)
 	fake := &fakeRedisClient{
-		selectWorkerFunc: func(ctx context.Context, browserType string) (redis.ServerInfo, error) {
+		selectWorkerFunc: func(ctx context.Context, browserType string, excludedWorkerIDs []string) (redis.ServerInfo, error) {
 			return redis.ServerInfo{
 				ID:          "worker-1",
 				BrowserType: "chromium",
@@ -1071,7 +1200,7 @@ func TestProxyHandler_BackendDialHonorsRequestDeadline(t *testing.T) {
 		modifyActiveConnectionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
 			return nil
 		},
-		modifyLifetimeConnectionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
+		modifyAllocatedSessionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
 			return nil
 		},
 	}
@@ -1138,9 +1267,11 @@ func TestProxyHandler_BackendDialHandshakeTimeoutReturnsConnectTimeout(t *testin
 	}()
 
 	activeRollback := make(chan redisModifyCall, 1)
-	lifetimeRollback := make(chan redisModifyCall, 1)
+	allocatedRollback := make(chan redisModifyCall, 1)
+	selectCalls := int32(0)
 	fake := &fakeRedisClient{
-		selectWorkerFunc: func(ctx context.Context, browserType string) (redis.ServerInfo, error) {
+		selectWorkerFunc: func(ctx context.Context, browserType string, excludedWorkerIDs []string) (redis.ServerInfo, error) {
+			atomic.AddInt32(&selectCalls, 1)
 			return redis.ServerInfo{
 				ID:          "worker-1",
 				BrowserType: "chromium",
@@ -1151,8 +1282,8 @@ func TestProxyHandler_BackendDialHandshakeTimeoutReturnsConnectTimeout(t *testin
 			activeRollback <- redisModifyCall{delta: delta, ctxErr: ctx.Err()}
 			return nil
 		},
-		modifyLifetimeConnectionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
-			lifetimeRollback <- redisModifyCall{delta: delta, ctxErr: ctx.Err()}
+		modifyAllocatedSessionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
+			allocatedRollback <- redisModifyCall{delta: delta, ctxErr: ctx.Err()}
 			return nil
 		},
 	}
@@ -1184,6 +1315,9 @@ func TestProxyHandler_BackendDialHandshakeTimeoutReturnsConnectTimeout(t *testin
 	if elapsed < 900*time.Millisecond {
 		t.Fatalf("expected backend handshake timeout near configured connect timeout, got %v", elapsed)
 	}
+	if got := atomic.LoadInt32(&selectCalls); got != 1 {
+		t.Fatalf("expected backend dial timeout not to trigger reselection, got %d selection calls", got)
+	}
 
 	select {
 	case call := <-activeRollback:
@@ -1198,16 +1332,301 @@ func TestProxyHandler_BackendDialHandshakeTimeoutReturnsConnectTimeout(t *testin
 	}
 
 	select {
-	case call := <-lifetimeRollback:
+	case call := <-allocatedRollback:
 		if call.delta != -1 {
-			t.Fatalf("expected ModifyLifetimeConnections delta -1, got %d", call.delta)
+			t.Fatalf("expected ModifyAllocatedSessions delta -1, got %d", call.delta)
 		}
 		if call.ctxErr != nil {
-			t.Fatalf("expected detached bookkeeping context for lifetime rollback, got %v", call.ctxErr)
+			t.Fatalf("expected detached bookkeeping context for allocated rollback, got %v", call.ctxErr)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("expected ModifyLifetimeConnections rollback")
+		t.Fatal("expected ModifyAllocatedSessions rollback")
 	}
+}
+
+func TestProxyHandler_FirstHandoffKeepsFullConnectTimeout(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer listener.Close()
+
+	acceptedConn := make(chan net.Conn, 1)
+	acceptErr := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			acceptErr <- err
+			return
+		}
+		acceptedConn <- conn
+	}()
+
+	var stalledConn net.Conn
+	defer func() {
+		if stalledConn != nil {
+			_ = stalledConn.Close()
+		}
+	}()
+
+	cfg := newTestConfig()
+	cfg.ProxyWorkerSelectionTimeout = 1
+	cfg.ProxyConnectTimeout = 2
+
+	selectCalls := int32(0)
+	fake := &fakeRedisClient{
+		selectWorkerFunc: func(ctx context.Context, browserType string, excludedWorkerIDs []string) (redis.ServerInfo, error) {
+			atomic.AddInt32(&selectCalls, 1)
+			if len(excludedWorkerIDs) != 0 {
+				t.Fatalf("expected first handoff not to exclude any workers, got %v", excludedWorkerIDs)
+			}
+			return redis.ServerInfo{
+				ID:          "worker-1",
+				BrowserType: "chromium",
+				Endpoint:    "ws://" + listener.Addr().String() + "/playwright",
+			}, nil
+		},
+		modifyActiveConnectionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
+			return nil
+		},
+		modifyAllocatedSessionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
+			return nil
+		},
+	}
+
+	handler := proxyHandler(fake, cfg)
+
+	req := newWebSocketUpgradeRequest(http.MethodGet)
+	resp := httptest.NewRecorder()
+
+	start := time.Now()
+	handler.ServeHTTP(resp, req)
+	elapsed := time.Since(start)
+
+	select {
+	case stalledConn = <-acceptedConn:
+	case err := <-acceptErr:
+		t.Fatalf("failed to accept backend dial: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("expected backend dial to reach stalled listener")
+	}
+
+	assertJSONErrorResponse(t, resp, http.StatusServiceUnavailable, connectTimedOutAfterSelectingWorkerMessage)
+	if elapsed < 1900*time.Millisecond {
+		t.Fatalf("expected first handoff to keep the full connect timeout, got %v", elapsed)
+	}
+	if elapsed > 2600*time.Millisecond {
+		t.Fatalf("expected first handoff timeout near configured connect timeout, got %v", elapsed)
+	}
+	if got := atomic.LoadInt32(&selectCalls); got != 1 {
+		t.Fatalf("expected no reselection on first handoff timeout, got %d selection calls", got)
+	}
+}
+
+func TestProxyHandler_ReselectionStaysWithinSelectionTimeout(t *testing.T) {
+	cfg := newTestConfig()
+	cfg.ProxyWorkerSelectionTimeout = 1
+	cfg.ProxyConnectTimeout = 1
+
+	var (
+		mu             sync.Mutex
+		selectionCalls [][]string
+		dialTimeouts   []time.Duration
+	)
+
+	fake := &fakeRedisClient{
+		selectWorkerFunc: func(ctx context.Context, browserType string, excludedWorkerIDs []string) (redis.ServerInfo, error) {
+			mu.Lock()
+			selectionCalls = append(selectionCalls, append([]string(nil), excludedWorkerIDs...))
+			mu.Unlock()
+
+			switch len(excludedWorkerIDs) {
+			case 0:
+				return redis.ServerInfo{
+					ID:          "worker-1",
+					BrowserType: "chromium",
+					Endpoint:    "ws://worker-1.invalid/playwright",
+				}, nil
+			case 1:
+				if excludedWorkerIDs[0] != "chromium:worker-1" {
+					t.Fatalf("expected chromium:worker-1 to be excluded, got %v", excludedWorkerIDs)
+				}
+				return redis.ServerInfo{
+					ID:          "worker-2",
+					BrowserType: "chromium",
+					Endpoint:    "ws://worker-2.invalid/playwright",
+				}, nil
+			default:
+				t.Fatalf("unexpected exclusions: %v", excludedWorkerIDs)
+				return redis.ServerInfo{}, nil
+			}
+		},
+		modifyActiveConnectionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
+			return nil
+		},
+		modifyAllocatedSessionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
+			return nil
+		},
+	}
+
+	handler := proxyHandlerWithBackendDialer(fake, cfg, func(timeout time.Duration) websocketBackendDialer {
+		mu.Lock()
+		dialTimeouts = append(dialTimeouts, timeout)
+		mu.Unlock()
+
+		return &stubBackendDialer{
+			dialContextFunc: func(ctx context.Context, urlStr string, requestHeader http.Header) (*websocket.Conn, *http.Response, error) {
+				switch urlStr {
+				case "ws://worker-1.invalid/playwright":
+					time.Sleep(700 * time.Millisecond)
+					return nil, nil, errors.New("selected worker failed fast")
+				case "ws://worker-2.invalid/playwright":
+					<-ctx.Done()
+					return nil, nil, ctx.Err()
+				default:
+					t.Fatalf("unexpected backend URL %q", urlStr)
+					return nil, nil, nil
+				}
+			},
+		}
+	})
+
+	req := newWebSocketUpgradeRequest(http.MethodGet)
+	resp := httptest.NewRecorder()
+
+	start := time.Now()
+	handler.ServeHTTP(resp, req)
+	elapsed := time.Since(start)
+
+	assertJSONErrorResponse(t, resp, http.StatusServiceUnavailable, connectTimedOutAfterSelectingWorkerMessage)
+	if elapsed < 900*time.Millisecond {
+		t.Fatalf("expected reselection flow to consume most of the selection budget, got %v", elapsed)
+	}
+	if elapsed > 1500*time.Millisecond {
+		t.Fatalf("expected reselection to stay within selection timeout budget, got %v", elapsed)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(selectionCalls) != 2 {
+		t.Fatalf("expected two selection attempts, got %d", len(selectionCalls))
+	}
+	if len(selectionCalls[0]) != 0 {
+		t.Fatalf("expected first selection attempt to have no exclusions, got %v", selectionCalls[0])
+	}
+	if len(selectionCalls[1]) != 1 || selectionCalls[1][0] != "chromium:worker-1" {
+		t.Fatalf("expected second selection to exclude chromium:worker-1, got %v", selectionCalls[1])
+	}
+	if len(dialTimeouts) != 2 {
+		t.Fatalf("expected two backend dial attempts, got %d", len(dialTimeouts))
+	}
+	if dialTimeouts[0] < 900*time.Millisecond {
+		t.Fatalf("expected first dial timeout near the full connect timeout, got %v", dialTimeouts[0])
+	}
+	if dialTimeouts[1] <= 0 {
+		t.Fatalf("expected second dial timeout to remain positive, got %v", dialTimeouts[1])
+	}
+	if dialTimeouts[1] >= 500*time.Millisecond {
+		t.Fatalf("expected second dial timeout to be capped by the remaining selection budget, got %v", dialTimeouts[1])
+	}
+}
+
+func TestProxyHandler_ReselectionDoesNotWaitForRetryRollback(t *testing.T) {
+	cfg := newTestConfig()
+	cfg.ProxyWorkerSelectionTimeout = 1
+	cfg.ProxyConnectTimeout = 1
+
+	selectionCalled := make(chan time.Time, 2)
+	rollbackStarted := make(chan struct{}, 1)
+	rollbackRelease := make(chan struct{})
+
+	fake := &fakeRedisClient{
+		selectWorkerFunc: func(ctx context.Context, browserType string, excludedWorkerIDs []string) (redis.ServerInfo, error) {
+			selectionCalled <- time.Now()
+
+			switch len(excludedWorkerIDs) {
+			case 0:
+				return redis.ServerInfo{
+					ID:          "worker-1",
+					BrowserType: "chromium",
+					Endpoint:    "ws://worker-1.invalid/playwright",
+				}, nil
+			case 1:
+				if excludedWorkerIDs[0] != "chromium:worker-1" {
+					t.Fatalf("expected chromium:worker-1 to be excluded, got %v", excludedWorkerIDs)
+				}
+				return redis.ServerInfo{}, redis.ErrNoAvailableWorkers
+			default:
+				t.Fatalf("unexpected exclusions: %v", excludedWorkerIDs)
+				return redis.ServerInfo{}, nil
+			}
+		},
+		modifyActiveConnectionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
+			if delta == -1 && serverInfo.WorkerID() == "chromium:worker-1" {
+				select {
+				case rollbackStarted <- struct{}{}:
+				default:
+				}
+				<-rollbackRelease
+			}
+			return nil
+		},
+		modifyAllocatedSessionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
+			return nil
+		},
+	}
+
+	handler := proxyHandlerWithBackendDialer(fake, cfg, func(timeout time.Duration) websocketBackendDialer {
+		return &stubBackendDialer{
+			dialContextFunc: func(ctx context.Context, urlStr string, requestHeader http.Header) (*websocket.Conn, *http.Response, error) {
+				if urlStr != "ws://worker-1.invalid/playwright" {
+					t.Fatalf("unexpected backend URL %q", urlStr)
+				}
+				return nil, nil, errors.New("selected worker failed fast")
+			},
+		}
+	})
+
+	req := newWebSocketUpgradeRequest(http.MethodGet)
+	resp := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(resp, req)
+		close(done)
+	}()
+
+	var firstSelection time.Time
+	select {
+	case firstSelection = <-selectionCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected first selection attempt")
+	}
+
+	select {
+	case <-rollbackStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected retry rollback to start")
+	}
+
+	select {
+	case secondSelection := <-selectionCalled:
+		if secondSelection.Sub(firstSelection) > 300*time.Millisecond {
+			t.Fatalf("expected reselection to proceed without waiting for rollback, got %v", secondSelection.Sub(firstSelection))
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected reselection before rollback finished")
+	}
+
+	close(rollbackRelease)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected handler to finish after releasing rollback")
+	}
+
+	assertJSONErrorResponse(t, resp, http.StatusServiceUnavailable, selectedWorkerUnavailableMessage)
 }
 
 func TestProxyHandler_ClientUpgraderReceivesRemainingConnectTimeout(t *testing.T) {
@@ -1232,7 +1651,7 @@ func TestProxyHandler_ClientUpgraderReceivesRemainingConnectTimeout(t *testing.T
 	upgraderTimeouts := make(chan time.Duration, 1)
 
 	fake := &fakeRedisClient{
-		selectWorkerFunc: func(ctx context.Context, browserType string) (redis.ServerInfo, error) {
+		selectWorkerFunc: func(ctx context.Context, browserType string, excludedWorkerIDs []string) (redis.ServerInfo, error) {
 			return redis.ServerInfo{ID: "worker-1", Endpoint: workerEndpoint}, nil
 		},
 	}
@@ -1303,18 +1722,18 @@ func TestProxyHandler_ClientUpgradeFailureRollsBackAndClosesBackendConnection(t 
 
 	workerEndpoint := "ws" + strings.TrimPrefix(backend.URL, "http")
 	activeRollbacks := make(chan redisModifyCall, 1)
-	lifetimeRollbacks := make(chan redisModifyCall, 1)
+	allocatedRollbacks := make(chan redisModifyCall, 1)
 
 	fake := &fakeRedisClient{
-		selectWorkerFunc: func(ctx context.Context, browserType string) (redis.ServerInfo, error) {
+		selectWorkerFunc: func(ctx context.Context, browserType string, excludedWorkerIDs []string) (redis.ServerInfo, error) {
 			return redis.ServerInfo{ID: "worker-1", Endpoint: workerEndpoint}, nil
 		},
 		modifyActiveConnectionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
 			activeRollbacks <- redisModifyCall{delta: delta, ctxErr: ctx.Err()}
 			return nil
 		},
-		modifyLifetimeConnectionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
-			lifetimeRollbacks <- redisModifyCall{delta: delta, ctxErr: ctx.Err()}
+		modifyAllocatedSessionsFunc: func(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error {
+			allocatedRollbacks <- redisModifyCall{delta: delta, ctxErr: ctx.Err()}
 			return nil
 		},
 	}
@@ -1364,15 +1783,15 @@ func TestProxyHandler_ClientUpgradeFailureRollsBackAndClosesBackendConnection(t 
 	}
 
 	select {
-	case call := <-lifetimeRollbacks:
+	case call := <-allocatedRollbacks:
 		if call.delta != -1 {
-			t.Fatalf("expected ModifyLifetimeConnections delta -1, got %d", call.delta)
+			t.Fatalf("expected ModifyAllocatedSessions delta -1, got %d", call.delta)
 		}
 		if call.ctxErr != nil {
-			t.Fatalf("expected detached bookkeeping context for lifetime rollback, got %v", call.ctxErr)
+			t.Fatalf("expected detached bookkeeping context for allocated rollback, got %v", call.ctxErr)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("expected ModifyLifetimeConnections rollback")
+		t.Fatal("expected ModifyAllocatedSessions rollback")
 	}
 
 	select {
@@ -1411,7 +1830,7 @@ func TestIsTimeoutLikeError(t *testing.T) {
 func TestProxyHandler_KeepsWorkerSelectionTimeoutRequestScopedAcrossKeepAliveRequests(t *testing.T) {
 	cfg := newTestConfig()
 	handler := http.HandlerFunc(proxyHandler(&fakeRedisClient{
-		selectWorkerFunc: func(ctx context.Context, browserType string) (redis.ServerInfo, error) {
+		selectWorkerFunc: func(ctx context.Context, browserType string, excludedWorkerIDs []string) (redis.ServerInfo, error) {
 			return redis.ServerInfo{}, redis.ErrNoAvailableWorkers
 		},
 	}, cfg))

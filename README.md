@@ -73,8 +73,8 @@ That's it! The same `ws://localhost:8080` endpoint works with any Playwright cli
 - A successful `connect()` returns a normal Playwright `Browser`. Create contexts with `browser.newContext()` or use `browser.newPage()` as the single-page convenience path.
 - Contexts created through one client connection are isolated from other client connections.
 - `PROXY_READ_HEADER_TIMEOUT` limits how long the server waits for request headers.
-- `PROXY_WORKER_SELECTION_TIMEOUT` is the main queue-wait timeout: if no matching worker is eligible on a given attempt, the proxy keeps retrying until this timeout expires.
-- `PROXY_CONNECT_TIMEOUT` starts only after a worker is selected and covers backend worker dial plus the client handshake response write.
+- `PROXY_WORKER_SELECTION_TIMEOUT` is the main queue-wait timeout: if no matching worker is eligible, or a selected worker fails fast before handoff succeeds, the proxy keeps retrying until this timeout expires.
+- `PROXY_CONNECT_TIMEOUT` gives the first selected-worker handoff its full budget. During reselection, later attempts can be shorter because the remaining `PROXY_WORKER_SELECTION_TIMEOUT` budget still wins.
 - Breaking change: `PROXY_CONNECT_TIMEOUT` no longer means the whole pre-upgrade path.
 - Proxy-owned failures are returned as JSON until the client WebSocket upgrade begins:
 
@@ -89,6 +89,8 @@ That's it! The same `ws://localhost:8080` endpoint works with any Playwright cli
   - `worker selection timed out`
   - `connect timed out after selecting worker`
   - `selected worker unavailable`
+- `selected worker unavailable` means the proxy saw a fast selected-worker failure and could not complete the handoff with another worker before the selection budget was exhausted.
+- Fast retry-path rollback happens in the background so slow Redis bookkeeping does not delay reselection. The tradeoff is that `allocated_sessions` can stay temporarily inflated while rollback catches up, but worker drain timing still follows committed successful sessions.
 - If Gorilla has already started the client upgrade handshake, the proxy still logs the exact failure and rolls back worker bookkeeping, but it may close the connection instead of returning a fresh JSON error body.
 - Malformed WebSocket handshakes after upgrade headers are present use standards-aligned HTTP responses instead of JSON:
   - `405 Method Not Allowed` for non-`GET` requests
@@ -205,7 +207,7 @@ flowchart TD
 2. **Contexts are created by the client** – use `browser.newContext()` or `browser.newPage()` after `connect()`.
 3. **Concurrent sessions** – each worker serves several client connections and contexts in parallel.
 4. **Recycling** – after serving a configurable number of sessions the worker shuts down; Docker/K8s restarts it to keep browser processes fresh.
-5. **Smart worker selection** – the proxy's algorithm keeps workers from hitting their restart threshold at the same time and still favours the busiest eligible worker.
+5. **Smart worker selection** – the proxy's algorithm keeps workers from hitting their restart threshold at the same time and still favours the least-loaded eligible worker.
 
 
 ## 🗺️ Roadmap
