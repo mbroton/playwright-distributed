@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"proxy/pkg/config"
 	"proxy/pkg/logger"
+	"slices"
 	"strconv"
 	"time"
 
@@ -14,8 +15,10 @@ import (
 )
 
 const (
-	activeConnectionsKey   = "cluster:active_connections"
-	lifetimeConnectionsKey = "cluster:lifetime_connections"
+	activeConnectionsKey     = "cluster:active_connections"
+	allocatedSessionsKey     = "cluster:allocated_sessions"
+	successfulSessionsKey    = "cluster:successful_sessions"
+	workerShutdownCommandFmt = "worker:cmd:%s"
 )
 
 //go:embed selector.lua
@@ -25,6 +28,8 @@ var selectorScriptSource string
 var reaperScriptSource string
 
 var ErrNoAvailableWorkers = errors.New("no available workers")
+
+const selectorResultFieldCount = 6
 
 type Client struct {
 	rd             *redis.Client
@@ -106,29 +111,32 @@ func (c *Client) GetWorkerActiveConnections(ctx context.Context, workerId string
 	return val, nil
 }
 
-func (c *Client) GetLifetimeConnections(ctx context.Context, workerId string) (int64, error) {
-	val, err := c.rd.HGet(ctx, lifetimeConnectionsKey, workerId).Int64()
+func (c *Client) GetAllocatedSessions(ctx context.Context, workerId string) (int64, error) {
+	val, err := c.rd.HGet(ctx, allocatedSessionsKey, workerId).Int64()
 	if err == redis.Nil {
 		return 0, nil
 	} else if err != nil {
-		return 0, fmt.Errorf("failed to get lifetime connections for worker %s: %w", workerId, err)
+		return 0, fmt.Errorf("failed to get allocated sessions for worker %s: %w", workerId, err)
 	}
 
 	return val, nil
 }
 
-func (c *Client) TriggerWorkerShutdownIfNeeded(ctx context.Context, serverInfo *ServerInfo) {
-	currentLifetime, err := c.GetLifetimeConnections(ctx, serverInfo.WorkerID())
+func (c *Client) RecordSuccessfulSessionAndTriggerShutdownIfNeeded(ctx context.Context, serverInfo *ServerInfo) {
+	// Shutdown must follow committed successful handoffs, not optimistic
+	// selector allocations. Async rollback can leave allocated_sessions
+	// temporarily inflated after a failed pre-upgrade handoff.
+	currentSuccessful, err := c.rd.HIncrBy(ctx, successfulSessionsKey, serverInfo.WorkerID(), 1).Result()
 	if err != nil {
-		logger.WithField("workerId", serverInfo.WorkerID()).Errorf("Could not get lifetime connections: %v", err)
+		logger.WithField("workerId", serverInfo.WorkerID()).Errorf("Failed to record successful session: %v", err)
 		return
 	}
 
-	if currentLifetime < int64(c.cfg.MaxLifetimeSessions) {
+	if currentSuccessful < int64(c.cfg.MaxLifetimeSessions) {
 		return
 	}
 
-	cmdKey := fmt.Sprintf("worker:cmd:%s", serverInfo.WorkerID())
+	cmdKey := fmt.Sprintf(workerShutdownCommandFmt, serverInfo.WorkerID())
 	wasSet, err := c.rd.SetNX(ctx, cmdKey, "shutdown", time.Duration(c.cfg.ShutdownCommandTTL)*time.Second).Result()
 	if err != nil {
 		logger.WithField("workerId", serverInfo.WorkerID()).Errorf("Failed to set shutdown command: %v", err)
@@ -141,8 +149,8 @@ func (c *Client) TriggerWorkerShutdownIfNeeded(ctx context.Context, serverInfo *
 		}
 
 		logger.WithField("workerId", serverInfo.WorkerID()).Infof(
-			"Worker has reached session limit (%d/%d). Shutdown command sent.",
-			currentLifetime,
+			"Worker has reached successful session limit (%d/%d). Shutdown command sent.",
+			currentSuccessful,
 			c.cfg.MaxLifetimeSessions,
 		)
 	}
@@ -157,10 +165,10 @@ func (c *Client) ModifyActiveConnections(ctx context.Context, serverInfo *Server
 	return nil
 }
 
-func (c *Client) ModifyLifetimeConnections(ctx context.Context, serverInfo *ServerInfo, delta int64) error {
-	err := c.rd.HIncrBy(ctx, lifetimeConnectionsKey, serverInfo.WorkerID(), int64(delta)).Err()
+func (c *Client) ModifyAllocatedSessions(ctx context.Context, serverInfo *ServerInfo, delta int64) error {
+	err := c.rd.HIncrBy(ctx, allocatedSessionsKey, serverInfo.WorkerID(), int64(delta)).Err()
 	if err != nil {
-		return fmt.Errorf("failed to modify lifetime connections for worker %s: %w", serverInfo.WorkerID(), err)
+		return fmt.Errorf("failed to modify allocated sessions for worker %s: %w", serverInfo.WorkerID(), err)
 	}
 
 	return nil
@@ -181,14 +189,25 @@ func (c *Client) GetWorker(ctx context.Context, workerId string) (ServerInfo, er
 	return serverInfo, nil
 }
 
-func (c *Client) SelectWorker(ctx context.Context, browserType string) (ServerInfo, error) {
+func (c *Client) SelectWorker(ctx context.Context, browserType string, excludedWorkerIDs []string) (ServerInfo, error) {
+	args := []any{
+		c.cfg.MaxConcurrentSessions,
+		c.cfg.MaxLifetimeSessions,
+		browserType,
+		c.cfg.SelectorFreshnessTimeout,
+	}
+	for _, excludedWorkerID := range excludedWorkerIDs {
+		if excludedWorkerID == "" {
+			continue
+		}
+		args = append(args, excludedWorkerID)
+	}
+
 	result, err := c.selectorScript.Run(
 		ctx,
 		c.rd,
 		[]string{},
-		c.cfg.MaxConcurrentSessions,
-		c.cfg.MaxLifetimeSessions,
-		browserType,
+		args...,
 	).Result()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
@@ -197,21 +216,55 @@ func (c *Client) SelectWorker(ctx context.Context, browserType string) (ServerIn
 		return ServerInfo{}, fmt.Errorf("failed to run selector script: %w", err)
 	}
 
-	workerId, ok := result.(string)
+	resultFields, ok := result.([]any)
 	if !ok {
 		return ServerInfo{}, fmt.Errorf("selector script returned unexpected type: %T", result)
 	}
 
-	return c.GetWorker(ctx, workerId)
+	return parseSelectorResult(resultFields)
+}
+
+func parseSelectorResult(resultFields []any) (ServerInfo, error) {
+	if len(resultFields) != selectorResultFieldCount {
+		return ServerInfo{}, fmt.Errorf("selector script returned %d fields, want %d", len(resultFields), selectorResultFieldCount)
+	}
+
+	stringFields := make([]string, len(resultFields))
+	for i, rawField := range resultFields {
+		field, ok := rawField.(string)
+		if !ok {
+			return ServerInfo{}, fmt.Errorf("selector script returned non-string field at index %d: %T", i, rawField)
+		}
+		stringFields[i] = field
+	}
+
+	serverInfo := ServerInfo{
+		ID:            stringFields[0],
+		BrowserType:   stringFields[1],
+		Endpoint:      stringFields[2],
+		Status:        stringFields[3],
+		StartedAt:     stringFields[4],
+		LastHeartbeat: stringFields[5],
+	}
+
+	if slices.Contains([]string{
+		serverInfo.ID,
+		serverInfo.BrowserType,
+		serverInfo.Endpoint,
+		serverInfo.Status,
+		serverInfo.StartedAt,
+		serverInfo.LastHeartbeat,
+	}, "") {
+		return ServerInfo{}, fmt.Errorf("selector script returned incomplete worker metadata")
+	}
+
+	return serverInfo, nil
 }
 
 func (c *Client) ReapStaleWorkers(ctx context.Context) (int, error) {
-	workerIDs, err := c.rd.HKeys(ctx, lifetimeConnectionsKey).Result()
+	workerIDs, err := c.getReapCandidateWorkerIDs(ctx)
 	if err != nil {
-		if errors.Is(err, redis.Nil) {
-			return 0, nil
-		}
-		return 0, fmt.Errorf("failed to get worker IDs from lifetime connections: %w", err)
+		return 0, err
 	}
 
 	if len(workerIDs) == 0 {
@@ -223,7 +276,12 @@ func (c *Client) ReapStaleWorkers(ctx context.Context) (int, error) {
 		args[i] = v
 	}
 
-	result, err := c.reaperScript.Run(ctx, c.rd, []string{activeConnectionsKey, lifetimeConnectionsKey}, args...).Result()
+	result, err := c.reaperScript.Run(
+		ctx,
+		c.rd,
+		[]string{activeConnectionsKey, allocatedSessionsKey, successfulSessionsKey},
+		args...,
+	).Result()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
 			return 0, nil
@@ -241,4 +299,38 @@ func (c *Client) ReapStaleWorkers(ctx context.Context) (int, error) {
 	}
 
 	return len(reapedIDs), nil
+}
+
+func (c *Client) getReapCandidateWorkerIDs(ctx context.Context) ([]string, error) {
+	hashes := []struct {
+		key         string
+		description string
+	}{
+		{key: activeConnectionsKey, description: "active connections"},
+		{key: allocatedSessionsKey, description: "allocated sessions"},
+		{key: successfulSessionsKey, description: "successful sessions"},
+	}
+
+	workerIDSet := make(map[string]struct{})
+	for _, hash := range hashes {
+		workerIDs, err := c.rd.HKeys(ctx, hash.key).Result()
+		if err != nil {
+			if errors.Is(err, redis.Nil) {
+				continue
+			}
+			return nil, fmt.Errorf("failed to get worker IDs from %s: %w", hash.description, err)
+		}
+
+		for _, workerID := range workerIDs {
+			workerIDSet[workerID] = struct{}{}
+		}
+	}
+
+	workerIDs := make([]string, 0, len(workerIDSet))
+	for workerID := range workerIDSet {
+		workerIDs = append(workerIDs, workerID)
+	}
+	slices.Sort(workerIDs)
+
+	return workerIDs, nil
 }

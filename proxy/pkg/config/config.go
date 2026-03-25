@@ -14,6 +14,7 @@ type Config struct {
 	MaxLifetimeSessions         int    `mapstructure:"MAX_LIFETIME_SESSIONS"`
 	ReaperRunInterval           int    `mapstructure:"REAPER_RUN_INTERVAL"`
 	ShutdownCommandTTL          int    `mapstructure:"SHUTDOWN_COMMAND_TTL"`
+	SelectorFreshnessTimeout    int    `mapstructure:"SELECTOR_FRESHNESS_TIMEOUT"`
 	ProxyReadHeaderTimeout      int    `mapstructure:"PROXY_READ_HEADER_TIMEOUT"`
 	ProxyWorkerSelectionTimeout int    `mapstructure:"PROXY_WORKER_SELECTION_TIMEOUT"`
 	ProxyConnectTimeout         int    `mapstructure:"PROXY_CONNECT_TIMEOUT"`
@@ -31,6 +32,7 @@ func LoadConfig() (*Config, error) {
 	viper.BindEnv("MAX_LIFETIME_SESSIONS")
 	viper.BindEnv("REAPER_RUN_INTERVAL")
 	viper.BindEnv("SHUTDOWN_COMMAND_TTL")
+	viper.BindEnv("SELECTOR_FRESHNESS_TIMEOUT")
 	viper.BindEnv("PROXY_READ_HEADER_TIMEOUT")
 	viper.BindEnv("PROXY_WORKER_SELECTION_TIMEOUT")
 	viper.BindEnv("PROXY_CONNECT_TIMEOUT")
@@ -40,6 +42,7 @@ func LoadConfig() (*Config, error) {
 	viper.SetDefault("MAX_LIFETIME_SESSIONS", 50)
 	viper.SetDefault("REAPER_RUN_INTERVAL", 300)
 	viper.SetDefault("SHUTDOWN_COMMAND_TTL", 60)
+	viper.SetDefault("SELECTOR_FRESHNESS_TIMEOUT", 60)
 	viper.SetDefault("PROXY_READ_HEADER_TIMEOUT", 5)
 	viper.SetDefault("PROXY_WORKER_SELECTION_TIMEOUT", 5)
 	viper.SetDefault("PROXY_CONNECT_TIMEOUT", 5)
@@ -56,6 +59,9 @@ func LoadConfig() (*Config, error) {
 	}
 	if cfg.RedisPort == 0 {
 		return nil, fmt.Errorf("REDIS_PORT is required")
+	}
+	if cfg.SelectorFreshnessTimeout <= 0 {
+		return nil, fmt.Errorf("SELECTOR_FRESHNESS_TIMEOUT must be greater than 0")
 	}
 	if cfg.ProxyReadHeaderTimeout <= 0 {
 		return nil, fmt.Errorf("PROXY_READ_HEADER_TIMEOUT must be greater than 0")

@@ -19,6 +19,7 @@ func TestLoadConfig_UsesProxyTimeouts(t *testing.T) {
 
 	t.Setenv("REDIS_HOST", "redis")
 	t.Setenv("REDIS_PORT", "6379")
+	t.Setenv("SELECTOR_FRESHNESS_TIMEOUT", "45")
 	t.Setenv("PROXY_READ_HEADER_TIMEOUT", "3")
 	t.Setenv("PROXY_WORKER_SELECTION_TIMEOUT", "7")
 	t.Setenv("PROXY_CONNECT_TIMEOUT", "7")
@@ -30,6 +31,9 @@ func TestLoadConfig_UsesProxyTimeouts(t *testing.T) {
 
 	if cfg.ProxyReadHeaderTimeout != 3 {
 		t.Fatalf("expected PROXY_READ_HEADER_TIMEOUT 3, got %d", cfg.ProxyReadHeaderTimeout)
+	}
+	if cfg.SelectorFreshnessTimeout != 45 {
+		t.Fatalf("expected SELECTOR_FRESHNESS_TIMEOUT 45, got %d", cfg.SelectorFreshnessTimeout)
 	}
 	if cfg.ProxyWorkerSelectionTimeout != 7 {
 		t.Fatalf("expected PROXY_WORKER_SELECTION_TIMEOUT 7, got %d", cfg.ProxyWorkerSelectionTimeout)
@@ -53,6 +57,9 @@ func TestLoadConfig_UsesTimeoutDefaults(t *testing.T) {
 	if cfg.ProxyReadHeaderTimeout != 5 {
 		t.Fatalf("expected default PROXY_READ_HEADER_TIMEOUT 5, got %d", cfg.ProxyReadHeaderTimeout)
 	}
+	if cfg.SelectorFreshnessTimeout != 60 {
+		t.Fatalf("expected default SELECTOR_FRESHNESS_TIMEOUT 60, got %d", cfg.SelectorFreshnessTimeout)
+	}
 	if cfg.ProxyWorkerSelectionTimeout != 5 {
 		t.Fatalf("expected default PROXY_WORKER_SELECTION_TIMEOUT 5, got %d", cfg.ProxyWorkerSelectionTimeout)
 	}
@@ -67,6 +74,11 @@ func TestLoadConfig_RejectsNonPositiveTimeouts(t *testing.T) {
 		envName string
 		want    string
 	}{
+		{
+			name:    "selector freshness timeout",
+			envName: "SELECTOR_FRESHNESS_TIMEOUT",
+			want:    "SELECTOR_FRESHNESS_TIMEOUT must be greater than 0",
+		},
 		{
 			name:    "read header timeout",
 			envName: "PROXY_READ_HEADER_TIMEOUT",

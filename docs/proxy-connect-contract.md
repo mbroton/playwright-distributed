@@ -64,6 +64,7 @@ Reason:
 - this is the main user-facing queue timeout
 - if all matching workers are busy, the proxy should wait for a worker instead of failing immediately
 - clients care most about how long they wait for capacity
+- the proxy may also spend this budget retrying after fast selected-worker failures before a usable handoff exists
 
 This timeout is the answer to the question: "How long will the proxy wait for a worker to become available?"
 
@@ -115,25 +116,31 @@ Stable client-facing messages in this phase include:
 `worker selection timed out` means:
 
 - the proxy kept retrying for an eligible worker
-- no worker became available before `PROXY_WORKER_SELECTION_TIMEOUT` expired
+- no usable worker became available before `PROXY_WORKER_SELECTION_TIMEOUT` expired
 
 This is deliberate. The proxy does not currently expose a fail-fast public error like `no available workers`. In the current retrying model, the real terminal client-visible failure is timeout, not an instantaneous "none available right now" signal.
 
 `connect timed out after selecting worker` means:
 
 - the proxy already selected a worker
-- the remaining handoff did not finish before `PROXY_CONNECT_TIMEOUT` expired
+- the remaining handoff did not finish before the active post-selection timeout expired
 
 This covers post-selection timeout conditions such as:
 
 - backend dial timeout
 - connect budget already exhausted before client upgrade starts
+- a later selected-worker attempt during reselection inheriting only the remaining `PROXY_WORKER_SELECTION_TIMEOUT` budget
+
+`PROXY_CONNECT_TIMEOUT` is a per-attempt ceiling, not extra time added on top of the selection phase. The first selected-worker handoff keeps the full `PROXY_CONNECT_TIMEOUT`. During reselection, the effective timeout for a later handoff attempt is `min(PROXY_CONNECT_TIMEOUT, remaining PROXY_WORKER_SELECTION_TIMEOUT)`.
 
 `selected worker unavailable` means:
 
-- the proxy selected a worker
+- the proxy saw a fast selected-worker failure
 - the failure was not classified as a timeout
-- the selected worker or its endpoint appears invalid, unreachable, or otherwise failed during the backend connection phase
+- the selected worker or its endpoint appears invalid, unreachable, or otherwise failed before a usable handoff completed
+- the proxy could not finish selection and handoff with another worker before the selection budget expired
+
+Fast retry-path rollback runs in the background so Redis bookkeeping cannot delay reselection. This can leave `allocated_sessions` temporarily inflated until rollback completes, which is an accepted internal tradeoff to preserve the public timeout contract.
 
 ### Errors During `Upgrade()`
 
@@ -172,6 +179,14 @@ This is a deliberate tradeoff. It duplicates a small part of Gorilla's behavior,
 
 Worker selection increments Redis counters during selection. That means the proxy must roll those counters back if setup fails later.
 
+The proxy intentionally keeps three different session counters:
+
+- `cluster:active_connections`: current live or still-pending sessions on the worker
+- `cluster:allocated_sessions`: optimistic lifetime budget already reserved by selection
+- `cluster:successful_sessions`: committed successful handoffs that completed proxy setup
+
+That split is deliberate. `allocated_sessions` may be temporarily inflated while async rollback catches up, but worker drain decisions must still follow `successful_sessions` so a failed handoff cannot drain a healthy worker one session early.
+
 Cleanup work uses a detached bookkeeping context instead of the request context.
 
 Reason:
@@ -189,7 +204,8 @@ The current contract intentionally does not do the following:
 - guarantee JSON after Gorilla has started the client upgrade
 - provide a public fail-fast `no available workers` error while selection is retry-based
 - blackhole or blacklist workers automatically in the proxy when a selected worker fails
-- retry different workers after a selected worker has already been chosen
+- retry different workers after backend dial has already timed out
+- retry different workers once the client upgrade path has already started
 
 Those behaviors would expand the public contract or change proxy semantics. They should be introduced only as explicit follow-up decisions.
 

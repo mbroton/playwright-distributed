@@ -1,132 +1,134 @@
 # Worker Selection Strategy
 
-This document explains how the proxy selects workers from the available pool and why this strategy helps maintain system stability.
+This document explains how the proxy chooses a worker and why the selector is intentionally biased toward both healthy load distribution and staggered worker recycling.
 
 ## Overview
 
-The worker selector in `proxy/internal/redis/selector.lua` implements a **lifetime-first selection strategy** designed to prevent multiple workers from reaching their session limit simultaneously, which would cause multiple restarts at the same time and temporarily reduce cluster capacity.
+The selector in `proxy/internal/redis/selector.lua` now uses **balanced routing with restart bias**.
 
-## Strategy Details
+That means:
 
-### Primary Goal: Stagger Worker Restarts
+- route only to healthy, eligible workers
+- prefer the least-loaded eligible worker first
+- keep an allocated-session safety margin so workers do not all hit their recycle limit at the same time
+- stay deterministic so behavior is predictable and easy to test
 
-Instead of distributing load evenly across all workers (which causes them to reach their limits at the same time), we intentionally "push" one worker to its limit first while keeping others behind. This ensures only one worker restarts at a time.
+The selector still runs in Redis/Lua because selection and counter increment must stay atomic.
 
-### Worker Discovery
+The selector uses `cluster:allocated_sessions` as its optimistic lifetime budget counter. Worker drain decisions use `cluster:successful_sessions` instead. That split keeps async rollback from draining a healthy worker one session early.
 
-Workers are pre-registered in the `cluster:active_connections` hash on startup with an initial value of 0. This ensures all workers are visible to the selection algorithm, including those with zero active connections.
+## Eligibility Rules
 
-### Selection Algorithm
+A worker is eligible only if all of these are true:
 
-1. **Early exit**: If no workers are available in the cluster, return `nil` immediately to prevent errors.
+- browser type matches the requested browser
+- status is `available`
+- active connections are below `MAX_CONCURRENT_SESSIONS`
+- allocated sessions are below `MAX_LIFETIME_SESSIONS`
+- `lastHeartbeat` is within `SELECTOR_FRESHNESS_TIMEOUT`
+- the worker metadata needed for routing is present and well-formed
+- the worker is not excluded for the current connection attempt
 
-2. **Filter eligible workers** based on:
-   - Status is "available"
-   - Active connections < `MAX_CONCURRENT_SESSIONS`
-   - Lifetime connections < `MAX_LIFETIME_SESSIONS`
-   - Recent heartbeat (within last 60 seconds)
+The selector ignores orphan counter entries that no longer have a valid worker record. Cleanup of those stale counters remains the reaper's job.
 
-3. **Calculate adaptive safety margin**:
-   ```
-   margin = max(1, floor(MAX_LIFETIME_SESSIONS / total_workers))
-   ```
+## Selection Algorithm
 
-4. **Primary selection** (respecting safety margin):
-   - Among workers with `lifetime < (MAX_LIFETIME_SESSIONS - margin)`
-   - Select worker with **highest lifetime** connections
-   - Tie-break with **lowest active** connections
+The selector uses two tiers.
 
-5. **Fallback selection** (respects hard limit):
-   - If no workers pass the margin check
-   - Among workers with `lifetime + 1 <= MAX_LIFETIME_SESSIONS`
-   - Select worker with **highest lifetime** connections
-   - Tie-break with **lowest active** connections
+### 1. Tier 1: Headroom Tier
 
-## Example Scenarios
+Workers in this tier satisfy:
 
-### Scenario 1: Normal Operation
-- **Setup**: 4 workers, `MAX_LIFETIME_SESSIONS = 20`
-- **Margin**: `max(1, floor(20/4)) = 5`
-- **Current state**:
-  ```
-  Worker A: lifetime=18, active=2  # Within margin (18 >= 15), not selectable
-  Worker B: lifetime=12, active=1  # Best choice (highest lifetime under margin)
-  Worker C: lifetime=8,  active=0
-  Worker D: lifetime=3,  active=1
-  ```
-- **Result**: Worker B is selected
-- **Rationale**: Worker A is close to its limit, so we avoid it. Worker B has done the most work among the remaining candidates.
+```text
+allocated < MAX_LIFETIME_SESSIONS - margin
+```
 
-### Scenario 2: Small Cluster with High Load
-- **Setup**: 2 workers, `MAX_LIFETIME_SESSIONS = 10`
-- **Margin**: `max(1, floor(10/2)) = 5`
-- **Current state**:
-  ```
-  Worker A: lifetime=8, active=3   # Within margin (8 >= 5), not selectable
-  Worker B: lifetime=7, active=2   # Within margin (7 >= 5), not selectable
-  ```
-- **Fallback triggered**: Both workers are within margin
-- **Result**: Worker A is selected (highest lifetime, and 8+1 <= 10)
-- **Rationale**: System prioritizes progress over perfect staggering when necessary, but never exceeds the hard limit.
+The margin is computed from the number of **eligible** workers for the requested browser:
 
-### Scenario 3: Development Environment
-- **Setup**: 1 worker, `MAX_LIFETIME_SESSIONS = 4`
-- **Margin**: `max(1, floor(4/1)) = 4`
-- **Current state**:
-  ```
-  Worker A: lifetime=2, active=0   # Under margin (2 < 0), selectable
-  ```
-- **Result**: Worker A is selected
-- **Rationale**: With only one worker, we can't stagger, but the margin prevents issues at the boundary.
+```text
+margin = max(1, floor(MAX_LIFETIME_SESSIONS / eligible_workers))
+```
 
-### Scenario 4: Edge Case - Worker at Limit
-- **Setup**: 3 workers, `MAX_LIFETIME_SESSIONS = 10`
-- **Margin**: `max(1, floor(10/3)) = 3`
-- **Current state**:
-  ```
-  Worker A: lifetime=9, active=1   # At limit-1, can be selected by fallback (9+1 <= 10)
-  Worker B: lifetime=7, active=2   # Within margin (7 >= 7), not selectable in primary
-  Worker C: lifetime=5, active=0   # Best primary choice (highest under margin)
-  ```
-- **Result**: Worker C is selected (primary selection)
-- **Rationale**: Primary selection prefers Worker C. If Worker C were unavailable, fallback would select Worker A but never Worker B at lifetime=10.
+This keeps workers with enough allocated headroom in the preferred pool and prevents the selector from pushing every worker toward the recycle edge at the same rate.
 
-## Benefits
+### 2. Tier 2: Fallback Tier
 
-### 1. **Predictable Capacity**
-- Only one worker restarts at a time
-- Cluster maintains `(N-1)/N` capacity during restarts instead of dropping significantly
+If Tier 1 is empty, the selector falls back to any remaining eligible worker that still stays under the hard lifetime limit for one more session:
 
-### 2. **Load Distribution**
-- Active connection tie-breaker prevents overloading busy workers
-- System remains responsive under concurrent load
+```text
+allocated + 1 <= MAX_LIFETIME_SESSIONS
+```
 
-### 3. **Adaptive Behavior**
-- Margin scales with cluster size automatically
-- Works efficiently for both small dev clusters and large production deployments
+This fallback keeps the system making progress under pressure without violating the hard limit.
 
-### 4. **Performance**
-- O(N) algorithm - single pass through workers
+## Ranking Inside a Tier
 
-### 5. **Robustness**
-- Guards against edge cases (empty worker pool, division by zero)
-- Guarantees compliance with hard lifetime limits
-- All workers visible regardless of current active connection count
+Within either tier, workers are ranked in this order:
+
+1. lower active connections
+2. higher allocated sessions
+3. older `startedAt`
+4. lexicographically smaller worker ID
+
+Why this order:
+
+- lower active connections keeps routing load-aware
+- higher allocated sessions keep the restart-staggering bias
+- older `startedAt` breaks ties in a stable way
+- worker ID is the final deterministic tiebreaker
+
+## Why This Replaced Pure Lifetime-First Routing
+
+The previous lifetime-first strategy did stagger restarts, but it over-prioritized lifetime even when another healthy worker was less loaded.
+
+The new strategy keeps the useful part of the old behavior while fixing that imbalance:
+
+- load awareness comes first inside a tier
+- restart bias still exists through the allocated-session safety margin and the allocated-session tiebreak
+- margin calculation now depends on eligible workers, not raw counter hashes
+
+## Failure Handling Boundary
+
+The selector itself only chooses workers and increments counters atomically. Failure recovery around selection happens in the proxy handler.
+
+For one connection attempt, the proxy may exclude a selected worker and ask the selector for another one when a selected worker fails fast before the handoff succeeds, for example:
+
+- invalid worker endpoint
+- immediate backend dial failure
+- selected worker disappears before a usable handoff can be completed
+
+Those exclusions are request-scoped only. They are not a cluster-wide blacklist.
+
+The proxy does **not** use selector retries for:
+
+- backend dial timeout
+- client upgrade failure after Gorilla starts the upgrade path
+
+Those remain terminal handoff failures for that client connection.
 
 ## Configuration Impact
 
-The selection strategy interacts with these configuration values:
+The selector depends on these values:
 
-- **`MAX_CONCURRENT_SESSIONS`**: Hard limit on concurrent connections per worker
-- **`MAX_LIFETIME_SESSIONS`**: Triggers worker restart and drives the selection preference
-- **Worker count**: Automatically detected and used to calculate the safety margin
+- `MAX_CONCURRENT_SESSIONS`
+- `MAX_LIFETIME_SESSIONS`
+- `SELECTOR_FRESHNESS_TIMEOUT`
 
-## Monitoring
+`SELECTOR_FRESHNESS_TIMEOUT` is intentionally explicit now. The selector no longer relies on a hardcoded heartbeat age threshold.
 
-To observe the strategy in action, monitor:
+`MAX_LIFETIME_SESSIONS` still refers to successful sessions at the worker lifecycle level. The selector uses `allocated_sessions` conservatively against that same limit so in-flight handoffs cannot oversubscribe the worker.
 
-1. **Lifetime connection distribution** across workers
-2. **Restart timing** - should see staggered restarts, not simultaneous ones
-3. **Active connection spikes** during high load periods
+## Operational Expectations
 
-The strategy should show a "sawtooth" pattern in lifetime connections over time, with one worker climbing to the limit, restarting (dropping to 0), while others remain at intermediate levels. 
+If the selector is working correctly, you should see:
+
+- draining and stale workers stop receiving new sessions
+- lower-active healthy workers preferred over busier ones
+- allocated-session counts rise unevenly enough that worker recycling is staggered rather than synchronized
+- fast bad-worker failures retried against other workers within the selection timeout when possible
+
+The system should still show a sawtooth-style allocated-session pattern over time, but with healthier per-request load distribution than a pure lifetime-first policy.
+
+## Known Scale Tradeoff
+
+The current selector still scans Redis worker state in O(N) per selection attempt. That is intentional for the current expected pool size because it keeps selection logic deterministic and atomic inside Lua. If the worker fleet or the number of queued clients grows substantially, this design will need a different data structure rather than incremental tuning.

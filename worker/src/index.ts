@@ -15,7 +15,8 @@ interface WorkerMetadata {
 }
 
 const clusterActiveConnectionsKey = 'cluster:active_connections';
-const clusterLifetimeConnectionsKey = 'cluster:lifetime_connections';
+const clusterAllocatedSessionsKey = 'cluster:allocated_sessions';
+const clusterSuccessfulSessionsKey = 'cluster:successful_sessions';
 
 
 class BrowserWorker {
@@ -171,12 +172,13 @@ class BrowserWorker {
     private async initializeCounters(): Promise<void> {
         this.logger.debug('Initializing worker connection counters in Redis...');
         try {
-            const [activeResult, lifetimeResult] = await Promise.all([
+            const [activeResult, allocatedResult, successfulResult] = await Promise.all([
                 this.redis.hSetNX(clusterActiveConnectionsKey, this.workerIdKey, String(0)),
-                this.redis.hSetNX(clusterLifetimeConnectionsKey, this.workerIdKey, String(0))
+                this.redis.hSetNX(clusterAllocatedSessionsKey, this.workerIdKey, String(0)),
+                this.redis.hSetNX(clusterSuccessfulSessionsKey, this.workerIdKey, String(0))
             ]);
 
-            if (activeResult && lifetimeResult) {
+            if (activeResult && allocatedResult && successfulResult) {
                 this.logger.debug('Successfully initialized connection counters.');
             } else {
                 this.logger.debug('Connection counters were already initialized for this worker.');

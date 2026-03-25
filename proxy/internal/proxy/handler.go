@@ -38,10 +38,10 @@ const (
 )
 
 type redisClient interface {
-	SelectWorker(ctx context.Context, browserType string) (redis.ServerInfo, error)
-	TriggerWorkerShutdownIfNeeded(ctx context.Context, serverInfo *redis.ServerInfo)
+	SelectWorker(ctx context.Context, browserType string, excludedWorkerIDs []string) (redis.ServerInfo, error)
+	RecordSuccessfulSessionAndTriggerShutdownIfNeeded(ctx context.Context, serverInfo *redis.ServerInfo)
 	ModifyActiveConnections(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error
-	ModifyLifetimeConnections(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error
+	ModifyAllocatedSessions(ctx context.Context, serverInfo *redis.ServerInfo, delta int64) error
 }
 
 type wsConn interface {
@@ -83,9 +83,16 @@ func rollbackWorkerCounters(parent context.Context, rd redisClient, server *redi
 		logger.Error("Failed to roll back active connections for %s: %v", server.WorkerID(), derr)
 	}
 
-	if derr := rd.ModifyLifetimeConnections(ctx, server, -1); derr != nil {
-		logger.Error("Failed to roll back lifetime connections for %s: %v", server.WorkerID(), derr)
+	if derr := rd.ModifyAllocatedSessions(ctx, server, -1); derr != nil {
+		logger.Error("Failed to roll back allocated sessions for %s: %v", server.WorkerID(), derr)
 	}
+}
+
+func rollbackWorkerCountersAsync(parent context.Context, rd redisClient, server redis.ServerInfo) {
+	// Retry-path rollback must not consume the reselection budget. Temporary
+	// counter inflation is preferable to letting Redis bookkeeping delay the
+	// next selection attempt beyond PROXY_WORKER_SELECTION_TIMEOUT.
+	go rollbackWorkerCounters(parent, rd, &server)
 }
 
 func classifyWorkerSelectionError(err error) error {
@@ -100,6 +107,10 @@ func classifyWorkerSelectionError(err error) error {
 }
 
 func selectWorkerWithRetry(ctx context.Context, rd redisClient, browserType string) (redis.ServerInfo, error) {
+	return selectWorkerWithRetryExcluding(ctx, rd, browserType, nil)
+}
+
+func selectWorkerWithRetryExcluding(ctx context.Context, rd redisClient, browserType string, excludedWorkerIDs []string) (redis.ServerInfo, error) {
 	ticker := time.NewTicker(retryDelay)
 	defer ticker.Stop()
 
@@ -108,7 +119,7 @@ func selectWorkerWithRetry(ctx context.Context, rd redisClient, browserType stri
 			return redis.ServerInfo{}, classifyWorkerSelectionError(err)
 		}
 
-		server, err := rd.SelectWorker(ctx, browserType)
+		server, err := rd.SelectWorker(ctx, browserType, excludedWorkerIDs)
 		if err == nil {
 			return server, nil
 		}
@@ -128,6 +139,20 @@ func selectWorkerWithRetry(ctx context.Context, rd redisClient, browserType stri
 			return redis.ServerInfo{}, classifyWorkerSelectionError(ctx.Err())
 		}
 	}
+}
+
+func appendExcludedWorkerID(excludedWorkerIDs []string, workerID string) []string {
+	if workerID == "" {
+		return excludedWorkerIDs
+	}
+
+	for _, excludedWorkerID := range excludedWorkerIDs {
+		if excludedWorkerID == workerID {
+			return excludedWorkerIDs
+		}
+	}
+
+	return append(excludedWorkerIDs, workerID)
 }
 
 func defaultBackendDialerFactory(timeout time.Duration) websocketBackendDialer {
@@ -232,6 +257,22 @@ func remainingTimeout(ctx context.Context) time.Duration {
 	return timeout
 }
 
+func newConnectAttemptContext(
+	requestCtx context.Context,
+	selectionCtx context.Context,
+	connectTimeout time.Duration,
+	isRetry bool,
+) (context.Context, context.CancelFunc) {
+	// The first selected-worker handoff keeps the full connect timeout. Only
+	// retries after fast selected-worker failures are bounded by the remaining
+	// selection budget, so reselection cannot extend PROXY_WORKER_SELECTION_TIMEOUT.
+	if isRetry {
+		return newTimeoutContext(selectionCtx, connectTimeout)
+	}
+
+	return newTimeoutContext(requestCtx, connectTimeout)
+}
+
 func isTimeoutLikeError(err error) bool {
 	if err == nil {
 		return false
@@ -289,56 +330,89 @@ func proxyHandlerWithConnectionFactories(
 		selectionCtx, cancel := newTimeoutContext(r.Context(), selectionTimeout)
 		defer cancel()
 
-		server, err := selectWorkerWithRetry(selectionCtx, rd, browserType)
-		if err != nil {
-			switch {
-			case errors.Is(err, errWorkerSelectionDeadlineExceeded):
-				logger.Error(
-					"Connection from %s rejected. Worker selection timed out after %v.",
-					r.RemoteAddr,
-					selectionTimeout,
-				)
-				httputils.ErrorResponse(w, http.StatusServiceUnavailable, workerSelectionTimedOutMessage)
-			case errors.Is(err, errWorkerSelectionCanceled):
-				logger.Debug("Connection from %s canceled during worker selection.", r.RemoteAddr)
-			default:
-				logger.Error(
-					"Connection from %s rejected. An unexpected error occurred while selecting a worker: %v",
-					r.RemoteAddr,
-					err,
-				)
-				httputils.ErrorResponse(w, http.StatusInternalServerError, internalServerErrorMessage)
-			}
-			return
-		}
-
-		// Waiting for capacity is the main user-facing timeout. Once a worker is
-		// selected, start a separate handoff budget so queue wait and worker
-		// handoff failures stay distinct in the public contract.
-		refreshPreUpgradeWriteDeadline(w, cfg)
-
 		connectTimeout := proxyConnectTimeout(cfg)
-		connectCtx, cancel := newTimeoutContext(r.Context(), connectTimeout)
-		defer cancel()
+		excludedWorkerIDs := []string(nil)
+		sawSelectedWorkerFailure := false
 
-		backendURL, err := url.Parse(server.Endpoint)
-		if err != nil {
-			logger.Error("Connection from %s rejected. Worker endpoint is invalid: %v", r.RemoteAddr, err)
-			rollbackWorkerCounters(r.Context(), rd, &server)
-			httputils.ErrorResponse(w, http.StatusServiceUnavailable, selectedWorkerUnavailableMessage)
-			return
-		}
+		var (
+			server        redis.ServerInfo
+			serverConn    *websocket.Conn
+			connectCtx    context.Context
+			connectCancel context.CancelFunc
+		)
 
-		backendTimeout := remainingTimeout(connectCtx)
-		if backendTimeout <= 0 {
-			logger.Error("Connection from %s rejected. Connect timed out after selecting worker %s.", r.RemoteAddr, server.WorkerID())
-			rollbackWorkerCounters(r.Context(), rd, &server)
-			httputils.ErrorResponse(w, http.StatusServiceUnavailable, connectTimedOutAfterSelectingWorkerMessage)
-			return
-		}
+		for {
+			server, err := selectWorkerWithRetryExcluding(selectionCtx, rd, browserType, excludedWorkerIDs)
+			if err != nil {
+				switch {
+				case errors.Is(err, errWorkerSelectionDeadlineExceeded):
+					if sawSelectedWorkerFailure {
+						logger.Error(
+							"Connection from %s rejected. Selection budget expired after selected worker failures over %v.",
+							r.RemoteAddr,
+							selectionTimeout,
+						)
+						httputils.ErrorResponse(w, http.StatusServiceUnavailable, selectedWorkerUnavailableMessage)
+						return
+					}
 
-		serverConn, _, err := dialerFactory(backendTimeout).DialContext(connectCtx, backendURL.String(), nil)
-		if err != nil {
+					logger.Error(
+						"Connection from %s rejected. Worker selection timed out after %v.",
+						r.RemoteAddr,
+						selectionTimeout,
+					)
+					httputils.ErrorResponse(w, http.StatusServiceUnavailable, workerSelectionTimedOutMessage)
+				case errors.Is(err, errWorkerSelectionCanceled):
+					logger.Debug("Connection from %s canceled during worker selection.", r.RemoteAddr)
+				default:
+					logger.Error(
+						"Connection from %s rejected. An unexpected error occurred while selecting a worker: %v",
+						r.RemoteAddr,
+						err,
+					)
+					httputils.ErrorResponse(w, http.StatusInternalServerError, internalServerErrorMessage)
+				}
+				return
+			}
+
+			// Waiting for capacity is the main user-facing timeout. The first
+			// selected-worker handoff keeps the full connect timeout. Later retry
+			// attempts are capped by the remaining selection budget so reselection
+			// cannot extend PROXY_WORKER_SELECTION_TIMEOUT.
+			refreshPreUpgradeWriteDeadline(w, cfg)
+
+			connectCtx, connectCancel = newConnectAttemptContext(
+				r.Context(),
+				selectionCtx,
+				connectTimeout,
+				sawSelectedWorkerFailure,
+			)
+
+			backendURL, parseErr := url.Parse(server.Endpoint)
+			if parseErr != nil {
+				connectCancel()
+				logger.Error("Connection from %s rejected. Worker endpoint for %s is invalid: %v", r.RemoteAddr, server.WorkerID(), parseErr)
+				rollbackWorkerCountersAsync(r.Context(), rd, server)
+				excludedWorkerIDs = appendExcludedWorkerID(excludedWorkerIDs, server.WorkerID())
+				sawSelectedWorkerFailure = true
+				continue
+			}
+
+			backendTimeout := remainingTimeout(connectCtx)
+			if backendTimeout <= 0 {
+				connectCancel()
+				logger.Error("Connection from %s rejected. Connect timed out after selecting worker %s.", r.RemoteAddr, server.WorkerID())
+				rollbackWorkerCounters(r.Context(), rd, &server)
+				httputils.ErrorResponse(w, http.StatusServiceUnavailable, connectTimedOutAfterSelectingWorkerMessage)
+				return
+			}
+
+			serverConn, _, err = dialerFactory(backendTimeout).DialContext(connectCtx, backendURL.String(), nil)
+			if err == nil {
+				break
+			}
+
+			connectCancel()
 			if isTimeoutLikeError(err) {
 				logger.Error("Connection from %s rejected. Connect timed out while dialing selected worker %s.", r.RemoteAddr, server.WorkerID())
 				rollbackWorkerCounters(r.Context(), rd, &server)
@@ -352,11 +426,12 @@ func proxyHandlerWithConnectionFactories(
 			}
 
 			logger.Error("Connection from %s rejected. Failed to connect to selected worker %s: %v", r.RemoteAddr, server.WorkerID(), err)
-			rollbackWorkerCounters(r.Context(), rd, &server)
-			httputils.ErrorResponse(w, http.StatusServiceUnavailable, selectedWorkerUnavailableMessage)
-			return
+			rollbackWorkerCountersAsync(r.Context(), rd, server)
+			excludedWorkerIDs = appendExcludedWorkerID(excludedWorkerIDs, server.WorkerID())
+			sawSelectedWorkerFailure = true
 		}
 		defer serverConn.Close()
+		defer connectCancel()
 
 		clientHandshakeTimeout := remainingTimeout(connectCtx)
 		if clientHandshakeTimeout <= 0 {
@@ -388,7 +463,11 @@ func proxyHandlerWithConnectionFactories(
 		go func() {
 			ctx, cancel := newBookkeepingContext(r.Context())
 			defer cancel()
-			rd.TriggerWorkerShutdownIfNeeded(ctx, &server)
+			// Shutdown must be driven by committed successful sessions, not the
+			// optimistic selector allocation counter. Async rollback can leave the
+			// allocation counter temporarily inflated, but it must not drain a
+			// healthy worker one session early.
+			rd.RecordSuccessfulSessionAndTriggerShutdownIfNeeded(ctx, &server)
 		}()
 
 		atomic.AddInt64(&activeConnections, 1)
@@ -397,7 +476,7 @@ func proxyHandlerWithConnectionFactories(
 		defer func() {
 			atomic.AddInt64(&activeConnections, -1)
 
-			// `rd.SelectWorker` is increasing this counter during selection process
+			// `rd.SelectWorker` reserves one active slot during selection.
 			ctx, cancel := newBookkeepingContext(r.Context())
 			defer cancel()
 			if err := rd.ModifyActiveConnections(ctx, &server, -1); err != nil {
