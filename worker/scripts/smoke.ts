@@ -1,12 +1,19 @@
-import { chromium } from 'playwright-core';
+import { chromium, firefox, webkit } from 'playwright-core';
 
 const wsEndpoint = process.env.WS_ENDPOINT;
+const browserType = process.env.BROWSER_TYPE ?? 'chromium';
 
 if (!wsEndpoint) {
     throw new Error('WS_ENDPOINT is required');
 }
 
-const browser = await chromium.connect(wsEndpoint, { timeout: 5000 });
+const browserTypes = { chromium, firefox, webkit } as const;
+if (!(browserType in browserTypes)) {
+    throw new Error(`Unsupported BROWSER_TYPE: ${browserType}`);
+}
+
+const browser = await browserTypes[browserType as keyof typeof browserTypes]
+    .connect(wsEndpoint, { timeout: 5000 });
 
 try {
     const context = await browser.newContext();
@@ -20,7 +27,7 @@ try {
     }
 
     await context.close();
-    console.log('Smoke test passed.');
+    console.log(`${browserType} smoke test passed.`);
 } finally {
     await browser.close();
 }
