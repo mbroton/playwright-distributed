@@ -16,14 +16,10 @@ updates:
     directory: "/worker"
     patterns: ["playwright-core"]
     multi-ecosystem-group: playwright
-    schedule:
-      interval: weekly
   - package-ecosystem: docker
     directory: "/worker"
     patterns: ["playwright"]
     multi-ecosystem-group: playwright
-    schedule:
-      interval: weekly
   # Keep unrelated npm updates in focused pull requests.
   - package-ecosystem: npm
     directory: "/worker"
