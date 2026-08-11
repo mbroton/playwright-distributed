@@ -1,5 +1,5 @@
 import { chromium, firefox, webkit, type BrowserServer } from 'playwright-core';
-import { createClient } from 'redis';
+import { createClient, type RedisClientType } from 'redis';
 import { loadConfig } from './config.js';
 import type { WorkerConfig } from './config.js';
 import { Logger } from './logger.js';
@@ -16,7 +16,7 @@ interface WorkerMetadata {
 
 const clusterActiveConnectionsKey = 'cluster:active_connections';
 const clusterLifetimeConnectionsKey = 'cluster:lifetime_connections';
-type RedisClient = ReturnType<typeof createClient>;
+type RedisClient = RedisClientType<{}, {}, {}, 2>;
 
 
 class BrowserWorker {
@@ -66,6 +66,7 @@ class BrowserWorker {
         let hasConnected = false;
         const client = createClient({
             url: this.config.redis.url,
+            RESP: 2,
             disableOfflineQueue: true,
             socket: {
                 connectTimeout: 2000,
@@ -420,11 +421,11 @@ class BrowserWorker {
         }
 
         if (client.isReady) {
-            await client.quit();
+            await client.close();
             return;
         }
 
-        await client.disconnect();
+        client.destroy();
     }
 
     private async cleanupAndExit(exitCode: number): Promise<void> {
