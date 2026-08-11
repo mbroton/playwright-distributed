@@ -1,0 +1,26 @@
+name: PR title
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions: {}
+
+jobs:
+  title:
+    name: Conventional Commit title
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        shell: bash
+        run: |
+          pattern='^(build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)(\([a-z0-9][a-z0-9._/-]*\))?!?: .+$'
+
+          if [[ "$PR_TITLE" =~ $pattern ]]; then
+            exit 0
+          fi
+
+          echo "::error title=Invalid pull request title::Use Conventional Commits, for example: fix(proxy): handle closed connections"
+          exit 1
