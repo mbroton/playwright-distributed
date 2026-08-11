@@ -1,4 +1,4 @@
-FROM golang:1.23-alpine AS build
+FROM golang:1.26.5-alpine3.24 AS build
 
 WORKDIR /build
 
@@ -9,7 +9,7 @@ COPY . .
 
 RUN CGO_ENABLED=0 GOOS=linux go build -o /app/proxy ./cmd/proxy
 
-FROM alpine:3.20
+FROM alpine:3.24.1
 
 WORKDIR /app
 

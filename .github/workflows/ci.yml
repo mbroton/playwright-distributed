@@ -54,12 +54,23 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23.1'
+          go-version: '1.26.5'
           cache-dependency-path: proxy/go.sum
-      
-      - name: Run proxy unit tests
+
+      - name: Vet proxy
         working-directory: ./proxy
-        run: go test -v ./...
+        run: go vet ./...
+
+      - name: Run proxy unit tests with race detection
+        working-directory: ./proxy
+        run: go test -race -v ./...
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+
+      - name: Scan proxy for reachable vulnerabilities
+        working-directory: ./proxy
+        run: govulncheck ./...
 
   docker-build:
     runs-on: ubuntu-latest
