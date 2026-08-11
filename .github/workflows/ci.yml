@@ -128,6 +128,9 @@ jobs:
           done
           exit 1
 
+      - name: Test worker Redis resilience
+        run: scripts/test/worker-redis-resilience.sh
+
       - name: Show service logs on failure
         if: failure()
         run: docker compose -f docker-compose.local.yaml logs
