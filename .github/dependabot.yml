@@ -1,5 +1,30 @@
 version: 2
+
+multi-ecosystem-groups:
+  playwright:
+    schedule:
+      interval: weekly
+    labels: ["dependencies", "worker"]
+    assignees: ["mbroton"]
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
 updates:
+  # Playwright's package and runtime image must change in the same pull request.
+  - package-ecosystem: npm
+    directory: "/worker"
+    patterns: ["playwright-core"]
+    multi-ecosystem-group: playwright
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: "/worker"
+    patterns: ["mcr.microsoft.com/playwright"]
+    multi-ecosystem-group: playwright
+    schedule:
+      interval: weekly
+  # Keep unrelated npm updates in focused pull requests.
   - package-ecosystem: npm
     directory: "/worker"
     schedule:
@@ -7,17 +32,9 @@ updates:
     open-pull-requests-limit: 5
     labels: ["dependencies", "worker"]
     assignees: ["mbroton"]
+    ignore:
+      - dependency-name: "playwright-core"
     commit-message:
       prefix: "chore"
       prefix-development: "chore"
-      include: "scope"
-  - package-ecosystem: docker
-    directory: "/worker"
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 3
-    labels: ["dependencies", "worker"]
-    assignees: ["mbroton"]
-    commit-message:
-      prefix: "chore"
       include: "scope"
