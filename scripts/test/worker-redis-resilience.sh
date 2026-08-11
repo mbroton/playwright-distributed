@@ -56,6 +56,21 @@ wait_for_worker_restart() {
     return 1
 }
 
+wait_for_worker_log() {
+    local expected="$1"
+    local worker_logs
+
+    for _ in {1..15}; do
+        worker_logs=$("${compose[@]}" logs worker)
+        if [[ "$worker_logs" == *"$expected"* ]]; then
+            return
+        fi
+        sleep 1
+    done
+
+    return 1
+}
+
 wait_for_new_worker_registration() {
     local previous_key="$1"
     local worker_keys
@@ -105,8 +120,7 @@ if (( $(worker_restart_count) != initial_restart_count )); then
     exit 1
 fi
 
-worker_logs=$("${compose[@]}" logs worker)
-if [[ "$worker_logs" != *'Redis state restored after reconnect'* ]]; then
+if ! wait_for_worker_log 'Redis state restored after reconnect'; then
     echo 'Worker did not restore its Redis state after reconnecting.' >&2
     exit 1
 fi
