@@ -8,8 +8,12 @@ if [[ -n "${COMPOSE_OVERRIDE_FILE:-}" ]]; then
 fi
 ws_endpoint="${WS_ENDPOINT:-ws://127.0.0.1:8080}"
 
-worker_start_time() {
-    "${compose[@]}" exec -T worker sh -c "awk '{print \$22}' /proc/1/stat"
+worker_container_id() {
+    "${compose[@]}" ps -q worker
+}
+
+worker_restart_count() {
+    docker inspect --format '{{.RestartCount}}' "$(worker_container_id)"
 }
 
 wait_for_redis() {
@@ -37,12 +41,12 @@ run_smoke_test() {
 }
 
 wait_for_worker_restart() {
-    local previous_start_time="$1"
-    local current_start_time
+    local previous_count="$1"
+    local current_count
 
     for _ in {1..30}; do
-        current_start_time=$(worker_start_time 2>/dev/null || true)
-        if [[ -n "$current_start_time" && "$current_start_time" != "$previous_start_time" ]]; then
+        current_count=$(worker_restart_count 2>/dev/null || true)
+        if [[ -n "$current_count" ]] && (( current_count > previous_count )); then
             return
         fi
         sleep 1
@@ -70,7 +74,7 @@ wait_for_new_worker_registration() {
     return 1
 }
 
-initial_start_time="$(worker_start_time)"
+initial_restart_count="$(worker_restart_count)"
 
 "${compose[@]}" stop redis
 
@@ -96,7 +100,7 @@ fi
 wait_for_redis
 run_smoke_test
 
-if [[ "$(worker_start_time)" != "$initial_start_time" ]]; then
+if (( $(worker_restart_count) != initial_restart_count )); then
     echo 'Worker restarted during a recoverable Redis outage.' >&2
     exit 1
 fi
@@ -113,16 +117,16 @@ if [[ -z "$worker_key" ]]; then
     exit 1
 fi
 
-start_time_before_shutdown="$(worker_start_time)"
+restart_count_before_shutdown="$(worker_restart_count)"
 command_channel="worker:cmd:${worker_key#worker:}"
 "${compose[@]}" exec -T redis redis-cli publish "$command_channel" shutdown >/dev/null
-wait_for_worker_restart "$start_time_before_shutdown"
+wait_for_worker_restart "$restart_count_before_shutdown"
 run_smoke_test
 
 worker_key_before_long_outage=$("${compose[@]}" exec -T redis redis-cli --raw --scan --pattern 'worker:chromium:*' | head -n 1)
-start_time_before_long_outage="$(worker_start_time)"
+restart_count_before_long_outage="$(worker_restart_count)"
 "${compose[@]}" stop redis
-wait_for_worker_restart "$start_time_before_long_outage"
+wait_for_worker_restart "$restart_count_before_long_outage"
 
 worker_logs=$("${compose[@]}" logs worker)
 if ! grep -Eq '"exitCode":[[:space:]]*1' <<< "$worker_logs"; then
