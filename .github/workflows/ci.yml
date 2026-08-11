@@ -26,6 +26,26 @@ jobs:
       - name: Verify Playwright versions stay in sync
         run: node scripts/check-playwright-version.js
 
+  worker-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+
+      - name: Install worker dependencies
+        working-directory: ./worker
+        run: npm ci
+
+      - name: Type-check worker
+        working-directory: ./worker
+        run: npm run typecheck
+
   proxy-tests:
     runs-on: ubuntu-latest
     steps:
@@ -62,3 +82,56 @@ jobs:
           file: ./worker/Dockerfile
           push: false
           platforms: linux/amd64
+
+  integration-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+
+      - name: Install smoke test dependencies
+        working-directory: ./worker
+        run: npm ci
+
+      - name: Start Redis
+        run: docker compose -f docker-compose.local.yaml up -d redis
+
+      - name: Wait for Redis
+        run: |
+          for attempt in {1..30}; do
+            if docker compose -f docker-compose.local.yaml exec -T redis redis-cli ping | grep -q PONG; then
+              exit 0
+            fi
+            sleep 1
+          done
+          exit 1
+
+      - name: Start proxy and Chromium worker
+        run: docker compose -f docker-compose.local.yaml up -d --build proxy worker
+
+      - name: Run Redis-backed smoke test
+        working-directory: ./worker
+        env:
+          WS_ENDPOINT: ws://127.0.0.1:8080
+        run: |
+          for attempt in {1..10}; do
+            if npm run smoke; then
+              exit 0
+            fi
+            sleep 2
+          done
+          exit 1
+
+      - name: Show service logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.local.yaml logs
+
+      - name: Stop integration services
+        if: always()
+        run: docker compose -f docker-compose.local.yaml down
