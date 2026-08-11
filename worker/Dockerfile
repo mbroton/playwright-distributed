@@ -10,4 +10,6 @@ RUN npm ci
 COPY ./tsconfig.json ./tsconfig.json
 COPY ./src/ ./src/
 
+USER pwuser
+
 CMD ["npm", "run", "start"]

@@ -112,21 +112,47 @@ jobs:
           done
           exit 1
 
-      - name: Start proxy and Chromium worker
-        run: docker compose -f docker-compose.local.yaml up -d --build proxy worker
+      - name: Start proxy and browser workers
+        run: docker compose -f docker-compose.local.yaml up -d --build proxy worker worker-firefox worker-webkit
 
-      - name: Run Redis-backed smoke test
-        working-directory: ./worker
-        env:
-          WS_ENDPOINT: ws://127.0.0.1:8080
+      - name: Verify workers run as non-root
         run: |
-          for attempt in {1..10}; do
-            if npm run smoke; then
-              exit 0
+          for service in worker worker-firefox worker-webkit; do
+            if [[ "$(docker compose -f docker-compose.local.yaml exec -T "$service" id -u)" == "0" ]]; then
+              echo "$service is running as root" >&2
+              exit 1
             fi
-            sleep 2
           done
-          exit 1
+
+          if docker compose -f docker-compose.local.yaml exec -T worker \
+            sh -c 'ps -eo args | grep "[c]hrome-headless-shell .*--no-sandbox"'; then
+            echo "Chromium is running without its sandbox" >&2
+            exit 1
+          fi
+
+      - name: Run Redis-backed browser smoke tests
+        working-directory: ./worker
+        run: |
+          for browser in chromium firefox webkit; do
+            endpoint="ws://127.0.0.1:8080"
+            if [[ "$browser" != "chromium" ]]; then
+              endpoint="$endpoint?browser=$browser"
+            fi
+
+            passed=false
+            for attempt in {1..10}; do
+              if BROWSER_TYPE="$browser" WS_ENDPOINT="$endpoint" npm run smoke; then
+                passed=true
+                break
+              fi
+              sleep 2
+            done
+
+            if [[ "$passed" != "true" ]]; then
+              echo "$browser smoke test did not pass" >&2
+              exit 1
+            fi
+          done
 
       - name: Test worker Redis resilience
         run: scripts/test/worker-redis-resilience.sh

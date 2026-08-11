@@ -85,8 +85,14 @@ Run each component (proxy, Redis, workers) as independent services (Docker/K8s).
   - Workers ➜ Redis (register, heartbeats)
   - Proxy ➜ Redis (worker discovery)
   - Proxy ➜ Workers (WebSocket forward)
-- **Exposure** – expose **only the proxy**.
+- **Exposure** – keep Redis and workers private. The proxy has no built-in authentication; keep it private or place it behind an authenticated TLS endpoint.
 - **Scaling** – add or remove workers freely; the proxy always chooses the next worker according to the staggered-restart algorithm.
+
+### Security boundary
+
+The supported deployment model trusts every client that can reach the proxy, while allowing browsers to visit untrusted pages. The Compose files bind the proxy to `127.0.0.1`, keep Redis and workers on the internal network, and run workers as a non-root user with Playwright's Chromium sandbox profile.
+
+The proxy grants full browser control and provides neither authentication nor TLS. Never publish it directly to an untrusted network; use an authenticated TLS reverse proxy, VPN, or private service network. Container hardening reduces risk but is not a strong isolation boundary for hostile tenants or browser exploits. Use dedicated VMs or another stronger sandbox when that boundary is required. See [Playwright's Docker security guidance](https://playwright.dev/docs/docker).
 
 
 ## 📚 Usage Examples

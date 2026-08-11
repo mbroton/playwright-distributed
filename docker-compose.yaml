@@ -14,12 +14,16 @@ services:
       # Maximum number of sessions a worker will handle before it is recycled. The proxy tracks this for each worker.
       - MAX_LIFETIME_SESSIONS=50
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     depends_on:
       - redis
 
   worker:
     image: ghcr.io/mbroton/playwright-distributed/worker:latest
+    init: true
+    security_opt:
+      - seccomp=./worker/seccomp_profile.json
+    shm_size: "1gb"
     environment:
       - REDIS_URL=redis://redis:6379
       # Port for the worker to listen on for browser connections

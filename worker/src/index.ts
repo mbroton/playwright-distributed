@@ -167,7 +167,10 @@ class BrowserWorker {
             
             switch (this.config.server.browserType) {
                 case 'chromium':
-                    this.browserServer = await chromium.launchServer(browserConfig);
+                    this.browserServer = await chromium.launchServer({
+                        ...browserConfig,
+                        chromiumSandbox: true
+                    });
                     break;
                 case 'firefox':
                     this.browserServer = await firefox.launchServer(browserConfig);
