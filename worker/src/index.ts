@@ -161,11 +161,12 @@ class BrowserWorker {
             await this.listenForCommands();
 
             const browserConfig = {
+                host: '0.0.0.0',
                 port: this.config.server.port,
                 headless: this.config.server.headless,
                 wsPath: `/playwright/${this.workerId}`,
             };
-            
+
             switch (this.config.server.browserType) {
                 case 'chromium':
                     this.browserServer = await chromium.launchServer({
@@ -186,7 +187,10 @@ class BrowserWorker {
             const wsEndpoint = this.browserServer.wsEndpoint();
             this.internalEndpoint = wsEndpoint;
             if (this.config.server.privateHostname) {
-                this.internalEndpoint = wsEndpoint.replace(/ws:\/\/127\.0\.0\.1|ws:\/\/localhost/, `ws://${this.config.server.privateHostname}`);
+                this.internalEndpoint = wsEndpoint.replace(
+                    /ws:\/\/(?:0\.0\.0\.0|127\.0\.0\.1|localhost|\[::1\])/,
+                    `ws://${this.config.server.privateHostname}`
+                );
             }
 
             this.logger.debug('Browser server launched', { endpoint: this.internalEndpoint });

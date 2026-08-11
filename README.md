@@ -61,7 +61,7 @@ console.log(await page.title());
 await browser.close();
 ```
 
-> Want Firefox or WebKit? Append `?browser=firefox` or `?browser=webkit` to the WebSocket URL and use the matching Playwright client (`p.firefox.connect`, `p.webkit.connect`, etc.).
+> Want Firefox or WebKit? Append `/?browser=firefox` or `/?browser=webkit` to the WebSocket URL and use the matching Playwright client (`p.firefox.connect`, `p.webkit.connect`, etc.).
 That's it! The same `ws://localhost:8080` endpoint works with any Playwright client (Node.js, Python, Java, .NET, etc.).
 
 
@@ -111,11 +111,11 @@ console.log(await page.title());
 await browser.close();
 
 // Target Firefox workers explicitly.
-const firefoxBrowser = await firefox.connect('ws://localhost:8080?browser=firefox');
+const firefoxBrowser = await firefox.connect('ws://localhost:8080/?browser=firefox');
 await firefoxBrowser.close();
 
 // Or WebKit workers.
-const webkitBrowser = await webkit.connect('ws://localhost:8080?browser=webkit');
+const webkitBrowser = await webkit.connect('ws://localhost:8080/?browser=webkit');
 await webkitBrowser.close();
 ```
 
@@ -136,11 +136,11 @@ async def main():
         await browser.close()
 
         # Firefox
-        firefox = await p.firefox.connect('ws://localhost:8080?browser=firefox')
+        firefox = await p.firefox.connect('ws://localhost:8080/?browser=firefox')
         await firefox.close()
 
         # WebKit
-        webkit = await p.webkit.connect('ws://localhost:8080?browser=webkit')
+        webkit = await p.webkit.connect('ws://localhost:8080/?browser=webkit')
         await webkit.close()
 
 asyncio.run(main())
