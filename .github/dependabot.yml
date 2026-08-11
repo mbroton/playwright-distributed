@@ -20,7 +20,7 @@ updates:
       interval: weekly
   - package-ecosystem: docker
     directory: "/worker"
-    patterns: ["mcr.microsoft.com/playwright"]
+    patterns: ["playwright"]
     multi-ecosystem-group: playwright
     schedule:
       interval: weekly
