@@ -16,21 +16,10 @@ updates:
     directory: "/worker"
     patterns: ["playwright-core"]
     multi-ecosystem-group: playwright
+    open-pull-requests-limit: 10
+    labels: ["dependencies", "worker"]
+    assignees: ["mbroton"]
   - package-ecosystem: docker
     directory: "/worker"
     patterns: ["playwright"]
     multi-ecosystem-group: playwright
-  # Keep unrelated npm updates in focused pull requests.
-  - package-ecosystem: npm
-    directory: "/worker"
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 5
-    labels: ["dependencies", "worker"]
-    assignees: ["mbroton"]
-    ignore:
-      - dependency-name: "playwright-core"
-    commit-message:
-      prefix: "chore"
-      prefix-development: "chore"
-      include: "scope"
