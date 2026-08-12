@@ -148,8 +148,15 @@ jobs:
       - name: Verify Redis key TTL controls worker liveness
         working-directory: ./worker
         run: |
-          worker_key=$(docker compose -f ../docker-compose.local.yaml exec -T redis \
-            redis-cli --raw --scan --pattern 'worker:chromium:*' | head -n 1)
+          worker_key=""
+          for _ in {1..30}; do
+            worker_key=$(docker compose -f ../docker-compose.local.yaml exec -T redis \
+              redis-cli --raw --scan --pattern 'worker:chromium:*' | head -n 1)
+            if [[ -n "$worker_key" ]]; then
+              break
+            fi
+            sleep 1
+          done
           if [[ -z "$worker_key" ]]; then
             echo "Chromium worker registration not found" >&2
             exit 1
