@@ -146,39 +146,7 @@ jobs:
           fi
 
       - name: Verify Redis key TTL controls worker liveness
-        working-directory: ./worker
-        run: |
-          redis=(docker compose -f ../docker-compose.local.yaml exec -T redis redis-cli --raw)
-          worker_id=chromium:selector-test
-          worker_key=worker:$worker_id
-
-          "${redis[@]}" hset "$worker_key" \
-            status available browserType chromium lastHeartbeat 0 >/dev/null
-          "${redis[@]}" expire "$worker_key" 60 >/dev/null
-          "${redis[@]}" hset cluster:active_connections "$worker_id" 0 >/dev/null
-          "${redis[@]}" hset cluster:lifetime_connections "$worker_id" 1 >/dev/null
-
-          selector=$(<../proxy/internal/redis/selector.lua)
-          selected=$("${redis[@]}" eval "$selector" 0 5 100 chromium)
-
-          if [[ "$selected" != "$worker_id" ]]; then
-            echo "Expected $worker_id, selected ${selected:-none}" >&2
-            exit 1
-          fi
-
-          "${redis[@]}" persist "$worker_key" >/dev/null
-          "${redis[@]}" hset cluster:active_connections "$worker_id" 0 >/dev/null
-          "${redis[@]}" hset cluster:lifetime_connections "$worker_id" 1 >/dev/null
-          selected_without_ttl=$("${redis[@]}" eval "$selector" 0 5 100 chromium)
-
-          "${redis[@]}" del "$worker_key" >/dev/null
-          "${redis[@]}" hdel cluster:active_connections "$worker_id" >/dev/null
-          "${redis[@]}" hdel cluster:lifetime_connections "$worker_id" >/dev/null
-
-          if [[ "$selected_without_ttl" == "$worker_id" ]]; then
-            echo "Selected persistent worker key $worker_id" >&2
-            exit 1
-          fi
+        run: scripts/test/selector-worker-liveness.sh
 
       - name: Run Redis-backed browser smoke tests
         working-directory: ./worker
