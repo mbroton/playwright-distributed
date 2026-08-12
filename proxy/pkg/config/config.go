@@ -7,7 +7,10 @@ import (
 	"github.com/spf13/viper"
 )
 
-const HTTPWriteTimeout = 15 * time.Second
+const (
+	HTTPWriteTimeout       = 15 * time.Second
+	maxWorkerSelectTimeout = HTTPWriteTimeout * 4 / 5
+)
 
 type Config struct {
 	RedisHost             string `mapstructure:"REDIS_HOST"`
@@ -77,8 +80,8 @@ func validate(cfg *Config) error {
 	}
 
 	workerSelectTimeout := time.Duration(cfg.WorkerSelectTimeout) * time.Second
-	if workerSelectTimeout >= HTTPWriteTimeout {
-		return fmt.Errorf("WORKER_SELECT_TIMEOUT must be less than the HTTP write timeout (%s)", HTTPWriteTimeout)
+	if workerSelectTimeout > maxWorkerSelectTimeout {
+		return fmt.Errorf("WORKER_SELECT_TIMEOUT must not exceed %s", maxWorkerSelectTimeout)
 	}
 
 	allowedBrowserTypes := map[string]struct{}{

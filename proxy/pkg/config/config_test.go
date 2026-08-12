@@ -24,6 +24,15 @@ func TestValidateAcceptsValidConfig(t *testing.T) {
 	}
 }
 
+func TestValidateAcceptsMaximumWorkerSelectTimeout(t *testing.T) {
+	cfg := validConfig()
+	cfg.WorkerSelectTimeout = 12
+
+	if err := validate(cfg); err != nil {
+		t.Fatalf("expected maximum worker select timeout to be valid, got %v", err)
+	}
+}
+
 func TestValidateRejectsInvalidTimingAndSessionValues(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -66,11 +75,11 @@ func TestValidateRejectsInvalidTimingAndSessionValues(t *testing.T) {
 			expected: "WORKER_SELECT_TIMEOUT must be greater than zero",
 		},
 		{
-			name: "worker select timeout reaches HTTP write timeout",
+			name: "worker select timeout exceeds response budget",
 			configure: func(cfg *Config) {
-				cfg.WorkerSelectTimeout = 15
+				cfg.WorkerSelectTimeout = 13
 			},
-			expected: "WORKER_SELECT_TIMEOUT must be less than the HTTP write timeout",
+			expected: "WORKER_SELECT_TIMEOUT must not exceed 12s",
 		},
 	}
 

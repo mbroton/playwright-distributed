@@ -148,22 +148,27 @@ jobs:
       - name: Verify Redis key TTL controls worker liveness
         working-directory: ./worker
         run: |
-          worker_key=""
-          for _ in {1..30}; do
-            worker_key=$(docker compose -f ../docker-compose.local.yaml exec -T redis \
-              redis-cli --raw --scan --pattern 'worker:chromium:*' | head -n 1)
-            if [[ -n "$worker_key" ]]; then
-              break
-            fi
-            sleep 1
-          done
-          if [[ -z "$worker_key" ]]; then
-            echo "Chromium worker registration not found" >&2
+          redis=(docker compose -f ../docker-compose.local.yaml exec -T redis redis-cli --raw)
+          worker_id=chromium:selector-test
+          worker_key=worker:$worker_id
+
+          "${redis[@]}" hset "$worker_key" \
+            status available browserType chromium lastHeartbeat 0 >/dev/null
+          "${redis[@]}" expire "$worker_key" 60 >/dev/null
+          "${redis[@]}" hset cluster:active_connections "$worker_id" 0 >/dev/null
+          "${redis[@]}" hset cluster:lifetime_connections "$worker_id" 1 >/dev/null
+
+          selector=$(<../proxy/internal/redis/selector.lua)
+          selected=$("${redis[@]}" eval "$selector" 0 5 100 chromium)
+
+          "${redis[@]}" del "$worker_key" >/dev/null
+          "${redis[@]}" hdel cluster:active_connections "$worker_id" >/dev/null
+          "${redis[@]}" hdel cluster:lifetime_connections "$worker_id" >/dev/null
+
+          if [[ "$selected" != "$worker_id" ]]; then
+            echo "Expected $worker_id, selected ${selected:-none}" >&2
             exit 1
           fi
-          docker compose -f ../docker-compose.local.yaml exec -T redis \
-            redis-cli hset "$worker_key" lastHeartbeat 0 >/dev/null
-          BROWSER_TYPE=chromium WS_ENDPOINT=ws://127.0.0.1:8080 npm run smoke
 
       - name: Run Redis-backed browser smoke tests
         working-directory: ./worker

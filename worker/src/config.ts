@@ -43,10 +43,10 @@ const schema = z.object({
     LOG_LEVEL: z.enum(logLevels).default('info'),
     LOG_FORMAT: z.enum(['json', 'text']).default('json'),
 }).refine(
-    values => values.HEARTBEAT_INTERVAL < values.REDIS_KEY_TTL,
+    values => values.REDIS_KEY_TTL >= values.HEARTBEAT_INTERVAL * 3,
     {
-        message: 'HEARTBEAT_INTERVAL must be less than REDIS_KEY_TTL',
-        path: ['HEARTBEAT_INTERVAL'],
+        message: 'REDIS_KEY_TTL must be at least three times HEARTBEAT_INTERVAL',
+        path: ['REDIS_KEY_TTL'],
     }
 );
 

@@ -15,18 +15,29 @@ test('uses safe timing defaults', () => {
     assert.equal(config.redis.keyTtl, 60);
 });
 
-test('rejects a heartbeat interval that can let the worker key expire', () => {
+test('accepts a worker key TTL three times the heartbeat interval', () => {
+    const config = parseConfig({
+        ...requiredEnvironment,
+        HEARTBEAT_INTERVAL: '20',
+        REDIS_KEY_TTL: '60',
+    });
+
+    assert.equal(config.server.heartbeatInterval, 20_000);
+    assert.equal(config.redis.keyTtl, 60);
+});
+
+test('rejects a worker key TTL without heartbeat failure tolerance', () => {
     assert.throws(
         () => parseConfig({
             ...requiredEnvironment,
-            HEARTBEAT_INTERVAL: '60',
+            HEARTBEAT_INTERVAL: '21',
             REDIS_KEY_TTL: '60',
         }),
         (error: unknown) => {
             assert.ok(error instanceof ZodError);
             assert.equal(
                 error.issues[0]?.message,
-                'HEARTBEAT_INTERVAL must be less than REDIS_KEY_TTL'
+                'REDIS_KEY_TTL must be at least three times HEARTBEAT_INTERVAL'
             );
             return true;
         }
