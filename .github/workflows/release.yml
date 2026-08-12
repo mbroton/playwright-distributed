@@ -8,15 +8,140 @@ permissions:
   contents: write
   packages: write
 
+# A release must not be cancelled between the two image pushes. The called
+# ci.yml cancels its own group, and its group name resolves with this
+# workflow's name, so keep this name clearly different from `Release-<ref>`.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  REGISTRY: ghcr.io
+  group: release-publish-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  release:
+  verify-tag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify the tag is a semantic version
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Tag $GITHUB_REF_NAME is not a semantic version, for example v1.2.3" >&2
+            exit 1
+          fi
+
+      - name: Verify the tag points at a commit on main
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "Tag $GITHUB_REF_NAME does not point at a commit on main" >&2
+            echo "Only reviewed commits that passed the required checks can be released" >&2
+            exit 1
+          fi
+
+  # Runs the full CI suite against the tagged commit. Calling ci.yml keeps the
+  # release checks equal to the pull request checks.
+  checks:
+    needs: verify-tag
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      packages: read
+
+  build:
+    needs: verify-tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+
+      - name: Install smoke test dependencies
+        working-directory: ./worker
+        run: npm ci
+
+      # Both images are built for both platforms before anything is pushed, so
+      # a build failure cannot leave one image published without the other.
+      - name: Build proxy for all release platforms
+        uses: docker/build-push-action@v6
+        with:
+          context: ./proxy
+          file: ./proxy/Dockerfile
+          push: false
+          platforms: linux/amd64,linux/arm64
+          cache-to: type=gha,mode=max,scope=proxy
+          cache-from: type=gha,scope=proxy
+
+      - name: Build worker for all release platforms
+        uses: docker/build-push-action@v6
+        with:
+          context: ./worker
+          file: ./worker/Dockerfile
+          push: false
+          platforms: linux/amd64,linux/arm64
+          cache-to: type=gha,mode=max,scope=worker
+          cache-from: type=gha,scope=worker
+
+      # docker-compose.yaml is the documented deployment path and pins the
+      # `latest` tags, so the smoke test loads the built images under those
+      # names and runs that file unchanged.
+      - name: Load the amd64 images under their deployment tags
+        uses: docker/build-push-action@v6
+        with:
+          context: ./proxy
+          file: ./proxy/Dockerfile
+          load: true
+          platforms: linux/amd64
+          cache-from: type=gha,scope=proxy
+          tags: ghcr.io/${{ github.repository }}/proxy:latest
+
+      - name: Load the amd64 worker image under its deployment tag
+        uses: docker/build-push-action@v6
+        with:
+          context: ./worker
+          file: ./worker/Dockerfile
+          load: true
+          platforms: linux/amd64
+          cache-from: type=gha,scope=worker
+          tags: ghcr.io/${{ github.repository }}/worker:latest
+
+      - name: Start the documented deployment
+        run: docker compose -f docker-compose.yaml up -d --pull never
+
+      - name: Smoke-test the release images
+        working-directory: ./worker
+        run: |
+          for _ in {1..15}; do
+            if WS_ENDPOINT=ws://127.0.0.1:8080 npm run smoke; then
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "The release images did not pass the smoke test" >&2
+          exit 1
+
+      - name: Show service logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.yaml logs
+
+      - name: Stop the deployment
+        if: always()
+        run: docker compose -f docker-compose.yaml down
+
+  publish:
+    needs: [checks, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -35,40 +160,45 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}/proxy
+          # `latest=auto` keeps a pre-release tag from moving `latest`.
+          flavor: latest=auto
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
-            type=raw,value=latest
-
-      - name: Build and push (proxy)
-        uses: docker/build-push-action@v6
-        with:
-          context: ./proxy
-          file: ./proxy/Dockerfile
-          push: true
-          platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.meta-proxy.outputs.tags }}
-          labels: ${{ steps.meta-proxy.outputs.labels }}
 
       - name: Docker meta (worker)
         id: meta-worker
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}/worker
+          flavor: latest=auto
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
-            type=raw,value=latest
 
-      - name: Build and push (worker)
+      # Both builds are cache hits from the build job, so these steps only push
+      # the layers. The two images therefore reach the registry seconds apart.
+      - name: Push proxy
+        uses: docker/build-push-action@v6
+        with:
+          context: ./proxy
+          file: ./proxy/Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=gha,scope=proxy
+          tags: ${{ steps.meta-proxy.outputs.tags }}
+          labels: ${{ steps.meta-proxy.outputs.labels }}
+
+      - name: Push worker
         uses: docker/build-push-action@v6
         with:
           context: ./worker
           file: ./worker/Dockerfile
           push: true
           platforms: linux/amd64,linux/arm64
+          cache-from: type=gha,scope=worker
           tags: ${{ steps.meta-worker.outputs.tags }}
           labels: ${{ steps.meta-worker.outputs.labels }}
 
@@ -76,3 +206,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}

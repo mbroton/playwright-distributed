@@ -3,6 +3,8 @@ on:
   push:
     branches: [ main ]
   pull_request:
+  # release.yml runs this suite against the tagged commit.
+  workflow_call:
 
 permissions:
   contents: read
