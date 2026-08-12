@@ -11,7 +11,10 @@ if [[ -n "${COMPOSE_OVERRIDE_FILE:-}" ]]; then
     compose+=(-f "$COMPOSE_OVERRIDE_FILE")
 fi
 
-redis=("${compose[@]}" exec -T redis redis-cli --raw)
+# A selection reserves a session on the worker it picks. Run against a scratch
+# database so this check cannot leave a reserved session behind on a live
+# worker, which would keep that worker draining forever.
+redis=("${compose[@]}" exec -T redis redis-cli --raw -n 1)
 
 worker_id=chromium:selector-test
 worker_key="worker:$worker_id"
@@ -25,8 +28,7 @@ cleanup() {
 trap cleanup EXIT
 
 # The stale lastHeartbeat value also proves that liveness no longer depends on
-# that field. A higher lifetime count than the real workers makes the selector
-# prefer this worker.
+# that field.
 register_test_worker() {
     "${redis[@]}" hset "$worker_key" \
         status available browserType chromium lastHeartbeat 0 >/dev/null
@@ -53,8 +55,8 @@ register_test_worker
 "${redis[@]}" persist "$worker_key" >/dev/null
 
 selected_without_ttl=$(select_worker)
-if [[ "$selected_without_ttl" == "$worker_id" ]]; then
-    echo "Selected persistent worker key $worker_id" >&2
+if [[ -n "$selected_without_ttl" ]]; then
+    echo "Selected persistent worker key $selected_without_ttl" >&2
     exit 1
 fi
 
