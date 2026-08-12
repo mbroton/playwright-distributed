@@ -16,7 +16,7 @@
   },
   "dependencies": {
     "dotenv": "^17.4.2",
-    "playwright-core": "1.58.1",
+    "playwright-core": "1.62.1",
     "redis": "^6.2.1",
     "zod": "^4.4.3"
   }
