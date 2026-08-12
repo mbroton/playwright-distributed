@@ -57,7 +57,9 @@ local fallback_active = math.huge
 
 for uuid, active in pairs(active_map) do
     local worker_key = 'worker:' .. uuid
-    -- The worker refreshes this key's TTL with every heartbeat, so its existence is the liveness check.
+    -- The worker refreshes this key's TTL with every heartbeat. A persistent key
+    -- can be left behind if registration stops between HSET and EXPIRE.
+    local worker_ttl = redis.call('TTL', worker_key)
     -- Also fetch worker's browserType to strictly match ARGV[3]
     local worker_fields = redis.call('HMGET', worker_key, 'status', 'browserType')
     local status = worker_fields[1]
@@ -66,7 +68,7 @@ for uuid, active in pairs(active_map) do
     local lifetime = lifetime_map[uuid] or 0
 
     -- Strictly require browser type match in addition to key prefix
-    if worker_browser_type == browser_type and status == 'available' and active < max_concurrent_sessions and lifetime < max_lifetime_sessions then
+    if worker_ttl > 0 and worker_browser_type == browser_type and status == 'available' and active < max_concurrent_sessions and lifetime < max_lifetime_sessions then
         if lifetime < (max_lifetime_sessions - margin) then
             if lifetime > best_lifetime or (lifetime == best_lifetime and active < best_active) then
                 best_uuid = uuid
