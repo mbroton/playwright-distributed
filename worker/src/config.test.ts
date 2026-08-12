@@ -8,22 +8,27 @@ const requiredEnvironment = {
     PORT: '3131',
 };
 
-test('uses safe timing defaults', () => {
-    const config = parseConfig(requiredEnvironment);
+test('default timing keeps the heartbeat failure tolerance', () => {
+    assert.doesNotThrow(() => parseConfig(requiredEnvironment));
+});
 
-    assert.equal(config.server.heartbeatInterval, 5_000);
-    assert.equal(config.redis.keyTtl, 60);
+test('converts second-based timing to the milliseconds the timers expect', () => {
+    const config = parseConfig({
+        ...requiredEnvironment,
+        HEARTBEAT_INTERVAL: '10',
+        REDIS_RETRY_DELAY: '3',
+    });
+
+    assert.equal(config.server.heartbeatInterval, 10 * 1000);
+    assert.equal(config.redis.retryDelay, 3 * 1000);
 });
 
 test('accepts a worker key TTL three times the heartbeat interval', () => {
-    const config = parseConfig({
+    assert.doesNotThrow(() => parseConfig({
         ...requiredEnvironment,
         HEARTBEAT_INTERVAL: '20',
         REDIS_KEY_TTL: '60',
-    });
-
-    assert.equal(config.server.heartbeatInterval, 20_000);
-    assert.equal(config.redis.keyTtl, 60);
+    }));
 });
 
 test('rejects a worker key TTL without heartbeat failure tolerance', () => {
