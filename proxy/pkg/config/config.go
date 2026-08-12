@@ -2,9 +2,12 @@ package config
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/spf13/viper"
 )
+
+const HTTPWriteTimeout = 15 * time.Second
 
 type Config struct {
 	RedisHost             string `mapstructure:"REDIS_HOST"`
@@ -43,12 +46,39 @@ func LoadConfig() (*Config, error) {
 		return nil, err
 	}
 
-	// TODO: use validator
+	if err := validate(&cfg); err != nil {
+		return nil, err
+	}
+
+	return &cfg, nil
+}
+
+func validate(cfg *Config) error {
 	if cfg.RedisHost == "" {
-		return nil, fmt.Errorf("REDIS_HOST is required")
+		return fmt.Errorf("REDIS_HOST is required")
 	}
 	if cfg.RedisPort == 0 {
-		return nil, fmt.Errorf("REDIS_PORT is required")
+		return fmt.Errorf("REDIS_PORT is required")
+	}
+	if cfg.MaxConcurrentSessions <= 0 {
+		return fmt.Errorf("MAX_CONCURRENT_SESSIONS must be greater than zero")
+	}
+	if cfg.MaxLifetimeSessions <= 0 {
+		return fmt.Errorf("MAX_LIFETIME_SESSIONS must be greater than zero")
+	}
+	if cfg.ReaperRunInterval <= 0 {
+		return fmt.Errorf("REAPER_RUN_INTERVAL must be greater than zero")
+	}
+	if cfg.ShutdownCommandTTL <= 0 {
+		return fmt.Errorf("SHUTDOWN_COMMAND_TTL must be greater than zero")
+	}
+	if cfg.WorkerSelectTimeout <= 0 {
+		return fmt.Errorf("WORKER_SELECT_TIMEOUT must be greater than zero")
+	}
+
+	workerSelectTimeout := time.Duration(cfg.WorkerSelectTimeout) * time.Second
+	if workerSelectTimeout >= HTTPWriteTimeout {
+		return fmt.Errorf("WORKER_SELECT_TIMEOUT must be less than the HTTP write timeout (%s)", HTTPWriteTimeout)
 	}
 
 	allowedBrowserTypes := map[string]struct{}{
@@ -58,8 +88,8 @@ func LoadConfig() (*Config, error) {
 	}
 
 	if _, ok := allowedBrowserTypes[cfg.DefaultBrowserType]; !ok {
-		return nil, fmt.Errorf("DEFAULT_BROWSER_TYPE must be one of: chromium, firefox, webkit")
+		return fmt.Errorf("DEFAULT_BROWSER_TYPE must be one of: chromium, firefox, webkit")
 	}
 
-	return &cfg, nil
+	return nil
 }

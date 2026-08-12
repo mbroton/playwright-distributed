@@ -15,6 +15,7 @@ worker.
 ## Verification
 
 - Proxy changes: run `cd proxy && go test ./...`.
+- Worker code changes: run `cd worker && npm test && npm run typecheck`.
 - Playwright version changes: run `node scripts/check-playwright-version.js`.
 - Worker runtime changes: smoke-test with
   `docker compose -f docker-compose.local.yaml up --build`.

@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "start": "tsx src/index.ts",
+    "test": "node --import tsx src/config.test.ts",
     "typecheck": "tsc --noEmit",
     "smoke": "tsx scripts/smoke.ts"
   },

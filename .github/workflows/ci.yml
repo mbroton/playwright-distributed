@@ -46,6 +46,10 @@ jobs:
         working-directory: ./worker
         run: npm run typecheck
 
+      - name: Test worker
+        working-directory: ./worker
+        run: npm test
+
   proxy-tests:
     runs-on: ubuntu-latest
     steps:
@@ -140,6 +144,19 @@ jobs:
             echo "Chromium is running without its sandbox" >&2
             exit 1
           fi
+
+      - name: Verify Redis key TTL controls worker liveness
+        working-directory: ./worker
+        run: |
+          worker_key=$(docker compose -f ../docker-compose.local.yaml exec -T redis \
+            redis-cli --raw --scan --pattern 'worker:chromium:*' | head -n 1)
+          if [[ -z "$worker_key" ]]; then
+            echo "Chromium worker registration not found" >&2
+            exit 1
+          fi
+          docker compose -f ../docker-compose.local.yaml exec -T redis \
+            redis-cli hset "$worker_key" lastHeartbeat 0 >/dev/null
+          BROWSER_TYPE=chromium WS_ENDPOINT=ws://127.0.0.1:8080 npm run smoke
 
       - name: Run Redis-backed browser smoke tests
         working-directory: ./worker

@@ -73,7 +73,7 @@ func StartProxyServer(cfg *config.Config, rd *redis.Client) {
 	server := &http.Server{
 		Addr:         ":8080",
 		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
+		WriteTimeout: config.HTTPWriteTimeout,
 		IdleTimeout:  60 * time.Second,
 		Handler:      mux,
 	}
