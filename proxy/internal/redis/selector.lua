@@ -21,10 +21,6 @@ local prefix = browser_type .. ':'
 local active_hash = 'cluster:active_connections'
 local lifetime_hash = 'cluster:lifetime_connections'
 
-local time = redis.call('TIME')
-local now_ms = tonumber(time[1]) * 1000 + math.floor(tonumber(time[2]) / 1000)
-local threshold = now_ms - (60 * 1000)
-
 local active_data = redis.call('HGETALL', active_hash)
 local lifetime_data = redis.call('HGETALL', lifetime_hash)
 local active_map = {}
@@ -61,24 +57,18 @@ local fallback_active = math.huge
 
 for uuid, active in pairs(active_map) do
     local worker_key = 'worker:' .. uuid
+    -- The worker refreshes this key's TTL with every heartbeat. A persistent key
+    -- can be left behind if registration stops between HSET and EXPIRE.
+    local worker_ttl = redis.call('TTL', worker_key)
     -- Also fetch worker's browserType to strictly match ARGV[3]
-    local worker_fields = redis.call('HMGET', worker_key, 'status', 'lastHeartbeat', 'browserType')
+    local worker_fields = redis.call('HMGET', worker_key, 'status', 'browserType')
     local status = worker_fields[1]
-    local lastHeartbeat_str = worker_fields[2]
-    local worker_browser_type = worker_fields[3]
+    local worker_browser_type = worker_fields[2]
     
     local lifetime = lifetime_map[uuid] or 0
 
-    local is_recent = false
-    if lastHeartbeat_str then
-        local heartbeat_unix = tonumber(lastHeartbeat_str)
-        if heartbeat_unix and heartbeat_unix >= threshold then
-            is_recent = true
-        end
-    end
-    
     -- Strictly require browser type match in addition to key prefix
-    if worker_browser_type == browser_type and status == 'available' and active < max_concurrent_sessions and lifetime < max_lifetime_sessions and is_recent then
+    if worker_ttl > 0 and worker_browser_type == browser_type and status == 'available' and active < max_concurrent_sessions and lifetime < max_lifetime_sessions then
         if lifetime < (max_lifetime_sessions - margin) then
             if lifetime > best_lifetime or (lifetime == best_lifetime and active < best_active) then
                 best_uuid = uuid

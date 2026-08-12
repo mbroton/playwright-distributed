@@ -42,36 +42,46 @@ const schema = z.object({
 
     LOG_LEVEL: z.enum(logLevels).default('info'),
     LOG_FORMAT: z.enum(['json', 'text']).default('json'),
-});
+}).refine(
+    values => values.REDIS_KEY_TTL >= values.HEARTBEAT_INTERVAL * 3,
+    {
+        message: 'REDIS_KEY_TTL must be at least three times HEARTBEAT_INTERVAL',
+        path: ['REDIS_KEY_TTL'],
+    }
+);
 
 let loadedConfig: WorkerConfig | null = null;
+
+export function parseConfig(environment: NodeJS.ProcessEnv): WorkerConfig {
+    const parsed = schema.parse(environment);
+    return {
+        redis: {
+            url: parsed.REDIS_URL,
+            keyTtl: parsed.REDIS_KEY_TTL,
+            retryAttempts: parsed.REDIS_RETRY_ATTEMPTS,
+            retryDelay: parsed.REDIS_RETRY_DELAY * 1000, // Converted to MS for setTimeout
+        },
+        server: {
+            browserType: parsed.BROWSER_TYPE,
+            port: parsed.PORT,
+            privateHostname: parsed.PRIVATE_HOSTNAME,
+            headless: parsed.HEADLESS,
+            heartbeatInterval: parsed.HEARTBEAT_INTERVAL * 1000, // Converted to MS for setInterval
+        },
+        logging: {
+            level: parsed.LOG_LEVEL,
+            format: parsed.LOG_FORMAT,
+        },
+    };
+}
 
 export function loadConfig(): WorkerConfig {
     if (loadedConfig) {
         return loadedConfig;
     }
-    
+
     try {
-        const parsed = schema.parse(process.env);
-        loadedConfig = {
-            redis: {
-                url: parsed.REDIS_URL,
-                keyTtl: parsed.REDIS_KEY_TTL,
-                retryAttempts: parsed.REDIS_RETRY_ATTEMPTS,
-                retryDelay: parsed.REDIS_RETRY_DELAY * 1000, // Converted to MS for setTimeout
-            },
-            server: {
-                browserType: parsed.BROWSER_TYPE,
-                port: parsed.PORT,
-                privateHostname: parsed.PRIVATE_HOSTNAME,
-                headless: parsed.HEADLESS,
-                heartbeatInterval: parsed.HEARTBEAT_INTERVAL * 1000, // Converted to MS for setInterval
-            },
-            logging: {
-                level: parsed.LOG_LEVEL,
-                format: parsed.LOG_FORMAT,
-            },
-        };
+        loadedConfig = parseConfig(process.env);
         return loadedConfig;
     } catch (error) {
         if (error instanceof z.ZodError) {
@@ -80,4 +90,4 @@ export function loadConfig(): WorkerConfig {
         }
         throw error;
     }
-} 
+}

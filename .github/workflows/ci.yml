@@ -46,6 +46,10 @@ jobs:
         working-directory: ./worker
         run: npm run typecheck
 
+      - name: Test worker
+        working-directory: ./worker
+        run: npm test
+
   proxy-tests:
     runs-on: ubuntu-latest
     steps:
@@ -140,6 +144,9 @@ jobs:
             echo "Chromium is running without its sandbox" >&2
             exit 1
           fi
+
+      - name: Verify Redis key TTL controls worker liveness
+        run: scripts/test/selector-worker-liveness.sh
 
       - name: Run Redis-backed browser smoke tests
         working-directory: ./worker
