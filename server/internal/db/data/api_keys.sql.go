@@ -8,7 +8,7 @@ package data
 import (
 	"context"
 
-	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/google/uuid"
 )
 
 const getActiveAPIKeyByHash = `-- name: GetActiveAPIKeyByHash :one
@@ -46,7 +46,7 @@ RETURNING id, name, hash, prefix, created_at, last_used_at, revoked_at
 `
 
 type InsertAPIKeyParams struct {
-	ID     pgtype.UUID
+	ID     uuid.UUID
 	Name   string
 	Hash   string
 	Prefix string
@@ -74,18 +74,13 @@ func (q *Queries) InsertAPIKey(ctx context.Context, arg InsertAPIKeyParams) (API
 
 const revokeAPIKey = `-- name: RevokeAPIKey :one
 UPDATE api_keys
-SET revoked_at = $2
+SET revoked_at = now()
 WHERE id = $1
 RETURNING id, name, hash, prefix, created_at, last_used_at, revoked_at
 `
 
-type RevokeAPIKeyParams struct {
-	ID        pgtype.UUID
-	RevokedAt pgtype.Timestamptz
-}
-
-func (q *Queries) RevokeAPIKey(ctx context.Context, arg RevokeAPIKeyParams) (APIKey, error) {
-	row := q.db.QueryRow(ctx, revokeAPIKey, arg.ID, arg.RevokedAt)
+func (q *Queries) RevokeAPIKey(ctx context.Context, id uuid.UUID) (APIKey, error) {
+	row := q.db.QueryRow(ctx, revokeAPIKey, id)
 	var i APIKey
 	err := row.Scan(
 		&i.ID,
@@ -101,18 +96,13 @@ func (q *Queries) RevokeAPIKey(ctx context.Context, arg RevokeAPIKeyParams) (API
 
 const touchAPIKey = `-- name: TouchAPIKey :one
 UPDATE api_keys
-SET last_used_at = $2
+SET last_used_at = now()
 WHERE id = $1
 RETURNING id, name, hash, prefix, created_at, last_used_at, revoked_at
 `
 
-type TouchAPIKeyParams struct {
-	ID         pgtype.UUID
-	LastUsedAt pgtype.Timestamptz
-}
-
-func (q *Queries) TouchAPIKey(ctx context.Context, arg TouchAPIKeyParams) (APIKey, error) {
-	row := q.db.QueryRow(ctx, touchAPIKey, arg.ID, arg.LastUsedAt)
+func (q *Queries) TouchAPIKey(ctx context.Context, id uuid.UUID) (APIKey, error) {
+	row := q.db.QueryRow(ctx, touchAPIKey, id)
 	var i APIKey
 	err := row.Scan(
 		&i.ID,

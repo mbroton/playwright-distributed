@@ -17,12 +17,12 @@ WHERE hash = $1
 
 -- name: TouchAPIKey :one
 UPDATE api_keys
-SET last_used_at = $2
+SET last_used_at = now()
 WHERE id = $1
 RETURNING *;
 
 -- name: RevokeAPIKey :one
 UPDATE api_keys
-SET revoked_at = $2
+SET revoked_at = now()
 WHERE id = $1
 RETURNING *;

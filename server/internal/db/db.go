@@ -8,25 +8,17 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const (
-	maxConnections    = 20
-	minConnections    = 2
-	maxConnectionIdle = 30 * time.Minute
-	maxConnectionAge  = time.Hour
-	healthCheckPeriod = time.Minute
-)
-
 func Open(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 	config, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("parsing database dsn: %w", err)
 	}
 
-	config.MaxConns = maxConnections
-	config.MinConns = minConnections
-	config.MaxConnIdleTime = maxConnectionIdle
-	config.MaxConnLifetime = maxConnectionAge
-	config.HealthCheckPeriod = healthCheckPeriod
+	if config.MaxConnLifetimeJitter == 0 {
+		// Zero jitter makes connections created at boot expire together.
+		// This can cause reconnect storms across replicas.
+		config.MaxConnLifetimeJitter = 5 * time.Minute
+	}
 
 	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {

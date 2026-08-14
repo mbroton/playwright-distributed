@@ -8,7 +8,7 @@ package data
 import (
 	"context"
 
-	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/google/uuid"
 )
 
 const deleteWorker = `-- name: DeleteWorker :exec
@@ -16,7 +16,7 @@ DELETE FROM workers
 WHERE id = $1
 `
 
-func (q *Queries) DeleteWorker(ctx context.Context, id pgtype.UUID) error {
+func (q *Queries) DeleteWorker(ctx context.Context, id uuid.UUID) error {
 	_, err := q.db.Exec(ctx, deleteWorker, id)
 	return err
 }
@@ -27,7 +27,7 @@ FROM workers
 WHERE id = $1
 `
 
-func (q *Queries) GetWorker(ctx context.Context, id pgtype.UUID) (Worker, error) {
+func (q *Queries) GetWorker(ctx context.Context, id uuid.UUID) (Worker, error) {
 	row := q.db.QueryRow(ctx, getWorker, id)
 	var i Worker
 	err := row.Scan(
@@ -90,19 +90,18 @@ INSERT INTO workers (
     status,
     last_heartbeat
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7
+    $1, $2, $3, $4, $5, $6, now()
 )
 RETURNING id, address, browser, playwright_version, max_slots, status, last_heartbeat, lifetime_sessions, created_at
 `
 
 type RegisterWorkerParams struct {
-	ID                pgtype.UUID
+	ID                uuid.UUID
 	Address           string
 	Browser           string
 	PlaywrightVersion string
 	MaxSlots          int32
 	Status            WorkerStatus
-	LastHeartbeat     pgtype.Timestamptz
 }
 
 func (q *Queries) RegisterWorker(ctx context.Context, arg RegisterWorkerParams) (Worker, error) {
@@ -113,7 +112,6 @@ func (q *Queries) RegisterWorker(ctx context.Context, arg RegisterWorkerParams) 
 		arg.PlaywrightVersion,
 		arg.MaxSlots,
 		arg.Status,
-		arg.LastHeartbeat,
 	)
 	var i Worker
 	err := row.Scan(
@@ -138,7 +136,7 @@ RETURNING id, address, browser, playwright_version, max_slots, status, last_hear
 `
 
 type SetWorkerStatusParams struct {
-	ID     pgtype.UUID
+	ID     uuid.UUID
 	Status WorkerStatus
 }
 
@@ -161,20 +159,19 @@ func (q *Queries) SetWorkerStatus(ctx context.Context, arg SetWorkerStatusParams
 
 const updateWorkerHeartbeat = `-- name: UpdateWorkerHeartbeat :one
 UPDATE workers
-SET last_heartbeat = $2,
-    status = $3
+SET last_heartbeat = now(),
+    status = $2
 WHERE id = $1
 RETURNING id, address, browser, playwright_version, max_slots, status, last_heartbeat, lifetime_sessions, created_at
 `
 
 type UpdateWorkerHeartbeatParams struct {
-	ID            pgtype.UUID
-	LastHeartbeat pgtype.Timestamptz
-	Status        WorkerStatus
+	ID     uuid.UUID
+	Status WorkerStatus
 }
 
 func (q *Queries) UpdateWorkerHeartbeat(ctx context.Context, arg UpdateWorkerHeartbeatParams) (Worker, error) {
-	row := q.db.QueryRow(ctx, updateWorkerHeartbeat, arg.ID, arg.LastHeartbeat, arg.Status)
+	row := q.db.QueryRow(ctx, updateWorkerHeartbeat, arg.ID, arg.Status)
 	var i Worker
 	err := row.Scan(
 		&i.ID,

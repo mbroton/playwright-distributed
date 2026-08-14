@@ -10,7 +10,15 @@ INSERT INTO sessions (
     keep_alive_ms,
     connect_metadata
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9
+    $1,
+    $2,
+    $3,
+    $4,
+    $5,
+    $6,
+    now(),
+    $7,
+    COALESCE(sqlc.narg(connect_metadata)::jsonb, '{}'::jsonb)
 )
 RETURNING *;
 
@@ -27,7 +35,7 @@ RETURNING *;
 
 -- name: RenewSessionHeartbeat :one
 UPDATE sessions
-SET last_heartbeat = $2
+SET last_heartbeat = now()
 WHERE id = $1
 RETURNING *;
 
@@ -41,4 +49,5 @@ WHERE worker_id = $1
 SELECT *
 FROM sessions
 WHERE worker_id = $1
-ORDER BY created_at, id;
+ORDER BY created_at, id
+LIMIT sqlc.arg(page_size) OFFSET sqlc.arg(page_offset);

@@ -93,7 +93,8 @@ jobs:
         working-directory: ./server
         run: |
           make generate
-          git diff --exit-code
+          git add -A
+          git diff --cached --exit-code
 
       - name: Vet server
         working-directory: ./server

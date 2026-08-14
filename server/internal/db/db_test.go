@@ -4,18 +4,23 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/pressly/goose/v3"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 
 	"server/internal/db"
 	"server/internal/db/data"
+	"server/internal/db/migrations"
 )
 
 const postgresImage = "postgres:18-alpine"
@@ -30,23 +35,71 @@ func TestMigrate(t *testing.T) {
 		t.Fatalf("Migrate() on a current database returned an error: %v", err)
 	}
 
-	var version int64
-	err := pool.QueryRow(
-		t.Context(),
-		"SELECT version_id FROM goose_db_version WHERE is_applied ORDER BY id DESC LIMIT 1",
-	).Scan(&version)
+	sqlDB := stdlib.OpenDBFromPool(pool)
+	defer sqlDB.Close()
+	provider, err := goose.NewProvider(goose.DialectPostgres, sqlDB, migrations.Files)
+	if err != nil {
+		t.Fatalf("creating migration provider: %v", err)
+	}
+
+	sources := provider.ListSources()
+	if len(sources) == 0 {
+		t.Fatal("embedded migrations are empty")
+	}
+	var highestVersion int64
+	for _, source := range sources {
+		if source.Version > highestVersion {
+			highestVersion = source.Version
+		}
+	}
+
+	if _, err := provider.DownTo(t.Context(), 0); err != nil {
+		t.Fatalf("DownTo(0) returned an error: %v", err)
+	}
+	if _, err := provider.Up(t.Context()); err != nil {
+		t.Fatalf("Up() after DownTo(0) returned an error: %v", err)
+	}
+
+	version, err := provider.GetDBVersion(t.Context())
 	if err != nil {
 		t.Fatalf("reading migration version: %v", err)
 	}
-	if version != 1 {
-		t.Fatalf("migration version = %d, want 1", version)
+	if version != highestVersion {
+		t.Fatalf("migration version = %d, want highest embedded version %d", version, highestVersion)
+	}
+}
+
+func TestMigrateConcurrent(t *testing.T) {
+	const migrationCount = 8
+
+	pool := newTestPool(t)
+	ctx := t.Context()
+	start := make(chan struct{})
+	errs := make(chan error, migrationCount)
+	var group sync.WaitGroup
+	for range migrationCount {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			<-start
+			errs <- db.Migrate(ctx, pool)
+		}()
+	}
+
+	close(start)
+	group.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent Migrate() returned an error: %v", err)
+		}
 	}
 }
 
 func TestQueries(t *testing.T) {
 	pool := newMigratedTestPool(t)
 	queries := data.New(pool)
-	now := time.Now().UTC().Truncate(time.Microsecond)
+	now := time.Now().UTC()
 	workerID := testUUID(1)
 	keyID := testUUID(2)
 	sessionID := testUUID(3)
@@ -60,7 +113,7 @@ func TestQueries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InsertAPIKey() returned an error: %v", err)
 	}
-	if key.ID != keyID || key.Hash != "test-key-hash" || !key.CreatedAt.Valid {
+	if key.ID != keyID || key.Hash != "test-key-hash" || key.CreatedAt.IsZero() {
 		t.Fatalf("InsertAPIKey() = %+v, want inserted key with a creation time", key)
 	}
 
@@ -72,16 +125,15 @@ func TestQueries(t *testing.T) {
 		t.Fatalf("GetActiveAPIKeyByHash().ID = %v, want %v", activeKey.ID, keyID)
 	}
 
-	touchedAt := now.Add(time.Minute)
-	touchedKey, err := queries.TouchAPIKey(t.Context(), data.TouchAPIKeyParams{
-		ID:         keyID,
-		LastUsedAt: timestamp(touchedAt),
-	})
+	touchBefore := databaseTime(t, pool)
+	touchedKey, err := queries.TouchAPIKey(t.Context(), keyID)
 	if err != nil {
 		t.Fatalf("TouchAPIKey() returned an error: %v", err)
 	}
-	assertTime(t, "TouchAPIKey().LastUsedAt", touchedKey.LastUsedAt, touchedAt)
+	touchAfter := databaseTime(t, pool)
+	assertOptionalTimeBetween(t, "TouchAPIKey().LastUsedAt", touchedKey.LastUsedAt, touchBefore, touchAfter)
 
+	registerBefore := databaseTime(t, pool)
 	worker, err := queries.RegisterWorker(t.Context(), data.RegisterWorkerParams{
 		ID:                workerID,
 		Address:           "ws://worker:3000",
@@ -89,12 +141,13 @@ func TestQueries(t *testing.T) {
 		PlaywrightVersion: "1.58.2",
 		MaxSlots:          4,
 		Status:            data.WorkerStatusAvailable,
-		LastHeartbeat:     timestamp(now),
 	})
 	if err != nil {
 		t.Fatalf("RegisterWorker() returned an error: %v", err)
 	}
-	if worker.LifetimeSessions != 0 || !worker.CreatedAt.Valid {
+	registerAfter := databaseTime(t, pool)
+	assertTimeBetween(t, "RegisterWorker().LastHeartbeat", worker.LastHeartbeat, registerBefore, registerAfter)
+	if worker.LifetimeSessions != 0 || worker.CreatedAt.IsZero() {
 		t.Fatalf("RegisterWorker() = %+v, want default lifetime and creation time", worker)
 	}
 
@@ -106,16 +159,22 @@ func TestQueries(t *testing.T) {
 		t.Fatalf("GetWorker() = %+v, want address %q and browser %q", gotWorker, worker.Address, worker.Browser)
 	}
 
-	heartbeatAt := now.Add(2 * time.Minute)
+	heartbeatBefore := databaseTime(t, pool)
 	gotWorker, err = queries.UpdateWorkerHeartbeat(t.Context(), data.UpdateWorkerHeartbeatParams{
-		ID:            workerID,
-		LastHeartbeat: timestamp(heartbeatAt),
-		Status:        data.WorkerStatusDraining,
+		ID:     workerID,
+		Status: data.WorkerStatusDraining,
 	})
 	if err != nil {
 		t.Fatalf("UpdateWorkerHeartbeat() returned an error: %v", err)
 	}
-	assertTime(t, "UpdateWorkerHeartbeat().LastHeartbeat", gotWorker.LastHeartbeat, heartbeatAt)
+	heartbeatAfter := databaseTime(t, pool)
+	assertTimeBetween(
+		t,
+		"UpdateWorkerHeartbeat().LastHeartbeat",
+		gotWorker.LastHeartbeat,
+		heartbeatBefore,
+		heartbeatAfter,
+	)
 	if gotWorker.Status != data.WorkerStatusDraining {
 		t.Fatalf("UpdateWorkerHeartbeat().Status = %q, want %q", gotWorker.Status, data.WorkerStatusDraining)
 	}
@@ -140,21 +199,23 @@ func TestQueries(t *testing.T) {
 	}
 
 	metadata := []byte(`{"browserName":"chromium"}`)
+	sessionBefore := databaseTime(t, pool)
 	session, err := queries.InsertSession(t.Context(), data.InsertSessionParams{
 		ID:              sessionID,
 		WorkerID:        workerID,
 		Mode:            data.SessionModeDedicated,
 		Status:          data.SessionStatusPending,
-		CreatedByKey:    keyID,
-		ExpiresAt:       timestamp(now.Add(time.Hour)),
-		LastHeartbeat:   timestamp(now),
+		CreatedByKey:    &keyID,
+		ExpiresAt:       timePointer(now.Add(time.Hour)),
 		KeepAliveMs:     pgtype.Int4{Int32: 30_000, Valid: true},
 		ConnectMetadata: metadata,
 	})
 	if err != nil {
 		t.Fatalf("InsertSession() returned an error: %v", err)
 	}
-	if session.ID != sessionID || session.Mode != data.SessionModeDedicated || !session.CreatedAt.Valid {
+	sessionAfter := databaseTime(t, pool)
+	assertTimeBetween(t, "InsertSession().LastHeartbeat", session.LastHeartbeat, sessionBefore, sessionAfter)
+	if session.ID != sessionID || session.Mode != data.SessionModeDedicated || session.CreatedAt.IsZero() {
 		t.Fatalf("InsertSession() = %+v, want inserted dedicated session", session)
 	}
 
@@ -175,25 +236,27 @@ func TestQueries(t *testing.T) {
 		t.Fatalf("SetSessionStatus().Status = %q, want %q", gotSession.Status, data.SessionStatusRunning)
 	}
 
-	running, err := queries.CountRunningSessionsByWorker(t.Context(), workerID)
-	if err != nil {
-		t.Fatalf("CountRunningSessionsByWorker() returned an error: %v", err)
-	}
-	if running != 1 {
-		t.Fatalf("CountRunningSessionsByWorker() = %d, want 1", running)
+	_, err = queries.SetSessionStatus(t.Context(), data.SetSessionStatusParams{
+		ID:     uuid.New(),
+		Status: data.SessionStatusRunning,
+	})
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("SetSessionStatus() for missing id error = %v, want %v", err, pgx.ErrNoRows)
 	}
 
-	renewedAt := now.Add(3 * time.Minute)
-	gotSession, err = queries.RenewSessionHeartbeat(t.Context(), data.RenewSessionHeartbeatParams{
-		ID:            sessionID,
-		LastHeartbeat: timestamp(renewedAt),
-	})
+	renewBefore := databaseTime(t, pool)
+	gotSession, err = queries.RenewSessionHeartbeat(t.Context(), sessionID)
 	if err != nil {
 		t.Fatalf("RenewSessionHeartbeat() returned an error: %v", err)
 	}
-	assertTime(t, "RenewSessionHeartbeat().LastHeartbeat", gotSession.LastHeartbeat, renewedAt)
+	renewAfter := databaseTime(t, pool)
+	assertTimeBetween(t, "RenewSessionHeartbeat().LastHeartbeat", gotSession.LastHeartbeat, renewBefore, renewAfter)
 
-	sessions, err := queries.ListSessionsByWorker(t.Context(), workerID)
+	sessions, err := queries.ListSessionsByWorker(t.Context(), data.ListSessionsByWorkerParams{
+		WorkerID:   workerID,
+		PageSize:   100,
+		PageOffset: 0,
+	})
 	if err != nil {
 		t.Fatalf("ListSessionsByWorker() returned an error: %v", err)
 	}
@@ -201,15 +264,13 @@ func TestQueries(t *testing.T) {
 		t.Fatalf("ListSessionsByWorker() = %+v, want one inserted session", sessions)
 	}
 
-	revokedAt := now.Add(4 * time.Minute)
-	revokedKey, err := queries.RevokeAPIKey(t.Context(), data.RevokeAPIKeyParams{
-		ID:        keyID,
-		RevokedAt: timestamp(revokedAt),
-	})
+	revokeBefore := databaseTime(t, pool)
+	revokedKey, err := queries.RevokeAPIKey(t.Context(), keyID)
 	if err != nil {
 		t.Fatalf("RevokeAPIKey() returned an error: %v", err)
 	}
-	assertTime(t, "RevokeAPIKey().RevokedAt", revokedKey.RevokedAt, revokedAt)
+	revokeAfter := databaseTime(t, pool)
+	assertOptionalTimeBetween(t, "RevokeAPIKey().RevokedAt", revokedKey.RevokedAt, revokeBefore, revokeAfter)
 	if _, err := queries.GetActiveAPIKeyByHash(t.Context(), key.Hash); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("GetActiveAPIKeyByHash() after revoke error = %v, want %v", err, pgx.ErrNoRows)
 	}
@@ -228,7 +289,6 @@ func TestQueries(t *testing.T) {
 func TestEnumConstraints(t *testing.T) {
 	pool := newMigratedTestPool(t)
 	queries := data.New(pool)
-	now := time.Now().UTC().Truncate(time.Microsecond)
 	workerID := testUUID(10)
 
 	_, err := queries.RegisterWorker(t.Context(), data.RegisterWorkerParams{
@@ -238,11 +298,10 @@ func TestEnumConstraints(t *testing.T) {
 		PlaywrightVersion: "1.58.2",
 		MaxSlots:          1,
 		Status:            data.WorkerStatus("invalid"),
-		LastHeartbeat:     timestamp(now),
 	})
 	assertPGCode(t, "invalid worker status", err, "22P02")
 
-	insertWorker(t, queries, workerID, now)
+	insertWorker(t, queries, workerID)
 
 	tests := []struct {
 		name   string
@@ -263,12 +322,10 @@ func TestEnumConstraints(t *testing.T) {
 	for index, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			_, err := queries.InsertSession(t.Context(), data.InsertSessionParams{
-				ID:              testUUID(byte(11 + index)),
-				WorkerID:        workerID,
-				Mode:            test.mode,
-				Status:          test.status,
-				LastHeartbeat:   timestamp(now),
-				ConnectMetadata: []byte(`{}`),
+				ID:       testUUID(byte(11 + index)),
+				WorkerID: workerID,
+				Mode:     test.mode,
+				Status:   test.status,
 			})
 			assertPGCode(t, test.name, err, "22P02")
 		})
@@ -278,29 +335,24 @@ func TestEnumConstraints(t *testing.T) {
 func TestForeignKeys(t *testing.T) {
 	pool := newMigratedTestPool(t)
 	queries := data.New(pool)
-	now := time.Now().UTC().Truncate(time.Microsecond)
 	workerID := testUUID(20)
 	keyID := testUUID(21)
 
 	_, err := queries.InsertSession(t.Context(), data.InsertSessionParams{
-		ID:              testUUID(22),
-		WorkerID:        workerID,
-		Mode:            data.SessionModeDefault,
-		Status:          data.SessionStatusPending,
-		LastHeartbeat:   timestamp(now),
-		ConnectMetadata: []byte(`{}`),
+		ID:       testUUID(22),
+		WorkerID: workerID,
+		Mode:     data.SessionModeDefault,
+		Status:   data.SessionStatusPending,
 	})
 	assertPGCode(t, "missing worker", err, "23503")
 
-	insertWorker(t, queries, workerID, now)
+	insertWorker(t, queries, workerID)
 	_, err = queries.InsertSession(t.Context(), data.InsertSessionParams{
-		ID:              testUUID(23),
-		WorkerID:        workerID,
-		Mode:            data.SessionModeDefault,
-		Status:          data.SessionStatusPending,
-		CreatedByKey:    keyID,
-		LastHeartbeat:   timestamp(now),
-		ConnectMetadata: []byte(`{}`),
+		ID:           testUUID(23),
+		WorkerID:     workerID,
+		Mode:         data.SessionModeDefault,
+		Status:       data.SessionStatusPending,
+		CreatedByKey: &keyID,
 	})
 	assertPGCode(t, "missing api key", err, "23503")
 
@@ -314,13 +366,11 @@ func TestForeignKeys(t *testing.T) {
 		t.Fatalf("InsertAPIKey() returned an error: %v", err)
 	}
 	_, err = queries.InsertSession(t.Context(), data.InsertSessionParams{
-		ID:              testUUID(24),
-		WorkerID:        workerID,
-		Mode:            data.SessionModeDefault,
-		Status:          data.SessionStatusPending,
-		CreatedByKey:    keyID,
-		LastHeartbeat:   timestamp(now),
-		ConnectMetadata: []byte(`{}`),
+		ID:           testUUID(24),
+		WorkerID:     workerID,
+		Mode:         data.SessionModeDefault,
+		Status:       data.SessionStatusPending,
+		CreatedByKey: &keyID,
 	})
 	if err != nil {
 		t.Fatalf("InsertSession() returned an error: %v", err)
@@ -328,7 +378,108 @@ func TestForeignKeys(t *testing.T) {
 
 	assertPGCode(t, "worker delete restriction", queries.DeleteWorker(t.Context(), workerID), "23001")
 	_, err = pool.Exec(t.Context(), "DELETE FROM api_keys WHERE id = $1", keyID)
-	assertPGCode(t, "api key delete restriction", err, "23503")
+	assertPGCode(t, "api key delete restriction", err, "23001")
+}
+
+func TestCheckConstraints(t *testing.T) {
+	pool := newMigratedTestPool(t)
+	queries := data.New(pool)
+	workerID := testUUID(30)
+	insertWorker(t, queries, workerID)
+
+	_, err := pool.Exec(
+		t.Context(),
+		"UPDATE workers SET lifetime_sessions = -1 WHERE id = $1",
+		workerID,
+	)
+	assertPGCode(t, "negative worker lifetime sessions", err, "23514")
+
+	_, err = queries.InsertSession(t.Context(), data.InsertSessionParams{
+		ID:          testUUID(31),
+		WorkerID:    workerID,
+		Mode:        data.SessionModeDefault,
+		Status:      data.SessionStatusPending,
+		KeepAliveMs: pgtype.Int4{Int32: -1, Valid: true},
+	})
+	assertPGCode(t, "negative session keep alive", err, "23514")
+}
+
+func TestInsertSessionDefaultMetadata(t *testing.T) {
+	pool := newMigratedTestPool(t)
+	queries := data.New(pool)
+	workerID := testUUID(40)
+	sessionID := testUUID(41)
+	insertWorker(t, queries, workerID)
+
+	_, err := queries.InsertSession(t.Context(), data.InsertSessionParams{
+		ID:              sessionID,
+		WorkerID:        workerID,
+		Mode:            data.SessionModeDefault,
+		Status:          data.SessionStatusPending,
+		ConnectMetadata: nil,
+	})
+	if err != nil {
+		t.Fatalf("InsertSession() with nil metadata returned an error: %v", err)
+	}
+
+	session, err := queries.GetSession(t.Context(), sessionID)
+	if err != nil {
+		t.Fatalf("GetSession() returned an error: %v", err)
+	}
+	assertJSONEqual(t, "GetSession().ConnectMetadata", session.ConnectMetadata, []byte(`{}`))
+}
+
+func TestInsertAPIKeyDuplicateHash(t *testing.T) {
+	pool := newMigratedTestPool(t)
+	queries := data.New(pool)
+	const hash = "duplicate-key-hash"
+
+	_, err := queries.InsertAPIKey(t.Context(), data.InsertAPIKeyParams{
+		ID:     testUUID(50),
+		Name:   "first key",
+		Hash:   hash,
+		Prefix: "first_",
+	})
+	if err != nil {
+		t.Fatalf("first InsertAPIKey() returned an error: %v", err)
+	}
+
+	_, err = queries.InsertAPIKey(t.Context(), data.InsertAPIKeyParams{
+		ID:     testUUID(51),
+		Name:   "duplicate key",
+		Hash:   hash,
+		Prefix: "duplicate_",
+	})
+	assertPGCode(t, "duplicate api key hash", err, "23505")
+}
+
+func TestCountRunningSessionsByWorker(t *testing.T) {
+	pool := newMigratedTestPool(t)
+	queries := data.New(pool)
+	workerA := testUUID(60)
+	workerB := testUUID(61)
+	insertWorker(t, queries, workerA)
+	insertWorker(t, queries, workerB)
+
+	insertSession(t, queries, testUUID(62), workerA, data.SessionStatusRunning)
+	insertSession(t, queries, testUUID(63), workerA, data.SessionStatusCompleted)
+	insertSession(t, queries, testUUID(64), workerB, data.SessionStatusRunning)
+
+	countA, err := queries.CountRunningSessionsByWorker(t.Context(), workerA)
+	if err != nil {
+		t.Fatalf("CountRunningSessionsByWorker(worker A) returned an error: %v", err)
+	}
+	if countA != 1 {
+		t.Fatalf("CountRunningSessionsByWorker(worker A) = %d, want 1", countA)
+	}
+
+	countB, err := queries.CountRunningSessionsByWorker(t.Context(), workerB)
+	if err != nil {
+		t.Fatalf("CountRunningSessionsByWorker(worker B) returned an error: %v", err)
+	}
+	if countB != 1 {
+		t.Fatalf("CountRunningSessionsByWorker(worker B) = %d, want 1", countB)
+	}
 }
 
 func newTestPool(t *testing.T) *pgxpool.Pool {
@@ -372,7 +523,7 @@ func newMigratedTestPool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-func insertWorker(t *testing.T, queries *data.Queries, id pgtype.UUID, heartbeat time.Time) {
+func insertWorker(t *testing.T, queries *data.Queries, id uuid.UUID) {
 	t.Helper()
 
 	_, err := queries.RegisterWorker(t.Context(), data.RegisterWorkerParams{
@@ -382,28 +533,65 @@ func insertWorker(t *testing.T, queries *data.Queries, id pgtype.UUID, heartbeat
 		PlaywrightVersion: "1.58.2",
 		MaxSlots:          1,
 		Status:            data.WorkerStatusAvailable,
-		LastHeartbeat:     timestamp(heartbeat),
 	})
 	if err != nil {
 		t.Fatalf("RegisterWorker() returned an error: %v", err)
 	}
 }
 
-func testUUID(value byte) pgtype.UUID {
-	var bytes [16]byte
-	bytes[15] = value
-	return pgtype.UUID{Bytes: bytes, Valid: true}
-}
-
-func timestamp(value time.Time) pgtype.Timestamptz {
-	return pgtype.Timestamptz{Time: value, Valid: true}
-}
-
-func assertTime(t *testing.T, name string, actual pgtype.Timestamptz, expected time.Time) {
+func insertSession(
+	t *testing.T,
+	queries *data.Queries,
+	id uuid.UUID,
+	workerID uuid.UUID,
+	status data.SessionStatus,
+) {
 	t.Helper()
-	if !actual.Valid || !actual.Time.Equal(expected) {
-		t.Fatalf("%s = %v, want %v", name, actual, expected)
+
+	_, err := queries.InsertSession(t.Context(), data.InsertSessionParams{
+		ID:       id,
+		WorkerID: workerID,
+		Mode:     data.SessionModeDefault,
+		Status:   status,
+	})
+	if err != nil {
+		t.Fatalf("InsertSession() returned an error: %v", err)
 	}
+}
+
+func testUUID(value byte) uuid.UUID {
+	var id uuid.UUID
+	id[15] = value
+	return id
+}
+
+func databaseTime(t *testing.T, pool *pgxpool.Pool) time.Time {
+	t.Helper()
+
+	var now time.Time
+	if err := pool.QueryRow(t.Context(), "SELECT now()").Scan(&now); err != nil {
+		t.Fatalf("reading database time: %v", err)
+	}
+	return now
+}
+
+func timePointer(value time.Time) *time.Time {
+	return &value
+}
+
+func assertTimeBetween(t *testing.T, name string, actual, before, after time.Time) {
+	t.Helper()
+	if actual.Before(before) || actual.After(after) {
+		t.Fatalf("%s = %v, want a time from %v through %v", name, actual, before, after)
+	}
+}
+
+func assertOptionalTimeBetween(t *testing.T, name string, actual *time.Time, before, after time.Time) {
+	t.Helper()
+	if actual == nil {
+		t.Fatalf("%s is nil, want a time from %v through %v", name, before, after)
+	}
+	assertTimeBetween(t, name, *actual, before, after)
 }
 
 func assertJSONEqual(t *testing.T, name string, actual, expected []byte) {

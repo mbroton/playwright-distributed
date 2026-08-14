@@ -22,12 +22,13 @@ CREATE TYPE session_status AS ENUM (
 CREATE TABLE workers (
     id uuid PRIMARY KEY,
     address text NOT NULL,
+    -- Plain text plus CHECK is deliberate because new browser values, such as camoufox, are expected.
     browser text NOT NULL CHECK (browser IN ('chromium', 'firefox', 'webkit')),
     playwright_version text NOT NULL,
     max_slots integer NOT NULL CHECK (max_slots > 0),
     status worker_status NOT NULL,
     last_heartbeat timestamptz NOT NULL,
-    lifetime_sessions bigint NOT NULL DEFAULT 0,
+    lifetime_sessions bigint NOT NULL DEFAULT 0 CHECK (lifetime_sessions >= 0),
     created_at timestamptz NOT NULL DEFAULT now()
 );
 
@@ -43,22 +44,24 @@ CREATE TABLE api_keys (
 
 CREATE TABLE sessions (
     id uuid PRIMARY KEY,
+    -- Retention cleanup removes sessions before workers; RESTRICT enforces that order.
     worker_id uuid NOT NULL REFERENCES workers (id) ON DELETE RESTRICT,
     mode session_mode NOT NULL,
     status session_status NOT NULL,
-    created_by_key uuid REFERENCES api_keys (id),
+    -- API keys are revoked, never deleted (GitHub-style); RESTRICT protects session attribution.
+    created_by_key uuid REFERENCES api_keys (id) ON DELETE RESTRICT,
     created_at timestamptz NOT NULL DEFAULT now(),
     expires_at timestamptz,
     last_heartbeat timestamptz NOT NULL,
-    keep_alive_ms integer,
+    keep_alive_ms integer CHECK (keep_alive_ms IS NULL OR keep_alive_ms > 0),
     connect_metadata jsonb NOT NULL DEFAULT '{}'::jsonb
 );
 
-CREATE INDEX workers_status_idx ON workers (status);
+CREATE INDEX sessions_worker_id_idx ON sessions (worker_id);
 CREATE INDEX sessions_running_worker_idx ON sessions (worker_id)
     WHERE status = 'running';
 CREATE INDEX sessions_running_heartbeat_idx ON sessions (last_heartbeat)
-    WHERE status = 'running';
+    WHERE status IN ('pending', 'running');
 
 -- +goose Down
 DROP TABLE sessions;

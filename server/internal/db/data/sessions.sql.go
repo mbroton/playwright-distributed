@@ -7,7 +7,9 @@ package data
 
 import (
 	"context"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -18,7 +20,7 @@ WHERE worker_id = $1
   AND status = 'running'
 `
 
-func (q *Queries) CountRunningSessionsByWorker(ctx context.Context, workerID pgtype.UUID) (int64, error) {
+func (q *Queries) CountRunningSessionsByWorker(ctx context.Context, workerID uuid.UUID) (int64, error) {
 	row := q.db.QueryRow(ctx, countRunningSessionsByWorker, workerID)
 	var count int64
 	err := row.Scan(&count)
@@ -31,7 +33,7 @@ FROM sessions
 WHERE id = $1
 `
 
-func (q *Queries) GetSession(ctx context.Context, id pgtype.UUID) (Session, error) {
+func (q *Queries) GetSession(ctx context.Context, id uuid.UUID) (Session, error) {
 	row := q.db.QueryRow(ctx, getSession, id)
 	var i Session
 	err := row.Scan(
@@ -61,19 +63,26 @@ INSERT INTO sessions (
     keep_alive_ms,
     connect_metadata
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9
+    $1,
+    $2,
+    $3,
+    $4,
+    $5,
+    $6,
+    now(),
+    $7,
+    COALESCE($8::jsonb, '{}'::jsonb)
 )
 RETURNING id, worker_id, mode, status, created_by_key, created_at, expires_at, last_heartbeat, keep_alive_ms, connect_metadata
 `
 
 type InsertSessionParams struct {
-	ID              pgtype.UUID
-	WorkerID        pgtype.UUID
+	ID              uuid.UUID
+	WorkerID        uuid.UUID
 	Mode            SessionMode
 	Status          SessionStatus
-	CreatedByKey    pgtype.UUID
-	ExpiresAt       pgtype.Timestamptz
-	LastHeartbeat   pgtype.Timestamptz
+	CreatedByKey    *uuid.UUID
+	ExpiresAt       *time.Time
 	KeepAliveMs     pgtype.Int4
 	ConnectMetadata []byte
 }
@@ -86,7 +95,6 @@ func (q *Queries) InsertSession(ctx context.Context, arg InsertSessionParams) (S
 		arg.Status,
 		arg.CreatedByKey,
 		arg.ExpiresAt,
-		arg.LastHeartbeat,
 		arg.KeepAliveMs,
 		arg.ConnectMetadata,
 	)
@@ -111,10 +119,17 @@ SELECT id, worker_id, mode, status, created_by_key, created_at, expires_at, last
 FROM sessions
 WHERE worker_id = $1
 ORDER BY created_at, id
+LIMIT $3 OFFSET $2
 `
 
-func (q *Queries) ListSessionsByWorker(ctx context.Context, workerID pgtype.UUID) ([]Session, error) {
-	rows, err := q.db.Query(ctx, listSessionsByWorker, workerID)
+type ListSessionsByWorkerParams struct {
+	WorkerID   uuid.UUID
+	PageOffset int32
+	PageSize   int32
+}
+
+func (q *Queries) ListSessionsByWorker(ctx context.Context, arg ListSessionsByWorkerParams) ([]Session, error) {
+	rows, err := q.db.Query(ctx, listSessionsByWorker, arg.WorkerID, arg.PageOffset, arg.PageSize)
 	if err != nil {
 		return nil, err
 	}
@@ -146,18 +161,13 @@ func (q *Queries) ListSessionsByWorker(ctx context.Context, workerID pgtype.UUID
 
 const renewSessionHeartbeat = `-- name: RenewSessionHeartbeat :one
 UPDATE sessions
-SET last_heartbeat = $2
+SET last_heartbeat = now()
 WHERE id = $1
 RETURNING id, worker_id, mode, status, created_by_key, created_at, expires_at, last_heartbeat, keep_alive_ms, connect_metadata
 `
 
-type RenewSessionHeartbeatParams struct {
-	ID            pgtype.UUID
-	LastHeartbeat pgtype.Timestamptz
-}
-
-func (q *Queries) RenewSessionHeartbeat(ctx context.Context, arg RenewSessionHeartbeatParams) (Session, error) {
-	row := q.db.QueryRow(ctx, renewSessionHeartbeat, arg.ID, arg.LastHeartbeat)
+func (q *Queries) RenewSessionHeartbeat(ctx context.Context, id uuid.UUID) (Session, error) {
+	row := q.db.QueryRow(ctx, renewSessionHeartbeat, id)
 	var i Session
 	err := row.Scan(
 		&i.ID,
@@ -182,7 +192,7 @@ RETURNING id, worker_id, mode, status, created_by_key, created_at, expires_at, l
 `
 
 type SetSessionStatusParams struct {
-	ID     pgtype.UUID
+	ID     uuid.UUID
 	Status SessionStatus
 }
 

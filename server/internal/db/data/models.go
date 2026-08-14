@@ -7,7 +7,9 @@ package data
 import (
 	"database/sql/driver"
 	"fmt"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -143,36 +145,36 @@ func (ns NullWorkerStatus) Value() (driver.Value, error) {
 }
 
 type APIKey struct {
-	ID         pgtype.UUID
+	ID         uuid.UUID
 	Name       string
 	Hash       string
 	Prefix     string
-	CreatedAt  pgtype.Timestamptz
-	LastUsedAt pgtype.Timestamptz
-	RevokedAt  pgtype.Timestamptz
+	CreatedAt  time.Time
+	LastUsedAt *time.Time
+	RevokedAt  *time.Time
 }
 
 type Session struct {
-	ID              pgtype.UUID
-	WorkerID        pgtype.UUID
+	ID              uuid.UUID
+	WorkerID        uuid.UUID
 	Mode            SessionMode
 	Status          SessionStatus
-	CreatedByKey    pgtype.UUID
-	CreatedAt       pgtype.Timestamptz
-	ExpiresAt       pgtype.Timestamptz
-	LastHeartbeat   pgtype.Timestamptz
+	CreatedByKey    *uuid.UUID
+	CreatedAt       time.Time
+	ExpiresAt       *time.Time
+	LastHeartbeat   time.Time
 	KeepAliveMs     pgtype.Int4
 	ConnectMetadata []byte
 }
 
 type Worker struct {
-	ID                pgtype.UUID
+	ID                uuid.UUID
 	Address           string
 	Browser           string
 	PlaywrightVersion string
 	MaxSlots          int32
 	Status            WorkerStatus
-	LastHeartbeat     pgtype.Timestamptz
+	LastHeartbeat     time.Time
 	LifetimeSessions  int64
-	CreatedAt         pgtype.Timestamptz
+	CreatedAt         time.Time
 }

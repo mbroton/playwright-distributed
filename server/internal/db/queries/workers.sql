@@ -8,7 +8,7 @@ INSERT INTO workers (
     status,
     last_heartbeat
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7
+    $1, $2, $3, $4, $5, $6, now()
 )
 RETURNING *;
 
@@ -19,8 +19,8 @@ WHERE id = $1;
 
 -- name: UpdateWorkerHeartbeat :one
 UPDATE workers
-SET last_heartbeat = $2,
-    status = $3
+SET last_heartbeat = now(),
+    status = $2
 WHERE id = $1
 RETURNING *;
 
