@@ -116,6 +116,13 @@ jobs:
           cache-from: type=gha,scope=worker
           tags: ghcr.io/${{ github.repository }}/worker:latest
 
+      # `--pull never` guards the ghcr images: the deployment must use the
+      # images built above, never ones already published. It also blocks
+      # third-party images, which a fresh runner does not have, so pull
+      # those explicitly first.
+      - name: Pull images not built from this repository
+        run: docker compose -f docker-compose.yaml pull redis
+
       - name: Start the documented deployment
         run: docker compose -f docker-compose.yaml up -d --pull never
 
