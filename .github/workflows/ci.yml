@@ -78,6 +78,38 @@ jobs:
         working-directory: ./proxy
         run: govulncheck ./...
 
+  server-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.6'
+          cache-dependency-path: server/go.sum
+
+      - name: Verify generated server code
+        working-directory: ./server
+        run: |
+          make generate
+          git diff --exit-code
+
+      - name: Vet server
+        working-directory: ./server
+        run: go vet ./...
+
+      - name: Run server tests with race detection
+        working-directory: ./server
+        run: go test -race -v ./...
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+
+      - name: Scan server for reachable vulnerabilities
+        working-directory: ./server
+        run: govulncheck ./...
+
   docker-build:
     runs-on: ubuntu-latest
     steps:
