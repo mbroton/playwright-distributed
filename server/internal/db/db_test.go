@@ -201,14 +201,17 @@ func TestQueries(t *testing.T) {
 	metadata := []byte(`{"browserName":"chromium"}`)
 	sessionBefore := databaseTime(t, pool)
 	session, err := queries.InsertSession(t.Context(), data.InsertSessionParams{
-		ID:              sessionID,
-		WorkerID:        workerID,
-		Mode:            data.SessionModeDedicated,
-		Status:          data.SessionStatusPending,
-		CreatedByKey:    &keyID,
-		ExpiresAt:       timePointer(now.Add(time.Hour)),
-		KeepAliveMs:     pgtype.Int4{Int32: 30_000, Valid: true},
-		ConnectMetadata: metadata,
+		ID:                sessionID,
+		WorkerID:          workerID,
+		Browser:           "chromium",
+		PlaywrightVersion: "1.58.2",
+		WorkerAddress:     "ws://worker:3000",
+		Mode:              data.SessionModeDedicated,
+		Status:            data.SessionStatusPending,
+		CreatedByKey:      &keyID,
+		ExpiresAt:         timePointer(now.Add(time.Hour)),
+		KeepAliveMs:       pgtype.Int4{Int32: 30_000, Valid: true},
+		ConnectMetadata:   metadata,
 	})
 	if err != nil {
 		t.Fatalf("InsertSession() returned an error: %v", err)
@@ -322,10 +325,13 @@ func TestEnumConstraints(t *testing.T) {
 	for index, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			_, err := queries.InsertSession(t.Context(), data.InsertSessionParams{
-				ID:       testUUID(byte(11 + index)),
-				WorkerID: workerID,
-				Mode:     test.mode,
-				Status:   test.status,
+				ID:                testUUID(byte(11 + index)),
+				WorkerID:          workerID,
+				Browser:           "chromium",
+				PlaywrightVersion: "1.58.2",
+				WorkerAddress:     "ws://worker:3000",
+				Mode:              test.mode,
+				Status:            test.status,
 			})
 			assertPGCode(t, test.name, err, "22P02")
 		})
@@ -337,22 +343,32 @@ func TestForeignKeys(t *testing.T) {
 	queries := data.New(pool)
 	workerID := testUUID(20)
 	keyID := testUUID(21)
+	missingWorkerSessionID := testUUID(22)
+	keySessionID := testUUID(24)
 
 	_, err := queries.InsertSession(t.Context(), data.InsertSessionParams{
-		ID:       testUUID(22),
-		WorkerID: workerID,
-		Mode:     data.SessionModeDefault,
-		Status:   data.SessionStatusPending,
+		ID:                missingWorkerSessionID,
+		WorkerID:          workerID,
+		Browser:           "firefox",
+		PlaywrightVersion: "1.57.0",
+		WorkerAddress:     "ws://removed-worker:3000",
+		Mode:              data.SessionModeDefault,
+		Status:            data.SessionStatusCompleted,
 	})
-	assertPGCode(t, "missing worker", err, "23503")
+	if err != nil {
+		t.Fatalf("InsertSession() with missing worker returned an error: %v", err)
+	}
 
 	insertWorker(t, queries, workerID)
 	_, err = queries.InsertSession(t.Context(), data.InsertSessionParams{
-		ID:           testUUID(23),
-		WorkerID:     workerID,
-		Mode:         data.SessionModeDefault,
-		Status:       data.SessionStatusPending,
-		CreatedByKey: &keyID,
+		ID:                testUUID(23),
+		WorkerID:          workerID,
+		Browser:           "chromium",
+		PlaywrightVersion: "1.58.2",
+		WorkerAddress:     "ws://worker:3000",
+		Mode:              data.SessionModeDefault,
+		Status:            data.SessionStatusPending,
+		CreatedByKey:      &keyID,
 	})
 	assertPGCode(t, "missing api key", err, "23503")
 
@@ -366,17 +382,60 @@ func TestForeignKeys(t *testing.T) {
 		t.Fatalf("InsertAPIKey() returned an error: %v", err)
 	}
 	_, err = queries.InsertSession(t.Context(), data.InsertSessionParams{
-		ID:           testUUID(24),
-		WorkerID:     workerID,
-		Mode:         data.SessionModeDefault,
-		Status:       data.SessionStatusPending,
-		CreatedByKey: &keyID,
+		ID:                keySessionID,
+		WorkerID:          workerID,
+		Browser:           "chromium",
+		PlaywrightVersion: "1.58.2",
+		WorkerAddress:     "ws://worker:3000",
+		Mode:              data.SessionModeDefault,
+		Status:            data.SessionStatusPending,
+		CreatedByKey:      &keyID,
 	})
 	if err != nil {
 		t.Fatalf("InsertSession() returned an error: %v", err)
 	}
 
-	assertPGCode(t, "worker delete restriction", queries.DeleteWorker(t.Context(), workerID), "23001")
+	if err := queries.DeleteWorker(t.Context(), workerID); err != nil {
+		t.Fatalf("DeleteWorker() with sessions returned an error: %v", err)
+	}
+
+	tests := []struct {
+		name              string
+		id                uuid.UUID
+		browser           string
+		playwrightVersion string
+		workerAddress     string
+	}{
+		{
+			name:              "session inserted before worker registration",
+			id:                missingWorkerSessionID,
+			browser:           "firefox",
+			playwrightVersion: "1.57.0",
+			workerAddress:     "ws://removed-worker:3000",
+		},
+		{
+			name:              "session created by api key",
+			id:                keySessionID,
+			browser:           "chromium",
+			playwrightVersion: "1.58.2",
+			workerAddress:     "ws://worker:3000",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			session, err := queries.GetSession(t.Context(), test.id)
+			if err != nil {
+				t.Fatalf("GetSession() after worker deletion returned an error: %v", err)
+			}
+			if session.WorkerID != workerID ||
+				session.Browser != test.browser ||
+				session.PlaywrightVersion != test.playwrightVersion ||
+				session.WorkerAddress != test.workerAddress {
+				t.Fatalf("GetSession() after worker deletion = %+v, want intact worker history", session)
+			}
+		})
+	}
+
 	_, err = pool.Exec(t.Context(), "DELETE FROM api_keys WHERE id = $1", keyID)
 	assertPGCode(t, "api key delete restriction", err, "23001")
 }
@@ -395,13 +454,27 @@ func TestCheckConstraints(t *testing.T) {
 	assertPGCode(t, "negative worker lifetime sessions", err, "23514")
 
 	_, err = queries.InsertSession(t.Context(), data.InsertSessionParams{
-		ID:          testUUID(31),
-		WorkerID:    workerID,
-		Mode:        data.SessionModeDefault,
-		Status:      data.SessionStatusPending,
-		KeepAliveMs: pgtype.Int4{Int32: -1, Valid: true},
+		ID:                testUUID(31),
+		WorkerID:          workerID,
+		Browser:           "chromium",
+		PlaywrightVersion: "1.58.2",
+		WorkerAddress:     "ws://worker:3000",
+		Mode:              data.SessionModeDefault,
+		Status:            data.SessionStatusPending,
+		KeepAliveMs:       pgtype.Int4{Int32: -1, Valid: true},
 	})
 	assertPGCode(t, "negative session keep alive", err, "23514")
+
+	_, err = queries.InsertSession(t.Context(), data.InsertSessionParams{
+		ID:                testUUID(32),
+		WorkerID:          workerID,
+		Browser:           "invalid",
+		PlaywrightVersion: "1.58.2",
+		WorkerAddress:     "ws://worker:3000",
+		Mode:              data.SessionModeDefault,
+		Status:            data.SessionStatusPending,
+	})
+	assertPGCode(t, "invalid session browser", err, "23514")
 }
 
 func TestInsertSessionDefaultMetadata(t *testing.T) {
@@ -412,11 +485,14 @@ func TestInsertSessionDefaultMetadata(t *testing.T) {
 	insertWorker(t, queries, workerID)
 
 	_, err := queries.InsertSession(t.Context(), data.InsertSessionParams{
-		ID:              sessionID,
-		WorkerID:        workerID,
-		Mode:            data.SessionModeDefault,
-		Status:          data.SessionStatusPending,
-		ConnectMetadata: nil,
+		ID:                sessionID,
+		WorkerID:          workerID,
+		Browser:           "chromium",
+		PlaywrightVersion: "1.58.2",
+		WorkerAddress:     "ws://worker:3000",
+		Mode:              data.SessionModeDefault,
+		Status:            data.SessionStatusPending,
+		ConnectMetadata:   nil,
 	})
 	if err != nil {
 		t.Fatalf("InsertSession() with nil metadata returned an error: %v", err)
@@ -549,10 +625,13 @@ func insertSession(
 	t.Helper()
 
 	_, err := queries.InsertSession(t.Context(), data.InsertSessionParams{
-		ID:       id,
-		WorkerID: workerID,
-		Mode:     data.SessionModeDefault,
-		Status:   status,
+		ID:                id,
+		WorkerID:          workerID,
+		Browser:           "chromium",
+		PlaywrightVersion: "1.58.2",
+		WorkerAddress:     "ws://worker:3000",
+		Mode:              data.SessionModeDefault,
+		Status:            status,
 	})
 	if err != nil {
 		t.Fatalf("InsertSession() returned an error: %v", err)

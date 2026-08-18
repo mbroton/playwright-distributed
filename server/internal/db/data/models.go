@@ -155,16 +155,19 @@ type APIKey struct {
 }
 
 type Session struct {
-	ID              uuid.UUID
-	WorkerID        uuid.UUID
-	Mode            SessionMode
-	Status          SessionStatus
-	CreatedByKey    *uuid.UUID
-	CreatedAt       time.Time
-	ExpiresAt       *time.Time
-	LastHeartbeat   time.Time
-	KeepAliveMs     pgtype.Int4
-	ConnectMetadata []byte
+	ID                uuid.UUID
+	WorkerID          uuid.UUID
+	Browser           string
+	PlaywrightVersion string
+	WorkerAddress     string
+	Mode              SessionMode
+	Status            SessionStatus
+	CreatedByKey      *uuid.UUID
+	CreatedAt         time.Time
+	ExpiresAt         *time.Time
+	LastHeartbeat     time.Time
+	KeepAliveMs       pgtype.Int4
+	ConnectMetadata   []byte
 }
 
 type Worker struct {

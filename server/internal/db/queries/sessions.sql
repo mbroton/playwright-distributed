@@ -2,6 +2,9 @@
 INSERT INTO sessions (
     id,
     worker_id,
+    browser,
+    playwright_version,
+    worker_address,
     mode,
     status,
     created_by_key,
@@ -16,8 +19,11 @@ INSERT INTO sessions (
     $4,
     $5,
     $6,
-    now(),
     $7,
+    $8,
+    $9,
+    now(),
+    $10,
     COALESCE(sqlc.narg(connect_metadata)::jsonb, '{}'::jsonb)
 )
 RETURNING *;

@@ -28,7 +28,7 @@ func (q *Queries) CountRunningSessionsByWorker(ctx context.Context, workerID uui
 }
 
 const getSession = `-- name: GetSession :one
-SELECT id, worker_id, mode, status, created_by_key, created_at, expires_at, last_heartbeat, keep_alive_ms, connect_metadata
+SELECT id, worker_id, browser, playwright_version, worker_address, mode, status, created_by_key, created_at, expires_at, last_heartbeat, keep_alive_ms, connect_metadata
 FROM sessions
 WHERE id = $1
 `
@@ -39,6 +39,9 @@ func (q *Queries) GetSession(ctx context.Context, id uuid.UUID) (Session, error)
 	err := row.Scan(
 		&i.ID,
 		&i.WorkerID,
+		&i.Browser,
+		&i.PlaywrightVersion,
+		&i.WorkerAddress,
 		&i.Mode,
 		&i.Status,
 		&i.CreatedByKey,
@@ -55,6 +58,9 @@ const insertSession = `-- name: InsertSession :one
 INSERT INTO sessions (
     id,
     worker_id,
+    browser,
+    playwright_version,
+    worker_address,
     mode,
     status,
     created_by_key,
@@ -69,28 +75,37 @@ INSERT INTO sessions (
     $4,
     $5,
     $6,
-    now(),
     $7,
-    COALESCE($8::jsonb, '{}'::jsonb)
+    $8,
+    $9,
+    now(),
+    $10,
+    COALESCE($11::jsonb, '{}'::jsonb)
 )
-RETURNING id, worker_id, mode, status, created_by_key, created_at, expires_at, last_heartbeat, keep_alive_ms, connect_metadata
+RETURNING id, worker_id, browser, playwright_version, worker_address, mode, status, created_by_key, created_at, expires_at, last_heartbeat, keep_alive_ms, connect_metadata
 `
 
 type InsertSessionParams struct {
-	ID              uuid.UUID
-	WorkerID        uuid.UUID
-	Mode            SessionMode
-	Status          SessionStatus
-	CreatedByKey    *uuid.UUID
-	ExpiresAt       *time.Time
-	KeepAliveMs     pgtype.Int4
-	ConnectMetadata []byte
+	ID                uuid.UUID
+	WorkerID          uuid.UUID
+	Browser           string
+	PlaywrightVersion string
+	WorkerAddress     string
+	Mode              SessionMode
+	Status            SessionStatus
+	CreatedByKey      *uuid.UUID
+	ExpiresAt         *time.Time
+	KeepAliveMs       pgtype.Int4
+	ConnectMetadata   []byte
 }
 
 func (q *Queries) InsertSession(ctx context.Context, arg InsertSessionParams) (Session, error) {
 	row := q.db.QueryRow(ctx, insertSession,
 		arg.ID,
 		arg.WorkerID,
+		arg.Browser,
+		arg.PlaywrightVersion,
+		arg.WorkerAddress,
 		arg.Mode,
 		arg.Status,
 		arg.CreatedByKey,
@@ -102,6 +117,9 @@ func (q *Queries) InsertSession(ctx context.Context, arg InsertSessionParams) (S
 	err := row.Scan(
 		&i.ID,
 		&i.WorkerID,
+		&i.Browser,
+		&i.PlaywrightVersion,
+		&i.WorkerAddress,
 		&i.Mode,
 		&i.Status,
 		&i.CreatedByKey,
@@ -115,7 +133,7 @@ func (q *Queries) InsertSession(ctx context.Context, arg InsertSessionParams) (S
 }
 
 const listSessionsByWorker = `-- name: ListSessionsByWorker :many
-SELECT id, worker_id, mode, status, created_by_key, created_at, expires_at, last_heartbeat, keep_alive_ms, connect_metadata
+SELECT id, worker_id, browser, playwright_version, worker_address, mode, status, created_by_key, created_at, expires_at, last_heartbeat, keep_alive_ms, connect_metadata
 FROM sessions
 WHERE worker_id = $1
 ORDER BY created_at, id
@@ -140,6 +158,9 @@ func (q *Queries) ListSessionsByWorker(ctx context.Context, arg ListSessionsByWo
 		if err := rows.Scan(
 			&i.ID,
 			&i.WorkerID,
+			&i.Browser,
+			&i.PlaywrightVersion,
+			&i.WorkerAddress,
 			&i.Mode,
 			&i.Status,
 			&i.CreatedByKey,
@@ -163,7 +184,7 @@ const renewSessionHeartbeat = `-- name: RenewSessionHeartbeat :one
 UPDATE sessions
 SET last_heartbeat = now()
 WHERE id = $1
-RETURNING id, worker_id, mode, status, created_by_key, created_at, expires_at, last_heartbeat, keep_alive_ms, connect_metadata
+RETURNING id, worker_id, browser, playwright_version, worker_address, mode, status, created_by_key, created_at, expires_at, last_heartbeat, keep_alive_ms, connect_metadata
 `
 
 func (q *Queries) RenewSessionHeartbeat(ctx context.Context, id uuid.UUID) (Session, error) {
@@ -172,6 +193,9 @@ func (q *Queries) RenewSessionHeartbeat(ctx context.Context, id uuid.UUID) (Sess
 	err := row.Scan(
 		&i.ID,
 		&i.WorkerID,
+		&i.Browser,
+		&i.PlaywrightVersion,
+		&i.WorkerAddress,
 		&i.Mode,
 		&i.Status,
 		&i.CreatedByKey,
@@ -188,7 +212,7 @@ const setSessionStatus = `-- name: SetSessionStatus :one
 UPDATE sessions
 SET status = $2
 WHERE id = $1
-RETURNING id, worker_id, mode, status, created_by_key, created_at, expires_at, last_heartbeat, keep_alive_ms, connect_metadata
+RETURNING id, worker_id, browser, playwright_version, worker_address, mode, status, created_by_key, created_at, expires_at, last_heartbeat, keep_alive_ms, connect_metadata
 `
 
 type SetSessionStatusParams struct {
@@ -202,6 +226,9 @@ func (q *Queries) SetSessionStatus(ctx context.Context, arg SetSessionStatusPara
 	err := row.Scan(
 		&i.ID,
 		&i.WorkerID,
+		&i.Browser,
+		&i.PlaywrightVersion,
+		&i.WorkerAddress,
 		&i.Mode,
 		&i.Status,
 		&i.CreatedByKey,

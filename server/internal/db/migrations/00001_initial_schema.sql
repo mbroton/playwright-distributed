@@ -44,8 +44,12 @@ CREATE TABLE api_keys (
 
 CREATE TABLE sessions (
     id uuid PRIMARY KEY,
-    -- Retention cleanup removes sessions before workers; RESTRICT enforces that order.
-    worker_id uuid NOT NULL REFERENCES workers (id) ON DELETE RESTRICT,
+    -- Workers are a live registry and are deleted when removed; sessions are history and use bare worker IDs on purpose.
+    worker_id uuid NOT NULL,
+    -- Plain text plus CHECK is deliberate because new browser values, such as camoufox, are expected.
+    browser text NOT NULL CHECK (browser IN ('chromium', 'firefox', 'webkit')),
+    playwright_version text NOT NULL,
+    worker_address text NOT NULL,
     mode session_mode NOT NULL,
     status session_status NOT NULL,
     -- API keys are revoked, never deleted (GitHub-style); RESTRICT protects session attribution.
