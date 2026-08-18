@@ -102,6 +102,8 @@ func (a *TokenAuthenticator) requiresAuthentication(ctx context.Context) (bool, 
 		return true, nil
 	}
 
+	// A request whose count predates a concurrent first-key commit can still pass.
+	// That window is bounded by the request; after a positive count, the latch stays enabled.
 	queryCtx, cancel := context.WithTimeout(ctx, authQueryTimeout)
 	defer cancel()
 	count, err := a.queries.CountActiveAPIKeys(queryCtx)

@@ -2,12 +2,15 @@ package apikey
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/testcontainers/testcontainers-go"
@@ -21,9 +24,14 @@ const postgresImage = "postgres:18-alpine"
 
 var errWriteFailed = errors.New("write failed")
 
-type failingWriter struct{}
+type failingWriter struct {
+	cancel context.CancelFunc
+}
 
-func (failingWriter) Write([]byte) (int, error) {
+func (w failingWriter) Write([]byte) (int, error) {
+	if w.cancel != nil {
+		w.cancel()
+	}
 	return 0, errWriteFailed
 }
 
@@ -71,13 +79,28 @@ func TestRun_CreateListRevoke(t *testing.T) {
 	if _, err := queries.GetActiveAPIKeyByHash(t.Context(), hashTokenForTest(token)); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("GetActiveAPIKeyByHash() after revoke error = %v, want %v", err, pgx.ErrNoRows)
 	}
+	var alreadyRevokedOutput bytes.Buffer
 	if err := Run(
 		t.Context(),
 		[]string{"revoke", "--id", keys[0].ID.String()},
 		queries,
+		&alreadyRevokedOutput,
+	); err != nil {
+		t.Fatalf("Run(revoke already revoked) returned an error: %v", err)
+	}
+	wantAlreadyRevoked := fmt.Sprintf("api key %s was already revoked\n", keys[0].ID)
+	if alreadyRevokedOutput.String() != wantAlreadyRevoked {
+		t.Fatalf("already-revoked output = %q, want %q", alreadyRevokedOutput.String(), wantAlreadyRevoked)
+	}
+
+	unknownID := uuid.New()
+	if err := Run(
+		t.Context(),
+		[]string{"revoke", "--id", unknownID.String()},
+		queries,
 		&bytes.Buffer{},
-	); err == nil || !strings.Contains(err.Error(), "already revoked") {
-		t.Fatalf("Run(revoke already revoked) error = %v, want clear already-revoked error", err)
+	); err == nil || !strings.Contains(err.Error(), fmt.Sprintf("api key %s not found", unknownID)) {
+		t.Fatalf("Run(revoke unknown) error = %v, want not-found error", err)
 	}
 
 	listOutput.Reset()
@@ -90,12 +113,26 @@ func TestRun_CreateListRevoke(t *testing.T) {
 }
 
 func TestRun_HelpAndUnknownSubcommand(t *testing.T) {
-	var help bytes.Buffer
-	if err := Run(t.Context(), []string{"create", "--help"}, nil, &help); err != nil {
-		t.Fatalf("Run(create --help) returned an error: %v", err)
+	tests := []struct {
+		name      string
+		args      []string
+		wantUsage string
+	}{
+		{name: "create help", args: []string{"create", "--help"}, wantUsage: "Usage of apikey create"},
+		{name: "short help", args: []string{"-h"}, wantUsage: "Usage: server apikey"},
+		{name: "long help", args: []string{"--help"}, wantUsage: "Usage: server apikey"},
+		{name: "help command", args: []string{"help"}, wantUsage: "Usage: server apikey"},
 	}
-	if !strings.Contains(help.String(), "Usage of apikey create") {
-		t.Fatalf("help output = %q, want usage", help.String())
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var help bytes.Buffer
+			if err := Run(t.Context(), test.args, nil, &help); err != nil {
+				t.Fatalf("Run(%v) returned an error: %v", test.args, err)
+			}
+			if !strings.Contains(help.String(), test.wantUsage) {
+				t.Fatalf("help output = %q, want %q", help.String(), test.wantUsage)
+			}
+		})
 	}
 
 	err := Run(t.Context(), []string{"rotate"}, nil, &bytes.Buffer{})
@@ -108,19 +145,51 @@ func TestCreate_DeletesKeyWhenPrintingFails(t *testing.T) {
 	pool := newMigratedTestPool(t)
 	queries := data.New(pool)
 
-	if _, err := Create(t.Context(), queries, "unusable", failingWriter{}); !errors.Is(err, errWriteFailed) {
-		t.Fatalf("Create() error = %v, want %v", err, errWriteFailed)
+	tests := []struct {
+		name   string
+		writer func(context.CancelFunc) failingWriter
+	}{
+		{
+			name: "write failure",
+			writer: func(context.CancelFunc) failingWriter {
+				return failingWriter{}
+			},
+		},
+		{
+			name: "context canceled before write failure",
+			writer: func(cancel context.CancelFunc) failingWriter {
+				return failingWriter{cancel: cancel}
+			},
+		},
 	}
-	count, err := queries.CountActiveAPIKeys(t.Context())
-	if err != nil {
-		t.Fatalf("CountActiveAPIKeys() returned an error: %v", err)
-	}
-	if count != 0 {
-		t.Fatalf("active API key count = %d, want 0 after output failure", count)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if _, err := Create(ctx, queries, "unusable", test.writer(cancel)); !errors.Is(err, errWriteFailed) {
+				t.Fatalf("Create() error = %v, want %v", err, errWriteFailed)
+			}
+			count, err := queries.CountActiveAPIKeys(t.Context())
+			if err != nil {
+				t.Fatalf("CountActiveAPIKeys() returned an error: %v", err)
+			}
+			if count != 0 {
+				t.Fatalf("active API key count = %d, want 0 after output failure", count)
+			}
+		})
 	}
 }
 
-func newMigratedTestPool(t *testing.T) *pgxpool.Pool {
+func TestRun_ReportsUnmigratedDatabase(t *testing.T) {
+	pool := newTestPool(t)
+	err := Run(t.Context(), []string{"list"}, data.New(pool), &bytes.Buffer{})
+	want := `database is not migrated; run "server serve" once first`
+	if err == nil || err.Error() != want {
+		t.Fatalf("Run(list) error = %v, want %q", err, want)
+	}
+}
+
+func newTestPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	testcontainers.SkipIfProviderIsNotHealthy(t)
 
@@ -145,6 +214,12 @@ func newMigratedTestPool(t *testing.T) *pgxpool.Pool {
 		t.Fatalf("opening Postgres pool: %v", err)
 	}
 	t.Cleanup(pool.Close)
+	return pool
+}
+
+func newMigratedTestPool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	pool := newTestPool(t)
 	if err := db.Migrate(t.Context(), pool); err != nil {
 		t.Fatalf("migrating test database: %v", err)
 	}

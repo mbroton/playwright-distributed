@@ -1,13 +1,16 @@
 package httpapi
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -18,6 +21,7 @@ import (
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/danielgtaylor/huma/v2/adapters/humago"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -30,6 +34,26 @@ const postgresImage = "postgres:18-alpine"
 
 type staticAuthenticator struct {
 	principal Principal
+}
+
+type failingExecDB struct {
+	data.DBTX
+	err error
+}
+
+func (db failingExecDB) Exec(context.Context, string, ...interface{}) (pgconn.CommandTag, error) {
+	return pgconn.CommandTag{}, db.err
+}
+
+type hijackingResponseWriter struct {
+	http.ResponseWriter
+	err    error
+	called bool
+}
+
+func (w *hijackingResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	w.called = true
+	return nil, nil, w.err
 }
 
 func (a staticAuthenticator) Authenticate(context.Context, string) (Principal, error) {
@@ -180,6 +204,45 @@ func TestServer_WorkerAndSessionRoutes(t *testing.T) {
 			invalidTransition.Body.String(),
 		)
 	}
+	if _, err := pool.Exec(
+		t.Context(),
+		"UPDATE workers SET status = 'stalled' WHERE id = $1",
+		worker.ID,
+	); err != nil {
+		t.Fatalf("setting worker status to stalled before API transitions: %v", err)
+	}
+	stalledToDraining := requestJSON(
+		t,
+		server.Handler,
+		http.MethodPost,
+		"/internal/workers/"+worker.ID.String()+"/status",
+		map[string]any{"status": "draining"},
+		"",
+	)
+	if stalledToDraining.Code != http.StatusConflict {
+		t.Fatalf(
+			"stalled-to-draining status = %d, want %d: %s",
+			stalledToDraining.Code,
+			http.StatusConflict,
+			stalledToDraining.Body.String(),
+		)
+	}
+	stalledToShuttingDown := requestJSON(
+		t,
+		server.Handler,
+		http.MethodPost,
+		"/internal/workers/"+worker.ID.String()+"/status",
+		map[string]any{"status": "shutting_down"},
+		"",
+	)
+	if stalledToShuttingDown.Code != http.StatusOK {
+		t.Fatalf(
+			"stalled-to-shutting-down status = %d, want %d: %s",
+			stalledToShuttingDown.Code,
+			http.StatusOK,
+			stalledToShuttingDown.Body.String(),
+		)
+	}
 
 	sessionID := uuid.New()
 	_, err = queries.InsertSession(t.Context(), data.InsertSessionParams{
@@ -276,6 +339,60 @@ func TestServer_Authentication(t *testing.T) {
 	stillAuthorized := requestJSON(t, server.Handler, http.MethodGet, "/v1/workers", nil, secondToken)
 	if stillAuthorized.Code != http.StatusOK {
 		t.Fatalf("active key status = %d, want %d", stillAuthorized.Code, http.StatusOK)
+	}
+	secondKey, err := queries.GetActiveAPIKeyByHash(t.Context(), hashToken(secondToken))
+	if err != nil {
+		t.Fatalf("GetActiveAPIKeyByHash(second key) returned an error: %v", err)
+	}
+	if _, err := queries.RevokeAPIKey(t.Context(), secondKey.ID); err != nil {
+		t.Fatalf("RevokeAPIKey(second key) returned an error: %v", err)
+	}
+	stillRequired := requestJSON(t, server.Handler, http.MethodGet, "/v1/workers", nil, "")
+	if stillRequired.Code != http.StatusUnauthorized {
+		t.Fatalf("request after revoking all keys status = %d, want %d", stillRequired.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestServer_TouchFailureDoesNotRejectRequest(t *testing.T) {
+	pool := newMigratedTestPool(t)
+	queries := data.New(pool)
+	const token = "pwd_touch-failure-token"
+	insertAPIKey(t, queries, "touch failure", token)
+	errTouch := errors.New("touch failed")
+	var logs bytes.Buffer
+	failingTouchQueries := data.New(failingExecDB{DBTX: pool, err: errTouch})
+	authenticator := NewTokenAuthenticator(
+		failingTouchQueries,
+		testLogger(&logs),
+	)
+	server := New(pool, failingTouchQueries, authenticator, testLogger(io.Discard))
+
+	response := requestJSON(t, server.Handler, http.MethodGet, "/v1/workers", nil, token)
+	if response.Code != http.StatusOK {
+		t.Fatalf("request after touch failure status = %d, want %d: %s", response.Code, http.StatusOK, response.Body.String())
+	}
+	if !strings.Contains(logs.String(), "touch api key") || !strings.Contains(logs.String(), errTouch.Error()) {
+		t.Fatalf("touch failure log = %q, want warning with touch error", logs.String())
+	}
+	untouched, err := queries.GetActiveAPIKeyByHash(t.Context(), hashToken(token))
+	if err != nil {
+		t.Fatalf("GetActiveAPIKeyByHash() returned an error: %v", err)
+	}
+	if untouched.LastUsedAt != nil {
+		t.Fatalf("last_used_at = %v, want nil after failed touch", untouched.LastUsedAt)
+	}
+}
+
+func TestServer_RejectsHostlessWorkerAddress(t *testing.T) {
+	server := New(nil, nil, NoAuthAuthenticator{}, testLogger(io.Discard))
+	response := requestJSON(t, server.Handler, http.MethodPost, "/internal/workers", map[string]any{
+		"address":            "ws://",
+		"browser":            "chromium",
+		"playwright_version": "1.62.1",
+		"max_slots":          1,
+	}, "")
+	if response.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("hostless address status = %d, want %d: %s", response.Code, http.StatusUnprocessableEntity, response.Body.String())
 	}
 }
 
@@ -414,7 +531,7 @@ func TestServer_Readiness(t *testing.T) {
 
 func TestServer_DisablesHumaRuntimeRoutes(t *testing.T) {
 	server := New(nil, nil, NoAuthAuthenticator{}, testLogger(io.Discard))
-	paths := []string{"/docs", "/openapi.json", "/schemas/Worker.json"}
+	paths := []string{"/docs", "/openapi.json", "/openapi.yaml", "/openapi", "/schemas/Worker.json"}
 	for _, path := range paths {
 		t.Run(path, func(t *testing.T) {
 			response := requestJSON(t, server.Handler, http.MethodGet, path, nil, "")
@@ -458,6 +575,26 @@ func TestRequestLogger_SkipsHealthProbes(t *testing.T) {
 	}
 	if logs.Len() != 0 {
 		t.Fatalf("probe requests produced logs: %s", logs.String())
+	}
+}
+
+func TestLoggingResponseWriter_Hijack(t *testing.T) {
+	errHijack := errors.New("hijack failed")
+	underlying := &hijackingResponseWriter{
+		ResponseWriter: httptest.NewRecorder(),
+		err:            errHijack,
+	}
+	response := &loggingResponseWriter{ResponseWriter: underlying}
+	if _, _, err := response.Hijack(); !errors.Is(err, errHijack) {
+		t.Fatalf("Hijack() error = %v, want %v", err, errHijack)
+	}
+	if !underlying.called {
+		t.Fatal("Hijack() did not delegate to the underlying response writer")
+	}
+
+	unsupported := &loggingResponseWriter{ResponseWriter: httptest.NewRecorder()}
+	if _, _, err := unsupported.Hijack(); err == nil {
+		t.Fatal("Hijack() with unsupported response writer returned nil error")
 	}
 }
 

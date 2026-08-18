@@ -36,19 +36,25 @@ func main() {
 }
 
 func run(ctx context.Context, args []string, stdout io.Writer, logger *slog.Logger) error {
-	command := "serve"
+	commandName := "serve"
 	if len(args) > 0 {
-		command = args[0]
+		commandName = args[0]
 		args = args[1:]
 	}
-	switch command {
+	var apiKeyCommand *apikey.Command
+	switch commandName {
 	case "serve":
 		if len(args) != 0 {
 			return errors.New("serve does not accept arguments")
 		}
 	case "apikey":
+		var err error
+		apiKeyCommand, err = apikey.Parse(args, stdout)
+		if err != nil || apiKeyCommand == nil {
+			return err
+		}
 	default:
-		return fmt.Errorf("unknown command %q", command)
+		return fmt.Errorf("unknown command %q", commandName)
 	}
 
 	databaseURL := os.Getenv("DATABASE_URL")
@@ -62,22 +68,19 @@ func run(ctx context.Context, args []string, stdout io.Writer, logger *slog.Logg
 	defer pool.Close()
 
 	queries := data.New(pool)
-	switch command {
-	case "serve":
-		if err := db.Migrate(ctx, pool); err != nil {
-			return err
-		}
-		address := os.Getenv("LISTEN_ADDR")
-		if address == "" {
-			address = defaultListenAddress
-		}
-		authenticator := httpapi.NewTokenAuthenticator(queries, logger)
-		controlPlane := httpapi.New(pool, queries, authenticator, logger)
-		return serve(ctx, address, controlPlane.Handler, logger)
-	case "apikey":
-		return apikey.Run(ctx, args, queries, stdout)
+	if apiKeyCommand != nil {
+		return apiKeyCommand.Execute(ctx, queries, stdout)
 	}
-	return nil
+	if err := db.Migrate(ctx, pool); err != nil {
+		return err
+	}
+	address := os.Getenv("LISTEN_ADDR")
+	if address == "" {
+		address = defaultListenAddress
+	}
+	authenticator := httpapi.NewTokenAuthenticator(queries, logger)
+	controlPlane := httpapi.New(pool, queries, authenticator, logger)
+	return serve(ctx, address, controlPlane.Handler, logger)
 }
 
 func serve(ctx context.Context, address string, handler http.Handler, logger *slog.Logger) error {

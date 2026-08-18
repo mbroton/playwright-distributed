@@ -15,6 +15,11 @@ FROM api_keys
 WHERE hash = $1
   AND revoked_at IS NULL;
 
+-- name: GetAPIKey :one
+SELECT *
+FROM api_keys
+WHERE id = $1;
+
 -- name: CountActiveAPIKeys :one
 SELECT count(*)
 FROM api_keys

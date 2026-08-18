@@ -207,6 +207,40 @@ func TestQueries(t *testing.T) {
 			data.WorkerStatusAvailable,
 		)
 	}
+	if _, err := pool.Exec(
+		t.Context(),
+		"UPDATE workers SET status = 'stalled' WHERE id = $1",
+		workerID,
+	); err != nil {
+		t.Fatalf("setting worker status to stalled before status transitions: %v", err)
+	}
+	if _, err := queries.SetWorkerStatus(t.Context(), data.SetWorkerStatusParams{
+		ID:     workerID,
+		Status: data.WorkerStatusDraining,
+	}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("SetWorkerStatus(stalled to draining) error = %v, want %v", err, pgx.ErrNoRows)
+	}
+	gotWorker, err = queries.SetWorkerStatus(t.Context(), data.SetWorkerStatusParams{
+		ID:     workerID,
+		Status: data.WorkerStatusShuttingDown,
+	})
+	if err != nil {
+		t.Fatalf("SetWorkerStatus(stalled to shutting_down) returned an error: %v", err)
+	}
+	if gotWorker.Status != data.WorkerStatusShuttingDown {
+		t.Fatalf(
+			"SetWorkerStatus(stalled to shutting_down).Status = %q, want %q",
+			gotWorker.Status,
+			data.WorkerStatusShuttingDown,
+		)
+	}
+	if _, err := pool.Exec(
+		t.Context(),
+		"UPDATE workers SET status = 'available' WHERE id = $1",
+		workerID,
+	); err != nil {
+		t.Fatalf("resetting worker status to available: %v", err)
+	}
 
 	gotWorker, err = queries.SetWorkerStatus(t.Context(), data.SetWorkerStatusParams{
 		ID:     workerID,

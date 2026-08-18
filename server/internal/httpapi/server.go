@@ -138,9 +138,9 @@ func registerPublicRoutes(api huma.API, queries *data.Queries, logger *slog.Logg
 func registerWorkerRoutes(api huma.API, queries *data.Queries, logger *slog.Logger) {
 	type registerWorkerInput struct {
 		Body struct {
-			Address           string `json:"address" format:"uri" pattern:"^wss?://"`
+			Address           string `json:"address" format:"uri" pattern:"^wss?://[^\\s/?#]+" maxLength:"512"`
 			Browser           string `json:"browser" enum:"chromium,firefox,webkit"`
-			PlaywrightVersion string `json:"playwright_version" minLength:"1"`
+			PlaywrightVersion string `json:"playwright_version" minLength:"1" maxLength:"64"`
 			MaxSlots          int32  `json:"max_slots" minimum:"1" maximum:"1024"`
 		}
 	}

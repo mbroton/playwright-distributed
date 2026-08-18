@@ -136,7 +136,7 @@ WHERE id = $2
       ($1::worker_status = 'draining' AND status IN ('available', 'draining'))
       OR (
           $1::worker_status = 'shutting_down'
-          AND status IN ('available', 'draining', 'shutting_down')
+          AND status IN ('available', 'draining', 'stalled', 'shutting_down')
       )
   )
 RETURNING id, address, browser, playwright_version, max_slots, status, last_heartbeat, lifetime_sessions, created_at
@@ -167,6 +167,8 @@ func (q *Queries) SetWorkerStatus(ctx context.Context, arg SetWorkerStatusParams
 const updateWorkerHeartbeat = `-- name: UpdateWorkerHeartbeat :one
 UPDATE workers
 SET last_heartbeat = now(),
+    -- A heartbeat can revive stalled workers only because the rescuer may mark
+    -- available workers stalled; it must never overwrite drain or shutdown intent.
     status = CASE
         WHEN status = 'stalled' THEN 'available'
         ELSE status

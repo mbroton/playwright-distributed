@@ -20,6 +20,8 @@ WHERE id = $1;
 -- name: UpdateWorkerHeartbeat :one
 UPDATE workers
 SET last_heartbeat = now(),
+    -- A heartbeat can revive stalled workers only because the rescuer may mark
+    -- available workers stalled; it must never overwrite drain or shutdown intent.
     status = CASE
         WHEN status = 'stalled' THEN 'available'
         ELSE status
@@ -35,7 +37,7 @@ WHERE id = sqlc.arg(id)
       (sqlc.arg(status)::worker_status = 'draining' AND status IN ('available', 'draining'))
       OR (
           sqlc.arg(status)::worker_status = 'shutting_down'
-          AND status IN ('available', 'draining', 'shutting_down')
+          AND status IN ('available', 'draining', 'stalled', 'shutting_down')
       )
   )
 RETURNING *;

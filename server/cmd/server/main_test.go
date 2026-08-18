@@ -40,3 +40,20 @@ func TestRun_RejectsInvalidCommandsBeforeOpeningDatabase(t *testing.T) {
 		})
 	}
 }
+
+func TestRun_APIKeyHelpBeforeOpeningDatabase(t *testing.T) {
+	t.Setenv("DATABASE_URL", "")
+	var output bytes.Buffer
+	err := run(
+		t.Context(),
+		[]string{"apikey", "create", "--help"},
+		&output,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	if err != nil {
+		t.Fatalf("run(apikey create --help) returned an error: %v", err)
+	}
+	if !strings.Contains(output.String(), "Usage of apikey create") {
+		t.Fatalf("help output = %q, want apikey create usage", output.String())
+	}
+}

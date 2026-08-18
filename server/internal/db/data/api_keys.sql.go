@@ -35,6 +35,27 @@ func (q *Queries) DeleteAPIKey(ctx context.Context, id uuid.UUID) error {
 	return err
 }
 
+const getAPIKey = `-- name: GetAPIKey :one
+SELECT id, name, hash, prefix, created_at, last_used_at, revoked_at
+FROM api_keys
+WHERE id = $1
+`
+
+func (q *Queries) GetAPIKey(ctx context.Context, id uuid.UUID) (APIKey, error) {
+	row := q.db.QueryRow(ctx, getAPIKey, id)
+	var i APIKey
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Hash,
+		&i.Prefix,
+		&i.CreatedAt,
+		&i.LastUsedAt,
+		&i.RevokedAt,
+	)
+	return i, err
+}
+
 const getActiveAPIKeyByHash = `-- name: GetActiveAPIKeyByHash :one
 SELECT id, name, hash, prefix, created_at, last_used_at, revoked_at
 FROM api_keys

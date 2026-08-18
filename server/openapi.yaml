@@ -83,7 +83,8 @@ components:
       properties:
         address:
           format: uri
-          pattern: ^wss?://
+          maxLength: 512
+          pattern: ^wss?://[^\s/?#]+
           type: string
         browser:
           enum:
@@ -97,6 +98,7 @@ components:
           minimum: 1
           type: integer
         playwright_version:
+          maxLength: 64
           minLength: 1
           type: string
       required:

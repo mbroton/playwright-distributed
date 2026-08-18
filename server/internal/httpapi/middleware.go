@@ -1,8 +1,10 @@
 package httpapi
 
 import (
+	"bufio"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"time"
 
@@ -79,4 +81,12 @@ func (w *loggingResponseWriter) Write(body []byte) (int, error) {
 
 func (w *loggingResponseWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
+}
+
+func (w *loggingResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := w.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("http response writer does not support hijacking")
+	}
+	return hijacker.Hijack()
 }
