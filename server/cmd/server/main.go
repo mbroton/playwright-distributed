@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -19,7 +21,6 @@ import (
 
 const (
 	defaultListenAddress = ":8080"
-	authCacheTTL         = 5 * time.Second
 	shutdownTimeout      = 10 * time.Second
 )
 
@@ -34,11 +35,20 @@ func main() {
 	}
 }
 
-func run(ctx context.Context, args []string, stdout *os.File, logger *slog.Logger) error {
+func run(ctx context.Context, args []string, stdout io.Writer, logger *slog.Logger) error {
 	command := "serve"
 	if len(args) > 0 {
 		command = args[0]
 		args = args[1:]
+	}
+	switch command {
+	case "serve":
+		if len(args) != 0 {
+			return errors.New("serve does not accept arguments")
+		}
+	case "apikey":
+	default:
+		return fmt.Errorf("unknown command %q", command)
 	}
 
 	databaseURL := os.Getenv("DATABASE_URL")
@@ -50,28 +60,24 @@ func run(ctx context.Context, args []string, stdout *os.File, logger *slog.Logge
 		return err
 	}
 	defer pool.Close()
-	if err := db.Migrate(ctx, pool); err != nil {
-		return err
-	}
 
 	queries := data.New(pool)
 	switch command {
 	case "serve":
-		if len(args) != 0 {
-			return errors.New("serve does not accept arguments")
+		if err := db.Migrate(ctx, pool); err != nil {
+			return err
 		}
 		address := os.Getenv("LISTEN_ADDR")
 		if address == "" {
 			address = defaultListenAddress
 		}
-		authenticator := httpapi.NewTokenAuthenticator(queries, authCacheTTL)
+		authenticator := httpapi.NewTokenAuthenticator(queries, logger)
 		controlPlane := httpapi.New(pool, queries, authenticator, logger)
 		return serve(ctx, address, controlPlane.Handler, logger)
 	case "apikey":
 		return apikey.Run(ctx, args, queries, stdout)
-	default:
-		return fmt.Errorf("unknown command %q", command)
 	}
+	return nil
 }
 
 func serve(ctx context.Context, address string, handler http.Handler, logger *slog.Logger) error {
@@ -79,12 +85,20 @@ func serve(ctx context.Context, address string, handler http.Handler, logger *sl
 		Addr:              address,
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return fmt.Errorf("listening on %s: %w", address, err)
+	}
+	defer server.Close()
+	logger.Info("server listening", "address", listener.Addr().String())
+
 	errCh := make(chan error, 1)
 	go func() {
-		logger.Info("server listening", "address", address)
-		errCh <- server.ListenAndServe()
+		errCh <- server.Serve(listener)
 	}()
 
 	select {

@@ -19,6 +19,14 @@ import (
 
 const postgresImage = "postgres:18-alpine"
 
+var errWriteFailed = errors.New("write failed")
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) {
+	return 0, errWriteFailed
+}
+
 func TestRun_CreateListRevoke(t *testing.T) {
 	pool := newMigratedTestPool(t)
 	queries := data.New(pool)
@@ -36,7 +44,7 @@ func TestRun_CreateListRevoke(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListAPIKeys() returned an error: %v", err)
 	}
-	if len(keys) != 1 || keys[0].Name != "deployment" || keys[0].Prefix != token[:8] {
+	if len(keys) != 1 || keys[0].Name != "deployment" || keys[0].Prefix != token[:storedTokenPrefixLength] {
 		t.Fatalf("stored keys = %+v, want created deployment key", keys)
 	}
 
@@ -63,6 +71,14 @@ func TestRun_CreateListRevoke(t *testing.T) {
 	if _, err := queries.GetActiveAPIKeyByHash(t.Context(), hashTokenForTest(token)); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("GetActiveAPIKeyByHash() after revoke error = %v, want %v", err, pgx.ErrNoRows)
 	}
+	if err := Run(
+		t.Context(),
+		[]string{"revoke", "--id", keys[0].ID.String()},
+		queries,
+		&bytes.Buffer{},
+	); err == nil || !strings.Contains(err.Error(), "already revoked") {
+		t.Fatalf("Run(revoke already revoked) error = %v, want clear already-revoked error", err)
+	}
 
 	listOutput.Reset()
 	if err := Run(t.Context(), []string{"list"}, queries, &listOutput); err != nil {
@@ -70,6 +86,37 @@ func TestRun_CreateListRevoke(t *testing.T) {
 	}
 	if !strings.Contains(listOutput.String(), keys[0].ID.String()) || strings.HasSuffix(listOutput.String(), "-\n") {
 		t.Fatalf("revoked key list output = %q, want key and revoke time", listOutput.String())
+	}
+}
+
+func TestRun_HelpAndUnknownSubcommand(t *testing.T) {
+	var help bytes.Buffer
+	if err := Run(t.Context(), []string{"create", "--help"}, nil, &help); err != nil {
+		t.Fatalf("Run(create --help) returned an error: %v", err)
+	}
+	if !strings.Contains(help.String(), "Usage of apikey create") {
+		t.Fatalf("help output = %q, want usage", help.String())
+	}
+
+	err := Run(t.Context(), []string{"rotate"}, nil, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "create, list, revoke") {
+		t.Fatalf("Run(unknown) error = %v, want valid subcommands", err)
+	}
+}
+
+func TestCreate_DeletesKeyWhenPrintingFails(t *testing.T) {
+	pool := newMigratedTestPool(t)
+	queries := data.New(pool)
+
+	if _, err := Create(t.Context(), queries, "unusable", failingWriter{}); !errors.Is(err, errWriteFailed) {
+		t.Fatalf("Create() error = %v, want %v", err, errWriteFailed)
+	}
+	count, err := queries.CountActiveAPIKeys(t.Context())
+	if err != nil {
+		t.Fatalf("CountActiveAPIKeys() returned an error: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("active API key count = %d, want 0 after output failure", count)
 	}
 }
 

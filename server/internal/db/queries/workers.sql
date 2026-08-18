@@ -19,14 +19,25 @@ WHERE id = $1;
 
 -- name: UpdateWorkerHeartbeat :one
 UPDATE workers
-SET last_heartbeat = now()
+SET last_heartbeat = now(),
+    status = CASE
+        WHEN status = 'stalled' THEN 'available'
+        ELSE status
+    END
 WHERE id = $1
 RETURNING *;
 
 -- name: SetWorkerStatus :one
 UPDATE workers
-SET status = $2
-WHERE id = $1
+SET status = sqlc.arg(status)::worker_status
+WHERE id = sqlc.arg(id)
+  AND (
+      (sqlc.arg(status)::worker_status = 'draining' AND status IN ('available', 'draining'))
+      OR (
+          sqlc.arg(status)::worker_status = 'shutting_down'
+          AND status IN ('available', 'draining', 'shutting_down')
+      )
+  )
 RETURNING *;
 
 -- name: ListWorkers :many

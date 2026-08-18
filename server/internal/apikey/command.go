@@ -20,7 +20,10 @@ import (
 	"server/internal/db/data"
 )
 
-const tokenPrefix = "pwd_"
+const (
+	tokenPrefix             = "pwd_"
+	storedTokenPrefixLength = len(tokenPrefix) + 4
+)
 
 func Run(ctx context.Context, args []string, queries *data.Queries, stdout io.Writer) error {
 	if len(args) == 0 {
@@ -30,9 +33,12 @@ func Run(ctx context.Context, args []string, queries *data.Queries, stdout io.Wr
 	switch args[0] {
 	case "create":
 		flags := flag.NewFlagSet("apikey create", flag.ContinueOnError)
-		flags.SetOutput(io.Discard)
+		flags.SetOutput(stdout)
 		name := flags.String("name", "", "API key name")
 		if err := flags.Parse(args[1:]); err != nil {
+			if errors.Is(err, flag.ErrHelp) {
+				return nil
+			}
 			return fmt.Errorf("parsing apikey create flags: %w", err)
 		}
 		if flags.NArg() != 0 {
@@ -41,15 +47,26 @@ func Run(ctx context.Context, args []string, queries *data.Queries, stdout io.Wr
 		_, err := Create(ctx, queries, *name, stdout)
 		return err
 	case "list":
-		if len(args) != 1 {
+		flags := flag.NewFlagSet("apikey list", flag.ContinueOnError)
+		flags.SetOutput(stdout)
+		if err := flags.Parse(args[1:]); err != nil {
+			if errors.Is(err, flag.ErrHelp) {
+				return nil
+			}
+			return fmt.Errorf("parsing apikey list flags: %w", err)
+		}
+		if flags.NArg() != 0 {
 			return errors.New("apikey list does not accept arguments")
 		}
 		return List(ctx, queries, stdout)
 	case "revoke":
 		flags := flag.NewFlagSet("apikey revoke", flag.ContinueOnError)
-		flags.SetOutput(io.Discard)
+		flags.SetOutput(stdout)
 		id := flags.String("id", "", "API key ID")
 		if err := flags.Parse(args[1:]); err != nil {
+			if errors.Is(err, flag.ErrHelp) {
+				return nil
+			}
 			return fmt.Errorf("parsing apikey revoke flags: %w", err)
 		}
 		if flags.NArg() != 0 {
@@ -61,7 +78,7 @@ func Run(ctx context.Context, args []string, queries *data.Queries, stdout io.Wr
 		}
 		return Revoke(ctx, queries, keyID)
 	default:
-		return fmt.Errorf("unknown api key subcommand %q", args[0])
+		return fmt.Errorf("unknown api key subcommand %q (valid subcommands: create, list, revoke)", args[0])
 	}
 }
 
@@ -85,13 +102,17 @@ func Create(
 		ID:     uuid.New(),
 		Name:   name,
 		Hash:   hex.EncodeToString(digest[:]),
-		Prefix: token[:8],
+		Prefix: token[:storedTokenPrefixLength],
 	})
 	if err != nil {
 		return data.APIKey{}, fmt.Errorf("inserting api key: %w", err)
 	}
 	if _, err := fmt.Fprintln(stdout, token); err != nil {
-		return data.APIKey{}, fmt.Errorf("printing api key token: %w", err)
+		printErr := fmt.Errorf("printing api key token: %w", err)
+		if deleteErr := queries.DeleteAPIKey(ctx, key.ID); deleteErr != nil {
+			return data.APIKey{}, errors.Join(printErr, fmt.Errorf("deleting unusable api key: %w", deleteErr))
+		}
+		return data.APIKey{}, printErr
 	}
 	return key, nil
 }
@@ -129,7 +150,7 @@ func List(ctx context.Context, queries *data.Queries, stdout io.Writer) error {
 func Revoke(ctx context.Context, queries *data.Queries, id uuid.UUID) error {
 	if _, err := queries.RevokeAPIKey(ctx, id); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return fmt.Errorf("api key %s not found", id)
+			return fmt.Errorf("api key %s not found or already revoked", id)
 		}
 		return fmt.Errorf("revoking api key: %w", err)
 	}

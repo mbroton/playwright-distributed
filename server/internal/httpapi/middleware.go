@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"errors"
 	"log/slog"
 	"net/http"
 	"time"
@@ -10,19 +11,33 @@ import (
 
 func authMiddleware(api huma.API, authenticator Authenticator, logger *slog.Logger) func(huma.Context, func(huma.Context)) {
 	return func(ctx huma.Context, next func(huma.Context)) {
-		if err := authenticator.Authenticate(ctx.Context(), ctx.Header("Authorization")); err != nil {
+		principal, err := authenticator.Authenticate(ctx.Context(), ctx.Header("Authorization"))
+		if errors.Is(err, errUnauthorized) {
 			ctx.SetHeader("WWW-Authenticate", "Bearer")
 			if writeErr := huma.WriteErr(api, ctx, http.StatusUnauthorized, "unauthorized"); writeErr != nil {
 				logger.Error("write authentication response", "error", writeErr)
 			}
 			return
 		}
-		next(ctx)
+		if err != nil {
+			logger.Error("authenticate request", "error", err)
+			ctx.SetHeader("Retry-After", "1")
+			if writeErr := huma.WriteErr(api, ctx, http.StatusServiceUnavailable, "authentication service unavailable"); writeErr != nil {
+				logger.Error("write authentication service response", "error", writeErr)
+			}
+			return
+		}
+		next(huma.WithValue(ctx, principalContextKey{}, principal))
 	}
 }
 
 func requestLogger(next http.Handler, logger *slog.Logger) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		start := time.Now()
 		response := &loggingResponseWriter{
 			ResponseWriter: w,
@@ -33,6 +48,7 @@ func requestLogger(next http.Handler, logger *slog.Logger) http.Handler {
 			"http request",
 			"method", r.Method,
 			"path", r.URL.Path,
+			"remote_address", r.RemoteAddr,
 			"status", response.status,
 			"duration", time.Since(start),
 		)

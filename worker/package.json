@@ -3,7 +3,7 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "generate:api": "openapi-ts -i ../server/openapi.yaml -o src/api",
+    "generate:api": "openapi-ts",
     "start": "tsx src/index.ts",
     "test": "node --import tsx --test src/*.test.ts",
     "typecheck": "tsc --noEmit",
@@ -11,8 +11,7 @@
   },
   "devDependencies": {
     "@hey-api/openapi-ts": "0.95.0",
-    "@types/node": "^24.13.3",
-    "tsx": "^4.23.12"
+    "@types/node": "^24.13.3"
   },
   "peerDependencies": {
     "typescript": "^5"
@@ -21,6 +20,7 @@
     "dotenv": "^17.4.2",
     "playwright-core": "1.62.1",
     "redis": "^6.2.1",
+    "tsx": "^4.23.12",
     "zod": "^4.4.3"
   }
 }

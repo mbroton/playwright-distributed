@@ -15,13 +15,6 @@ components:
     ErrorModel:
       additionalProperties: false
       properties:
-        $schema:
-          description: A URL to the JSON Schema for this object.
-          examples:
-            - https://example.com/schemas/ErrorModel.json
-          format: uri
-          readOnly: true
-          type: string
         detail:
           description: A human-readable explanation specific to this occurrence of the problem.
           examples:
@@ -62,45 +55,14 @@ components:
     HealthOutputBody:
       additionalProperties: false
       properties:
-        $schema:
-          description: A URL to the JSON Schema for this object.
-          examples:
-            - https://example.com/schemas/HealthOutputBody.json
-          format: uri
-          readOnly: true
-          type: string
         status:
           type: string
       required:
         - status
       type: object
-    HeartbeatInputBody:
-      additionalProperties: false
-      properties:
-        $schema:
-          description: A URL to the JSON Schema for this object.
-          examples:
-            - https://example.com/schemas/HeartbeatInputBody.json
-          format: uri
-          readOnly: true
-          type: string
-        active_session_ids:
-          items:
-            type: string
-          type:
-            - array
-            - "null"
-      type: object
     HeartbeatOutputBody:
       additionalProperties: false
       properties:
-        $schema:
-          description: A URL to the JSON Schema for this object.
-          examples:
-            - https://example.com/schemas/HeartbeatOutputBody.json
-          format: uri
-          readOnly: true
-          type: string
         commands:
           items:
             type: string
@@ -119,15 +81,9 @@ components:
     RegisterWorkerInputBody:
       additionalProperties: false
       properties:
-        $schema:
-          description: A URL to the JSON Schema for this object.
-          examples:
-            - https://example.com/schemas/RegisterWorkerInputBody.json
-          format: uri
-          readOnly: true
-          type: string
         address:
           format: uri
+          pattern: ^wss?://
           type: string
         browser:
           enum:
@@ -137,6 +93,7 @@ components:
           type: string
         max_slots:
           format: int32
+          maximum: 1024
           minimum: 1
           type: integer
         playwright_version:
@@ -151,13 +108,6 @@ components:
     Session:
       additionalProperties: false
       properties:
-        $schema:
-          description: A URL to the JSON Schema for this object.
-          examples:
-            - https://example.com/schemas/Session.json
-          format: uri
-          readOnly: true
-          type: string
         browser:
           type: string
         connect_metadata:
@@ -216,13 +166,6 @@ components:
     SetStatusInputBody:
       additionalProperties: false
       properties:
-        $schema:
-          description: A URL to the JSON Schema for this object.
-          examples:
-            - https://example.com/schemas/SetStatusInputBody.json
-          format: uri
-          readOnly: true
-          type: string
         status:
           enum:
             - draining
@@ -234,13 +177,6 @@ components:
     Worker:
       additionalProperties: false
       properties:
-        $schema:
-          description: A URL to the JSON Schema for this object.
-          examples:
-            - https://example.com/schemas/Worker.json
-          format: uri
-          readOnly: true
-          type: string
         address:
           type: string
         browser:
@@ -325,12 +261,30 @@ paths:
               schema:
                 $ref: "#/components/schemas/Worker"
           description: Created
-        default:
+        "401":
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/ErrorModel"
-          description: Error
+          description: Unauthorized
+        "422":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Unprocessable Entity
+        "500":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Internal Server Error
+        "503":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Service Unavailable
       security:
         - bearer: []
       summary: Register a worker
@@ -348,12 +302,6 @@ paths:
             description: Worker ID
             format: uuid
             type: string
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/HeartbeatInputBody"
-        required: true
       responses:
         "200":
           content:
@@ -361,6 +309,12 @@ paths:
               schema:
                 $ref: "#/components/schemas/HeartbeatOutputBody"
           description: OK
+        "401":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Unauthorized
         "404":
           content:
             application/problem+json:
@@ -379,6 +333,12 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorModel"
           description: Internal Server Error
+        "503":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Service Unavailable
       security:
         - bearer: []
       summary: Heartbeat a worker
@@ -409,12 +369,24 @@ paths:
               schema:
                 $ref: "#/components/schemas/Worker"
           description: OK
+        "401":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Unauthorized
         "404":
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/ErrorModel"
           description: Not Found
+        "409":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Conflict
         "422":
           content:
             application/problem+json:
@@ -427,6 +399,12 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorModel"
           description: Internal Server Error
+        "503":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Service Unavailable
       security:
         - bearer: []
       summary: Request a worker status transition
@@ -476,6 +454,12 @@ paths:
               schema:
                 $ref: "#/components/schemas/Session"
           description: OK
+        "401":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Unauthorized
         "404":
           content:
             application/problem+json:
@@ -494,6 +478,12 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorModel"
           description: Internal Server Error
+        "503":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Service Unavailable
       security:
         - bearer: []
       summary: Get a session
@@ -511,12 +501,24 @@ paths:
                   $ref: "#/components/schemas/Worker"
                 type: array
           description: OK
-        default:
+        "401":
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/ErrorModel"
-          description: Error
+          description: Unauthorized
+        "500":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Internal Server Error
+        "503":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Service Unavailable
       security:
         - bearer: []
       summary: List workers

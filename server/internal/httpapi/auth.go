@@ -5,84 +5,120 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+
 	"server/internal/db/data"
 )
 
-var errUnauthorized = errors.New("httpapi: unauthorized")
+const authQueryTimeout = 2 * time.Second
+
+var (
+	errUnauthorized = errors.New("httpapi: unauthorized")
+	errAuthBackend  = errors.New("httpapi: authentication backend unavailable")
+)
+
+type Principal struct {
+	KeyID *uuid.UUID
+}
+
+type principalContextKey struct{}
+
+func PrincipalFromContext(ctx context.Context) Principal {
+	principal, _ := ctx.Value(principalContextKey{}).(Principal)
+	return principal
+}
 
 type Authenticator interface {
-	Authenticate(ctx context.Context, authorization string) error
+	Authenticate(ctx context.Context, authorization string) (Principal, error)
 }
 
 type NoAuthAuthenticator struct{}
 
-func (NoAuthAuthenticator) Authenticate(context.Context, string) error {
-	return nil
+func (NoAuthAuthenticator) Authenticate(context.Context, string) (Principal, error) {
+	return Principal{}, nil
 }
 
 type TokenAuthenticator struct {
 	queries *data.Queries
-	ttl     time.Duration
-	noAuth  NoAuthAuthenticator
+	logger  *slog.Logger
 
-	mu             sync.Mutex
-	activeKeyCount int64
-	cacheExpiresAt time.Time
+	mu                      sync.Mutex
+	authRequired            bool
+	unauthenticatedWarnOnce sync.Once
 }
 
-func NewTokenAuthenticator(queries *data.Queries, ttl time.Duration) *TokenAuthenticator {
+func NewTokenAuthenticator(queries *data.Queries, logger *slog.Logger) *TokenAuthenticator {
 	return &TokenAuthenticator{
 		queries: queries,
-		ttl:     ttl,
+		logger:  logger,
 	}
 }
 
-func (a *TokenAuthenticator) Authenticate(ctx context.Context, authorization string) error {
-	count, err := a.countActiveKeys(ctx)
+func (a *TokenAuthenticator) Authenticate(ctx context.Context, authorization string) (Principal, error) {
+	required, err := a.requiresAuthentication(ctx)
 	if err != nil {
-		return errUnauthorized
+		return Principal{}, err
 	}
-	if count == 0 {
-		return a.noAuth.Authenticate(ctx, authorization)
+	if !required {
+		a.unauthenticatedWarnOnce.Do(func() {
+			a.logger.Warn("control plane authentication disabled because no active api keys exist")
+		})
+		return Principal{}, nil
 	}
 
 	token, ok := bearerToken(authorization)
 	if !ok {
-		return errUnauthorized
+		return Principal{}, errUnauthorized
 	}
 
 	digest := sha256.Sum256([]byte(token))
 	key, err := a.queries.GetActiveAPIKeyByHash(ctx, hex.EncodeToString(digest[:]))
-	if err != nil {
-		return errUnauthorized
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Principal{}, errUnauthorized
 	}
-	if _, err := a.queries.TouchAPIKey(ctx, key.ID); err != nil {
-		return errUnauthorized
+	if err != nil {
+		return Principal{}, fmt.Errorf("%w: looking up api key: %w", errAuthBackend, err)
+	}
+	if err := a.queries.TouchAPIKey(ctx, key.ID); err != nil {
+		a.logger.Warn("touch api key", "key_id", key.ID, "error", err)
 	}
 
-	return nil
+	keyID := key.ID
+	return Principal{KeyID: &keyID}, nil
 }
 
-func (a *TokenAuthenticator) countActiveKeys(ctx context.Context) (int64, error) {
+func (a *TokenAuthenticator) requiresAuthentication(ctx context.Context) (bool, error) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	now := time.Now()
-	if now.Before(a.cacheExpiresAt) {
-		return a.activeKeyCount, nil
+	required := a.authRequired
+	a.mu.Unlock()
+	if required {
+		return true, nil
 	}
 
-	count, err := a.queries.CountActiveAPIKeys(ctx)
+	queryCtx, cancel := context.WithTimeout(ctx, authQueryTimeout)
+	defer cancel()
+	count, err := a.queries.CountActiveAPIKeys(queryCtx)
 	if err != nil {
-		return 0, err
+		return false, fmt.Errorf("%w: counting active api keys: %w", errAuthBackend, err)
 	}
-	a.activeKeyCount = count
-	a.cacheExpiresAt = now.Add(a.ttl)
-	return count, nil
+	if count == 0 {
+		a.mu.Lock()
+		required = a.authRequired
+		a.mu.Unlock()
+		return required, nil
+	}
+
+	a.mu.Lock()
+	a.authRequired = true
+	a.mu.Unlock()
+	return true, nil
 }
 
 func bearerToken(authorization string) (string, bool) {

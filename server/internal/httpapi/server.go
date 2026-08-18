@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/danielgtaylor/huma/v2/adapters/humago"
@@ -32,6 +33,10 @@ func New(
 ) *Server {
 	mux := http.NewServeMux()
 	config := huma.DefaultConfig("Playwright Distributed Control Plane", "1.0.0")
+	config.DocsPath = ""
+	config.OpenAPIPath = ""
+	config.SchemasPath = ""
+	config.CreateHooks = nil
 	config.Components.SecuritySchemes = map[string]*huma.SecurityScheme{
 		bearerScheme: {
 			Type:         "http",
@@ -84,7 +89,11 @@ func registerPublicRoutes(api huma.API, queries *data.Queries, logger *slog.Logg
 		Path:        "/sessions/{id}",
 		Summary:     "Get a session",
 		Tags:        []string{"Sessions"},
-		Errors:      []int{http.StatusNotFound},
+		Errors: []int{
+			http.StatusNotFound,
+			http.StatusUnauthorized,
+			http.StatusServiceUnavailable,
+		},
 	}, func(ctx context.Context, input *getSessionInput) (*getSessionOutput, error) {
 		session, err := queries.GetSession(ctx, input.ID)
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -109,6 +118,10 @@ func registerPublicRoutes(api huma.API, queries *data.Queries, logger *slog.Logg
 		Path:        "/workers",
 		Summary:     "List workers",
 		Tags:        []string{"Workers"},
+		Errors: []int{
+			http.StatusUnauthorized,
+			http.StatusServiceUnavailable,
+		},
 	}, func(ctx context.Context, _ *struct{}) (*listWorkersOutput, error) {
 		workers, err := queries.ListWorkers(ctx)
 		if err != nil {
@@ -125,10 +138,10 @@ func registerPublicRoutes(api huma.API, queries *data.Queries, logger *slog.Logg
 func registerWorkerRoutes(api huma.API, queries *data.Queries, logger *slog.Logger) {
 	type registerWorkerInput struct {
 		Body struct {
-			Address           string `json:"address" format:"uri"`
+			Address           string `json:"address" format:"uri" pattern:"^wss?://"`
 			Browser           string `json:"browser" enum:"chromium,firefox,webkit"`
 			PlaywrightVersion string `json:"playwright_version" minLength:"1"`
-			MaxSlots          int32  `json:"max_slots" minimum:"1"`
+			MaxSlots          int32  `json:"max_slots" minimum:"1" maximum:"1024"`
 		}
 	}
 	type workerOutput struct {
@@ -141,6 +154,10 @@ func registerWorkerRoutes(api huma.API, queries *data.Queries, logger *slog.Logg
 		Summary:       "Register a worker",
 		Tags:          []string{"Workers"},
 		DefaultStatus: http.StatusCreated,
+		Errors: []int{
+			http.StatusUnauthorized,
+			http.StatusServiceUnavailable,
+		},
 	}, func(ctx context.Context, input *registerWorkerInput) (*workerOutput, error) {
 		worker, err := queries.RegisterWorker(ctx, data.RegisterWorkerParams{
 			ID:                uuid.New(),
@@ -157,10 +174,7 @@ func registerWorkerRoutes(api huma.API, queries *data.Queries, logger *slog.Logg
 	})
 
 	type heartbeatInput struct {
-		ID   uuid.UUID `path:"id" format:"uuid" doc:"Worker ID"`
-		Body struct {
-			ActiveSessionIDs []uuid.UUID `json:"active_session_ids,omitempty"`
-		}
+		ID uuid.UUID `path:"id" format:"uuid" doc:"Worker ID"`
 	}
 	type heartbeatOutput struct {
 		Body struct {
@@ -174,7 +188,11 @@ func registerWorkerRoutes(api huma.API, queries *data.Queries, logger *slog.Logg
 		Path:        "/workers/{id}/heartbeat",
 		Summary:     "Heartbeat a worker",
 		Tags:        []string{"Workers"},
-		Errors:      []int{http.StatusNotFound},
+		Errors: []int{
+			http.StatusNotFound,
+			http.StatusUnauthorized,
+			http.StatusServiceUnavailable,
+		},
 	}, func(ctx context.Context, input *heartbeatInput) (*heartbeatOutput, error) {
 		worker, err := queries.UpdateWorkerHeartbeat(ctx, input.ID)
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -201,14 +219,24 @@ func registerWorkerRoutes(api huma.API, queries *data.Queries, logger *slog.Logg
 		Path:        "/workers/{id}/status",
 		Summary:     "Request a worker status transition",
 		Tags:        []string{"Workers"},
-		Errors:      []int{http.StatusNotFound},
+		Errors: []int{
+			http.StatusNotFound,
+			http.StatusConflict,
+			http.StatusUnauthorized,
+			http.StatusServiceUnavailable,
+		},
 	}, func(ctx context.Context, input *setStatusInput) (*workerOutput, error) {
 		worker, err := queries.SetWorkerStatus(ctx, data.SetWorkerStatusParams{
 			ID:     input.ID,
 			Status: input.Body.Status,
 		})
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, huma.Error404NotFound("worker not found")
+			if _, getErr := queries.GetWorker(ctx, input.ID); errors.Is(getErr, pgx.ErrNoRows) {
+				return nil, huma.Error404NotFound("worker not found")
+			} else if getErr != nil {
+				return nil, internalError(logger, "get worker after rejected status transition", getErr)
+			}
+			return nil, huma.Error409Conflict("invalid worker status transition")
 		}
 		if err != nil {
 			return nil, internalError(logger, "set worker status", err)
@@ -243,7 +271,9 @@ func registerInfrastructureRoutes(api huma.API, pool *pgxpool.Pool, logger *slog
 		Tags:        []string{"Infrastructure"},
 		Errors:      []int{http.StatusServiceUnavailable},
 	}, func(ctx context.Context, _ *struct{}) (*healthOutput, error) {
-		if err := pool.Ping(ctx); err != nil {
+		pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		if err := pool.Ping(pingCtx); err != nil {
 			logger.Warn("database readiness check failed", "error", err)
 			return nil, huma.Error503ServiceUnavailable("database unavailable")
 		}

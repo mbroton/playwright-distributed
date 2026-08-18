@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -9,10 +10,13 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/danielgtaylor/huma/v2"
+	"github.com/danielgtaylor/huma/v2/adapters/humago"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/testcontainers/testcontainers-go"
@@ -24,10 +28,19 @@ import (
 
 const postgresImage = "postgres:18-alpine"
 
+type staticAuthenticator struct {
+	principal Principal
+}
+
+func (a staticAuthenticator) Authenticate(context.Context, string) (Principal, error) {
+	return a.principal, nil
+}
+
 func TestServer_WorkerAndSessionRoutes(t *testing.T) {
 	pool := newMigratedTestPool(t)
 	queries := data.New(pool)
-	server := New(pool, queries, NewTokenAuthenticator(queries, 0), testLogger(io.Discard))
+	logger := testLogger(io.Discard)
+	server := New(pool, queries, NewTokenAuthenticator(queries, logger), logger)
 
 	register := requestJSON(t, server.Handler, http.MethodPost, "/internal/workers", map[string]any{
 		"address":            "ws://worker:3000",
@@ -53,6 +66,9 @@ func TestServer_WorkerAndSessionRoutes(t *testing.T) {
 	if len(workers) != 1 || workers[0].ID != worker.ID {
 		t.Fatalf("listed workers = %+v, want registered worker %s", workers, worker.ID)
 	}
+	if strings.Contains(list.Body.String(), "$schema") || list.Header().Get("Link") != "" {
+		t.Fatalf("list response contains a schema link: headers=%v body=%s", list.Header(), list.Body.String())
+	}
 
 	heartbeatBefore := databaseTime(t, pool)
 	heartbeat := requestJSON(
@@ -60,7 +76,7 @@ func TestServer_WorkerAndSessionRoutes(t *testing.T) {
 		server.Handler,
 		http.MethodPost,
 		"/internal/workers/"+worker.ID.String()+"/heartbeat",
-		map[string]any{"active_session_ids": []string{}},
+		nil,
 		"",
 	)
 	if heartbeat.Code != http.StatusOK {
@@ -86,6 +102,28 @@ func TestServer_WorkerAndSessionRoutes(t *testing.T) {
 			heartbeatBefore,
 			heartbeatAfter,
 		)
+	}
+	if _, err := pool.Exec(
+		t.Context(),
+		"UPDATE workers SET status = 'stalled' WHERE id = $1",
+		worker.ID,
+	); err != nil {
+		t.Fatalf("setting worker status to stalled: %v", err)
+	}
+	recovered := requestJSON(
+		t,
+		server.Handler,
+		http.MethodPost,
+		"/internal/workers/"+worker.ID.String()+"/heartbeat",
+		nil,
+		"",
+	)
+	if recovered.Code != http.StatusOK {
+		t.Fatalf("stalled worker heartbeat status = %d, want %d: %s", recovered.Code, http.StatusOK, recovered.Body.String())
+	}
+	decodeJSON(t, recovered.Body.Bytes(), &heartbeatBody)
+	if heartbeatBody.Status != data.WorkerStatusAvailable {
+		t.Fatalf("stalled worker heartbeat status = %q, want %q", heartbeatBody.Status, data.WorkerStatusAvailable)
 	}
 
 	missingHeartbeat := requestJSON(
@@ -114,6 +152,33 @@ func TestServer_WorkerAndSessionRoutes(t *testing.T) {
 	decodeJSON(t, status.Body.Bytes(), &worker)
 	if worker.Status != data.WorkerStatusDraining {
 		t.Fatalf("worker status = %q, want %q", worker.Status, data.WorkerStatusDraining)
+	}
+	shuttingDown := requestJSON(
+		t,
+		server.Handler,
+		http.MethodPost,
+		"/internal/workers/"+worker.ID.String()+"/status",
+		map[string]any{"status": "shutting_down"},
+		"",
+	)
+	if shuttingDown.Code != http.StatusOK {
+		t.Fatalf("shutting-down transition status = %d, want %d: %s", shuttingDown.Code, http.StatusOK, shuttingDown.Body.String())
+	}
+	invalidTransition := requestJSON(
+		t,
+		server.Handler,
+		http.MethodPost,
+		"/internal/workers/"+worker.ID.String()+"/status",
+		map[string]any{"status": "draining"},
+		"",
+	)
+	if invalidTransition.Code != http.StatusConflict {
+		t.Fatalf(
+			"invalid status transition status = %d, want %d: %s",
+			invalidTransition.Code,
+			http.StatusConflict,
+			invalidTransition.Body.String(),
+		)
 	}
 
 	sessionID := uuid.New()
@@ -148,12 +213,21 @@ func TestServer_WorkerAndSessionRoutes(t *testing.T) {
 func TestServer_Authentication(t *testing.T) {
 	pool := newMigratedTestPool(t)
 	queries := data.New(pool)
-	authenticator := NewTokenAuthenticator(queries, 0)
-	server := New(pool, queries, authenticator, testLogger(io.Discard))
+	var logs bytes.Buffer
+	logger := testLogger(&logs)
+	authenticator := NewTokenAuthenticator(queries, logger)
+	server := New(pool, queries, authenticator, logger)
 
 	open := requestJSON(t, server.Handler, http.MethodGet, "/v1/workers", nil, "")
 	if open.Code != http.StatusOK {
 		t.Fatalf("request with no active keys status = %d, want %d", open.Code, http.StatusOK)
+	}
+	secondOpen := requestJSON(t, server.Handler, http.MethodGet, "/v1/workers", nil, "")
+	if secondOpen.Code != http.StatusOK {
+		t.Fatalf("second request with no active keys status = %d, want %d", secondOpen.Code, http.StatusOK)
+	}
+	if count := strings.Count(logs.String(), "authentication disabled"); count != 1 {
+		t.Fatalf("unauthenticated warning count = %d, want 1: %s", count, logs.String())
 	}
 
 	const token = "pwd_right-token-value"
@@ -174,6 +248,13 @@ func TestServer_Authentication(t *testing.T) {
 	authorized := requestJSON(t, server.Handler, http.MethodGet, "/v1/workers", nil, token)
 	if authorized.Code != http.StatusOK {
 		t.Fatalf("authorized status = %d, want %d: %s", authorized.Code, http.StatusOK, authorized.Body.String())
+	}
+	principal, err := authenticator.Authenticate(t.Context(), "Bearer "+token)
+	if err != nil {
+		t.Fatalf("Authenticate() returned an error: %v", err)
+	}
+	if principal.KeyID == nil || *principal.KeyID != key.ID {
+		t.Fatalf("Authenticate() principal = %+v, want key ID %s", principal, key.ID)
 	}
 	touched, err := queries.GetActiveAPIKeyByHash(t.Context(), hashToken(token))
 	if err != nil {
@@ -198,6 +279,122 @@ func TestServer_Authentication(t *testing.T) {
 	}
 }
 
+func TestServer_SecuredRoutesRequireAuthentication(t *testing.T) {
+	pool := newMigratedTestPool(t)
+	queries := data.New(pool)
+	logger := testLogger(io.Discard)
+	insertAPIKey(t, queries, "route test", "pwd_route-test-token")
+	server := New(pool, queries, NewTokenAuthenticator(queries, logger), logger)
+
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		body   any
+	}{
+		{
+			name:   "get session",
+			method: http.MethodGet,
+			path:   "/v1/sessions/" + uuid.NewString(),
+		},
+		{
+			name:   "list workers",
+			method: http.MethodGet,
+			path:   "/v1/workers",
+		},
+		{
+			name:   "register worker",
+			method: http.MethodPost,
+			path:   "/internal/workers",
+			body: map[string]any{
+				"address":            "ws://worker:3000",
+				"browser":            "chromium",
+				"playwright_version": "1.62.1",
+				"max_slots":          1,
+			},
+		},
+		{
+			name:   "heartbeat worker",
+			method: http.MethodPost,
+			path:   "/internal/workers/" + uuid.NewString() + "/heartbeat",
+		},
+		{
+			name:   "set worker status",
+			method: http.MethodPost,
+			path:   "/internal/workers/" + uuid.NewString() + "/status",
+			body:   map[string]any{"status": "draining"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := requestJSON(t, server.Handler, test.method, test.path, test.body, "")
+			if response.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want %d: %s", response.Code, http.StatusUnauthorized, response.Body.String())
+			}
+			if got := response.Header().Get("WWW-Authenticate"); got != "Bearer" {
+				t.Fatalf("WWW-Authenticate = %q, want %q", got, "Bearer")
+			}
+		})
+	}
+}
+
+func TestServer_AuthenticationBackendFailure(t *testing.T) {
+	pool := newMigratedTestPool(t)
+	queries := data.New(pool)
+	const token = "pwd_backend-failure-token"
+	insertAPIKey(t, queries, "backend failure", token)
+	var logs bytes.Buffer
+	logger := testLogger(&logs)
+	server := New(pool, queries, NewTokenAuthenticator(queries, logger), logger)
+	pool.Close()
+
+	response := requestJSON(t, server.Handler, http.MethodGet, "/v1/workers", nil, token)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d: %s", response.Code, http.StatusServiceUnavailable, response.Body.String())
+	}
+	if response.Header().Get("Retry-After") == "" {
+		t.Fatal("503 response does not contain Retry-After")
+	}
+	if strings.Contains(logs.String(), token) {
+		t.Fatalf("authentication backend log contains token: %s", logs.String())
+	}
+	if !strings.Contains(logs.String(), "authenticate request") {
+		t.Fatalf("authentication backend failure was not logged: %s", logs.String())
+	}
+}
+
+func TestAuthMiddleware_StoresPrincipal(t *testing.T) {
+	keyID := uuid.New()
+	mux := http.NewServeMux()
+	config := huma.DefaultConfig("principal test", "1.0.0")
+	config.CreateHooks = nil
+	api := humago.New(mux, config)
+	group := huma.NewGroup(api, "")
+	group.UseMiddleware(authMiddleware(group, staticAuthenticator{
+		principal: Principal{KeyID: &keyID},
+	}, testLogger(io.Discard)))
+	type principalOutput struct {
+		Body Principal
+	}
+	huma.Register(group, huma.Operation{
+		OperationID: "get-principal",
+		Method:      http.MethodGet,
+		Path:        "/principal",
+	}, func(ctx context.Context, _ *struct{}) (*principalOutput, error) {
+		return &principalOutput{Body: PrincipalFromContext(ctx)}, nil
+	})
+
+	response := requestJSON(t, mux, http.MethodGet, "/principal", nil, "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", response.Code, http.StatusOK, response.Body.String())
+	}
+	var principal Principal
+	decodeJSON(t, response.Body.Bytes(), &principal)
+	if principal.KeyID == nil || *principal.KeyID != keyID {
+		t.Fatalf("principal = %+v, want key ID %s", principal, keyID)
+	}
+}
+
 func TestServer_Readiness(t *testing.T) {
 	pool := newMigratedTestPool(t)
 	queries := data.New(pool)
@@ -215,7 +412,20 @@ func TestServer_Readiness(t *testing.T) {
 	}
 }
 
-func TestRequestLogger_OmitsQueryString(t *testing.T) {
+func TestServer_DisablesHumaRuntimeRoutes(t *testing.T) {
+	server := New(nil, nil, NoAuthAuthenticator{}, testLogger(io.Discard))
+	paths := []string{"/docs", "/openapi.json", "/schemas/Worker.json"}
+	for _, path := range paths {
+		t.Run(path, func(t *testing.T) {
+			response := requestJSON(t, server.Handler, http.MethodGet, path, nil, "")
+			if response.Code != http.StatusNotFound {
+				t.Fatalf("%s status = %d, want %d", path, response.Code, http.StatusNotFound)
+			}
+		})
+	}
+}
+
+func TestRequestLogger_OmitsQueryStringAndIncludesRemoteAddress(t *testing.T) {
 	var logs bytes.Buffer
 	logger := testLogger(&logs)
 	handler := requestLogger(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -223,12 +433,31 @@ func TestRequestLogger_OmitsQueryString(t *testing.T) {
 	}), logger)
 
 	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/healthz?token=pwd_secret", nil))
+	request := httptest.NewRequest(http.MethodGet, "/v1/workers?token=pwd_secret", nil)
+	request.RemoteAddr = "192.0.2.1:1234"
+	handler.ServeHTTP(response, request)
 	if strings.Contains(logs.String(), "pwd_secret") || strings.Contains(logs.String(), "?token=") {
 		t.Fatalf("request log contains query string: %s", logs.String())
 	}
-	if !strings.Contains(logs.String(), `"path":"/healthz"`) {
+	if !strings.Contains(logs.String(), `"path":"/v1/workers"`) {
 		t.Fatalf("request log does not contain URL path: %s", logs.String())
+	}
+	if !strings.Contains(logs.String(), `"remote_address":"192.0.2.1:1234"`) {
+		t.Fatalf("request log does not contain remote address: %s", logs.String())
+	}
+}
+
+func TestRequestLogger_SkipsHealthProbes(t *testing.T) {
+	var logs bytes.Buffer
+	handler := requestLogger(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}), testLogger(&logs))
+
+	for _, path := range []string{"/healthz", "/readyz"} {
+		handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, path, nil))
+	}
+	if logs.Len() != 0 {
+		t.Fatalf("probe requests produced logs: %s", logs.String())
 	}
 }
 
@@ -243,6 +472,13 @@ func TestOpenAPISpec_Deterministic(t *testing.T) {
 	}
 	if !bytes.Equal(first, second) {
 		t.Fatal("OpenAPISpec() output changed between calls")
+	}
+	committed, err := os.ReadFile("../../openapi.yaml")
+	if err != nil {
+		t.Fatalf("reading committed OpenAPI document: %v", err)
+	}
+	if !bytes.Equal(first, committed) {
+		t.Fatal("committed openapi.yaml does not match OpenAPISpec() output; run make openapi")
 	}
 }
 

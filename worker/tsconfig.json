@@ -1,7 +1,7 @@
 {
   "compilerOptions": {
     // Environment setup & latest features
-    "lib": ["ESNext", "DOM"],
+    "lib": ["ESNext"],
     "target": "ESNext",
     "module": "ESNext",
     "moduleDetection": "force",
@@ -30,5 +30,6 @@
   },
   "ts-node": {
     "esm": true
-  }
+  },
+  "include": ["src/**/*.ts", "scripts/**/*.ts", "types/**/*.d.ts", "openapi-ts.config.ts"]
 }

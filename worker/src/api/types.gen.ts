@@ -21,10 +21,6 @@ export type ErrorDetail = {
 
 export type ErrorModel = {
     /**
-     * A URL to the JSON Schema for this object.
-     */
-    readonly $schema?: string;
-    /**
      * A human-readable explanation specific to this occurrence of the problem.
      */
     detail?: string;
@@ -51,35 +47,15 @@ export type ErrorModel = {
 };
 
 export type HealthOutputBody = {
-    /**
-     * A URL to the JSON Schema for this object.
-     */
-    readonly $schema?: string;
     status: string;
 };
 
-export type HeartbeatInputBody = {
-    /**
-     * A URL to the JSON Schema for this object.
-     */
-    readonly $schema?: string;
-    active_session_ids?: Array<string> | null;
-};
-
 export type HeartbeatOutputBody = {
-    /**
-     * A URL to the JSON Schema for this object.
-     */
-    readonly $schema?: string;
     commands: Array<string>;
     status: 'available' | 'draining' | 'stalled' | 'shutting_down';
 };
 
 export type RegisterWorkerInputBody = {
-    /**
-     * A URL to the JSON Schema for this object.
-     */
-    readonly $schema?: string;
     address: string;
     browser: 'chromium' | 'firefox' | 'webkit';
     max_slots: number;
@@ -87,10 +63,6 @@ export type RegisterWorkerInputBody = {
 };
 
 export type Session = {
-    /**
-     * A URL to the JSON Schema for this object.
-     */
-    readonly $schema?: string;
     browser: string;
     connect_metadata: {
         [key: string]: unknown;
@@ -109,99 +81,10 @@ export type Session = {
 };
 
 export type SetStatusInputBody = {
-    /**
-     * A URL to the JSON Schema for this object.
-     */
-    readonly $schema?: string;
     status: 'draining' | 'shutting_down';
 };
 
 export type Worker = {
-    /**
-     * A URL to the JSON Schema for this object.
-     */
-    readonly $schema?: string;
-    address: string;
-    browser: string;
-    created_at: string;
-    id: string;
-    last_heartbeat: string;
-    lifetime_sessions: number;
-    max_slots: number;
-    playwright_version: string;
-    status: 'available' | 'draining' | 'stalled' | 'shutting_down';
-};
-
-export type ErrorModelWritable = {
-    /**
-     * A human-readable explanation specific to this occurrence of the problem.
-     */
-    detail?: string;
-    /**
-     * Optional list of individual error details
-     */
-    errors?: Array<ErrorDetail> | null;
-    /**
-     * A URI reference that identifies the specific occurrence of the problem.
-     */
-    instance?: string;
-    /**
-     * HTTP status code
-     */
-    status?: number;
-    /**
-     * A short, human-readable summary of the problem type. This value should not change between occurrences of the error.
-     */
-    title?: string;
-    /**
-     * A URI reference to human-readable documentation for the error.
-     */
-    type?: string;
-};
-
-export type HealthOutputBodyWritable = {
-    status: string;
-};
-
-export type HeartbeatInputBodyWritable = {
-    active_session_ids?: Array<string> | null;
-};
-
-export type HeartbeatOutputBodyWritable = {
-    commands: Array<string>;
-    status: 'available' | 'draining' | 'stalled' | 'shutting_down';
-};
-
-export type RegisterWorkerInputBodyWritable = {
-    address: string;
-    browser: 'chromium' | 'firefox' | 'webkit';
-    max_slots: number;
-    playwright_version: string;
-};
-
-export type SessionWritable = {
-    browser: string;
-    connect_metadata: {
-        [key: string]: unknown;
-    };
-    created_at: string;
-    created_by_key?: string;
-    expires_at?: string;
-    id: string;
-    keep_alive_ms?: number;
-    last_heartbeat: string;
-    mode: 'default' | 'dedicated';
-    playwright_version: string;
-    status: 'pending' | 'running' | 'completed' | 'failed' | 'expired';
-    worker_address: string;
-    worker_id: string;
-};
-
-export type SetStatusInputBodyWritable = {
-    status: 'draining' | 'shutting_down';
-};
-
-export type WorkerWritable = {
     address: string;
     browser: string;
     created_at: string;
@@ -239,7 +122,7 @@ export type HealthResponses = {
 export type HealthResponse = HealthResponses[keyof HealthResponses];
 
 export type RegisterWorkerData = {
-    body: RegisterWorkerInputBodyWritable;
+    body: RegisterWorkerInputBody;
     path?: never;
     query?: never;
     url: '/internal/workers';
@@ -247,9 +130,21 @@ export type RegisterWorkerData = {
 
 export type RegisterWorkerErrors = {
     /**
-     * Error
+     * Unauthorized
      */
-    default: ErrorModel;
+    401: ErrorModel;
+    /**
+     * Unprocessable Entity
+     */
+    422: ErrorModel;
+    /**
+     * Internal Server Error
+     */
+    500: ErrorModel;
+    /**
+     * Service Unavailable
+     */
+    503: ErrorModel;
 };
 
 export type RegisterWorkerError = RegisterWorkerErrors[keyof RegisterWorkerErrors];
@@ -264,7 +159,7 @@ export type RegisterWorkerResponses = {
 export type RegisterWorkerResponse = RegisterWorkerResponses[keyof RegisterWorkerResponses];
 
 export type HeartbeatWorkerData = {
-    body: HeartbeatInputBodyWritable;
+    body?: never;
     path: {
         /**
          * Worker ID
@@ -277,6 +172,10 @@ export type HeartbeatWorkerData = {
 
 export type HeartbeatWorkerErrors = {
     /**
+     * Unauthorized
+     */
+    401: ErrorModel;
+    /**
      * Not Found
      */
     404: ErrorModel;
@@ -288,6 +187,10 @@ export type HeartbeatWorkerErrors = {
      * Internal Server Error
      */
     500: ErrorModel;
+    /**
+     * Service Unavailable
+     */
+    503: ErrorModel;
 };
 
 export type HeartbeatWorkerError = HeartbeatWorkerErrors[keyof HeartbeatWorkerErrors];
@@ -302,7 +205,7 @@ export type HeartbeatWorkerResponses = {
 export type HeartbeatWorkerResponse = HeartbeatWorkerResponses[keyof HeartbeatWorkerResponses];
 
 export type SetWorkerStatusData = {
-    body: SetStatusInputBodyWritable;
+    body: SetStatusInputBody;
     path: {
         /**
          * Worker ID
@@ -315,9 +218,17 @@ export type SetWorkerStatusData = {
 
 export type SetWorkerStatusErrors = {
     /**
+     * Unauthorized
+     */
+    401: ErrorModel;
+    /**
      * Not Found
      */
     404: ErrorModel;
+    /**
+     * Conflict
+     */
+    409: ErrorModel;
     /**
      * Unprocessable Entity
      */
@@ -326,6 +237,10 @@ export type SetWorkerStatusErrors = {
      * Internal Server Error
      */
     500: ErrorModel;
+    /**
+     * Service Unavailable
+     */
+    503: ErrorModel;
 };
 
 export type SetWorkerStatusError = SetWorkerStatusErrors[keyof SetWorkerStatusErrors];
@@ -382,6 +297,10 @@ export type GetSessionData = {
 
 export type GetSessionErrors = {
     /**
+     * Unauthorized
+     */
+    401: ErrorModel;
+    /**
      * Not Found
      */
     404: ErrorModel;
@@ -393,6 +312,10 @@ export type GetSessionErrors = {
      * Internal Server Error
      */
     500: ErrorModel;
+    /**
+     * Service Unavailable
+     */
+    503: ErrorModel;
 };
 
 export type GetSessionError = GetSessionErrors[keyof GetSessionErrors];
@@ -415,9 +338,17 @@ export type ListWorkersData = {
 
 export type ListWorkersErrors = {
     /**
-     * Error
+     * Unauthorized
      */
-    default: ErrorModel;
+    401: ErrorModel;
+    /**
+     * Internal Server Error
+     */
+    500: ErrorModel;
+    /**
+     * Service Unavailable
+     */
+    503: ErrorModel;
 };
 
 export type ListWorkersError = ListWorkersErrors[keyof ListWorkersErrors];
