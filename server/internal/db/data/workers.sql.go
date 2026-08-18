@@ -159,19 +159,13 @@ func (q *Queries) SetWorkerStatus(ctx context.Context, arg SetWorkerStatusParams
 
 const updateWorkerHeartbeat = `-- name: UpdateWorkerHeartbeat :one
 UPDATE workers
-SET last_heartbeat = now(),
-    status = $2
+SET last_heartbeat = now()
 WHERE id = $1
 RETURNING id, address, browser, playwright_version, max_slots, status, last_heartbeat, lifetime_sessions, created_at
 `
 
-type UpdateWorkerHeartbeatParams struct {
-	ID     uuid.UUID
-	Status WorkerStatus
-}
-
-func (q *Queries) UpdateWorkerHeartbeat(ctx context.Context, arg UpdateWorkerHeartbeatParams) (Worker, error) {
-	row := q.db.QueryRow(ctx, updateWorkerHeartbeat, arg.ID, arg.Status)
+func (q *Queries) UpdateWorkerHeartbeat(ctx context.Context, id uuid.UUID) (Worker, error) {
+	row := q.db.QueryRow(ctx, updateWorkerHeartbeat, id)
 	var i Worker
 	err := row.Scan(
 		&i.ID,

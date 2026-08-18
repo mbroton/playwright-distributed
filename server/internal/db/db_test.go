@@ -160,10 +160,7 @@ func TestQueries(t *testing.T) {
 	}
 
 	heartbeatBefore := databaseTime(t, pool)
-	gotWorker, err = queries.UpdateWorkerHeartbeat(t.Context(), data.UpdateWorkerHeartbeatParams{
-		ID:     workerID,
-		Status: data.WorkerStatusDraining,
-	})
+	gotWorker, err = queries.UpdateWorkerHeartbeat(t.Context(), workerID)
 	if err != nil {
 		t.Fatalf("UpdateWorkerHeartbeat() returned an error: %v", err)
 	}
@@ -175,8 +172,8 @@ func TestQueries(t *testing.T) {
 		heartbeatBefore,
 		heartbeatAfter,
 	)
-	if gotWorker.Status != data.WorkerStatusDraining {
-		t.Fatalf("UpdateWorkerHeartbeat().Status = %q, want %q", gotWorker.Status, data.WorkerStatusDraining)
+	if gotWorker.Status != data.WorkerStatusAvailable {
+		t.Fatalf("UpdateWorkerHeartbeat().Status = %q, want unchanged %q", gotWorker.Status, data.WorkerStatusAvailable)
 	}
 
 	gotWorker, err = queries.SetWorkerStatus(t.Context(), data.SetWorkerStatusParams{

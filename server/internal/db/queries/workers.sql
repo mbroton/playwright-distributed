@@ -19,8 +19,7 @@ WHERE id = $1;
 
 -- name: UpdateWorkerHeartbeat :one
 UPDATE workers
-SET last_heartbeat = now(),
-    status = $2
+SET last_heartbeat = now()
 WHERE id = $1
 RETURNING *;
 

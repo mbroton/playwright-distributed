@@ -3,12 +3,14 @@
   "type": "module",
   "private": true,
   "scripts": {
+    "generate:api": "openapi-ts -i ../server/openapi.yaml -o src/api",
     "start": "tsx src/index.ts",
     "test": "node --import tsx --test src/*.test.ts",
     "typecheck": "tsc --noEmit",
     "smoke": "tsx scripts/smoke.ts"
   },
   "devDependencies": {
+    "@hey-api/openapi-ts": "0.95.0",
     "@types/node": "^24.13.3",
     "tsx": "^4.23.12"
   },

@@ -7,9 +7,23 @@ package data
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 )
+
+const countActiveAPIKeys = `-- name: CountActiveAPIKeys :one
+SELECT count(*)
+FROM api_keys
+WHERE revoked_at IS NULL
+`
+
+func (q *Queries) CountActiveAPIKeys(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, countActiveAPIKeys)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
 
 const getActiveAPIKeyByHash = `-- name: GetActiveAPIKeyByHash :one
 SELECT id, name, hash, prefix, created_at, last_used_at, revoked_at
@@ -70,6 +84,48 @@ func (q *Queries) InsertAPIKey(ctx context.Context, arg InsertAPIKeyParams) (API
 		&i.RevokedAt,
 	)
 	return i, err
+}
+
+const listAPIKeys = `-- name: ListAPIKeys :many
+SELECT id, name, prefix, created_at, last_used_at, revoked_at
+FROM api_keys
+ORDER BY created_at, id
+`
+
+type ListAPIKeysRow struct {
+	ID         uuid.UUID
+	Name       string
+	Prefix     string
+	CreatedAt  time.Time
+	LastUsedAt *time.Time
+	RevokedAt  *time.Time
+}
+
+func (q *Queries) ListAPIKeys(ctx context.Context) ([]ListAPIKeysRow, error) {
+	rows, err := q.db.Query(ctx, listAPIKeys)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListAPIKeysRow
+	for rows.Next() {
+		var i ListAPIKeysRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.Prefix,
+			&i.CreatedAt,
+			&i.LastUsedAt,
+			&i.RevokedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const revokeAPIKey = `-- name: RevokeAPIKey :one
