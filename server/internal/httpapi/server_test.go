@@ -385,14 +385,16 @@ func TestServer_TouchFailureDoesNotRejectRequest(t *testing.T) {
 
 func TestServer_RejectsHostlessWorkerAddress(t *testing.T) {
 	server := New(nil, nil, NoAuthAuthenticator{}, testLogger(io.Discard))
-	response := requestJSON(t, server.Handler, http.MethodPost, "/internal/workers", map[string]any{
-		"address":            "ws://",
-		"browser":            "chromium",
-		"playwright_version": "1.62.1",
-		"max_slots":          1,
-	}, "")
-	if response.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("hostless address status = %d, want %d: %s", response.Code, http.StatusUnprocessableEntity, response.Body.String())
+	for _, address := range []string{"ws://", "ws://:3000", "ws://user@"} {
+		response := requestJSON(t, server.Handler, http.MethodPost, "/internal/workers", map[string]any{
+			"address":            address,
+			"browser":            "chromium",
+			"playwright_version": "1.62.1",
+			"max_slots":          1,
+		}, "")
+		if response.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("address %q status = %d, want %d: %s", address, response.Code, http.StatusUnprocessableEntity, response.Body.String())
+		}
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -156,9 +157,14 @@ func registerWorkerRoutes(api huma.API, queries *data.Queries, logger *slog.Logg
 		DefaultStatus: http.StatusCreated,
 		Errors: []int{
 			http.StatusUnauthorized,
+			http.StatusUnprocessableEntity,
 			http.StatusServiceUnavailable,
 		},
 	}, func(ctx context.Context, input *registerWorkerInput) (*workerOutput, error) {
+		// The pattern cannot reject an empty hostname (ws://:3000, ws://user@).
+		if parsed, err := url.Parse(input.Body.Address); err != nil || parsed.Hostname() == "" {
+			return nil, huma.Error422UnprocessableEntity("address must include a hostname")
+		}
 		worker, err := queries.RegisterWorker(ctx, data.RegisterWorkerParams{
 			ID:                uuid.New(),
 			Address:           input.Body.Address,
