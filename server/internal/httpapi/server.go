@@ -400,7 +400,6 @@ func registerWorkerRoutes(
 	type heartbeatOutput struct {
 		Body struct {
 			Status          data.WorkerStatus `json:"status" enum:"available,draining,stalled,shutting_down"`
-			Commands        []string          `json:"commands" nullable:"false"`
 			StaleSessionIDs []uuid.UUID       `json:"stale_session_ids" nullable:"false" format:"uuid"`
 		}
 	}
@@ -444,7 +443,6 @@ func registerWorkerRoutes(
 		}
 		output := &heartbeatOutput{}
 		output.Body.Status = worker.Status
-		output.Body.Commands = []string{}
 		output.Body.StaleSessionIDs = staleIDs
 		return output, nil
 	})

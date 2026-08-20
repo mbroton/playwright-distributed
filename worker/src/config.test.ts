@@ -1,50 +1,61 @@
 import assert from 'node:assert/strict';
+import os from 'node:os';
 import test from 'node:test';
 import { ZodError } from 'zod';
 import { parseConfig } from './config.js';
 
 const requiredEnvironment = {
-    REDIS_URL: 'redis://localhost:6379',
-    PORT: '3131',
+    SERVER_URL: 'http://localhost:8080',
 };
 
-test('default timing keeps the heartbeat failure tolerance', () => {
-    assert.doesNotThrow(() => parseConfig(requiredEnvironment));
+test('uses worker defaults', () => {
+    const config = parseConfig(requiredEnvironment);
+
+    assert.deepEqual(config, {
+        controlPlane: { serverUrl: 'http://localhost:8080' },
+        browser: { type: 'chromium', headless: true },
+        shim: {
+            port: 3131,
+            privateHostname: os.hostname(),
+            maxSlots: 5,
+        },
+        lifecycle: {
+            heartbeatIntervalMs: 5_000,
+            drainTimeoutMs: 300_000,
+        },
+        logging: { level: 'info', format: 'json' },
+    });
 });
 
-test('converts second-based timing to the milliseconds the timers expect', () => {
+test('requires SERVER_URL', () => {
+    assert.throws(() => parseConfig({}), ZodError);
+});
+
+test('rejects invalid values', () => {
+    assert.throws(() => parseConfig({
+        SERVER_URL: 'ws://localhost:8080',
+        MAX_SLOTS: '0',
+        HEARTBEAT_INTERVAL: '0',
+    }), (error: unknown) => {
+        assert.ok(error instanceof ZodError);
+        assert.ok(error.issues.some(issue => issue.path[0] === 'SERVER_URL'));
+        assert.ok(error.issues.some(issue => issue.path[0] === 'MAX_SLOTS'));
+        assert.ok(error.issues.some(issue => issue.path[0] === 'HEARTBEAT_INTERVAL'));
+        return true;
+    });
+});
+
+test('uses PRIVATE_HOSTNAME when set', () => {
     const config = parseConfig({
         ...requiredEnvironment,
-        HEARTBEAT_INTERVAL: '10',
-        REDIS_RETRY_DELAY: '3',
+        PRIVATE_HOSTNAME: 'worker-1',
     });
 
-    assert.equal(config.server.heartbeatInterval, 10 * 1000);
-    assert.equal(config.redis.retryDelay, 3 * 1000);
+    assert.equal(config.shim.privateHostname, 'worker-1');
 });
 
-test('accepts a worker key TTL three times the heartbeat interval', () => {
-    assert.doesNotThrow(() => parseConfig({
-        ...requiredEnvironment,
-        HEARTBEAT_INTERVAL: '20',
-        REDIS_KEY_TTL: '60',
-    }));
-});
-
-test('rejects a worker key TTL without heartbeat failure tolerance', () => {
-    assert.throws(
-        () => parseConfig({
-            ...requiredEnvironment,
-            HEARTBEAT_INTERVAL: '21',
-            REDIS_KEY_TTL: '60',
-        }),
-        (error: unknown) => {
-            assert.ok(error instanceof ZodError);
-            assert.equal(
-                error.issues[0]?.message,
-                'REDIS_KEY_TTL must be at least three times HEARTBEAT_INTERVAL'
-            );
-            return true;
-        }
-    );
+test('parses boolean strings and rejects other boolean forms', () => {
+    assert.equal(parseConfig({ ...requiredEnvironment, HEADLESS: 'false' }).browser.headless, false);
+    assert.equal(parseConfig({ ...requiredEnvironment, HEADLESS: 'true' }).browser.headless, true);
+    assert.throws(() => parseConfig({ ...requiredEnvironment, HEADLESS: '1' }), ZodError);
 });

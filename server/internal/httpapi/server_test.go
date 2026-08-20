@@ -110,15 +110,12 @@ func TestServer_WorkerAndSessionRoutes(t *testing.T) {
 	}
 	var heartbeatBody struct {
 		Status          data.WorkerStatus `json:"status"`
-		Commands        []string          `json:"commands"`
 		StaleSessionIDs []uuid.UUID       `json:"stale_session_ids"`
 	}
 	decodeJSON(t, heartbeat.Body.Bytes(), &heartbeatBody)
 	if heartbeatBody.Status != data.WorkerStatusAvailable ||
-		heartbeatBody.Commands == nil ||
-		len(heartbeatBody.Commands) != 0 ||
 		heartbeatBody.StaleSessionIDs == nil {
-		t.Fatalf("heartbeat response = %+v, want available and empty commands", heartbeatBody)
+		t.Fatalf("heartbeat response = %+v, want available and empty stale sessions", heartbeatBody)
 	}
 	heartbeatAfter := databaseTime(t, pool)
 	updatedWorker, err := queries.GetWorker(t.Context(), worker.ID)
