@@ -178,10 +178,10 @@ func (s *Scheduler) Admit(ctx context.Context, request ClaimRequest) (data.Sessi
 			excluded = append(excluded, *fullWorkerID)
 			continue
 		}
-		excluded = excluded[:0]
 		if errors.Is(err, errUncertainCommit) {
 			return data.Session{}, err
 		}
+		excluded = excluded[:0]
 		if waitErr := s.queueWaitError(ctx, waitCtx); waitErr != nil {
 			return data.Session{}, waitErr
 		}
@@ -352,7 +352,7 @@ func (s *Scheduler) claimOnce(
 	// hide a committed row. The pending-session TTL is the backstop for that
 	// maybe-committed row; never auto-retry past an uncertain commit.
 	if err := tx.Commit(ctx); err != nil {
-		return data.Session{}, nil, fmt.Errorf("%w: %v", errUncertainCommit, err)
+		return data.Session{}, nil, fmt.Errorf("%w: %w", errUncertainCommit, err)
 	}
 
 	return session, nil, nil
