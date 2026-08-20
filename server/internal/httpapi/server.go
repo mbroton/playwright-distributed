@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,13 +18,29 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"server/internal/db/data"
+	"server/internal/scheduler"
 )
 
-const bearerScheme = "bearer"
+const (
+	bearerScheme           = "bearer"
+	maxConnectMetadataSize = 8 * 1024
+)
 
 type Server struct {
 	Handler http.Handler
 	API     huma.API
+}
+
+type serverOptions struct {
+	scheduler *scheduler.Scheduler
+}
+
+type Option func(*serverOptions)
+
+func WithScheduler(value *scheduler.Scheduler) Option {
+	return func(options *serverOptions) {
+		options.scheduler = value
+	}
 }
 
 func New(
@@ -31,7 +48,12 @@ func New(
 	queries *data.Queries,
 	authenticator Authenticator,
 	logger *slog.Logger,
+	options ...Option,
 ) *Server {
+	settings := serverOptions{}
+	for _, option := range options {
+		option(&settings)
+	}
 	mux := http.NewServeMux()
 	config := huma.DefaultConfig("Playwright Distributed Control Plane", "1.0.0")
 	config.DocsPath = ""
@@ -57,8 +79,8 @@ func New(
 		return group
 	}
 
-	registerPublicRoutes(secured("/v1"), queries, logger)
-	registerWorkerRoutes(secured("/internal"), queries, logger)
+	registerPublicRoutes(secured("/v1"), queries, settings.scheduler, logger)
+	registerWorkerRoutes(secured("/internal"), pool, queries, settings.scheduler, logger)
 	registerInfrastructureRoutes(humaAPI, pool, logger)
 
 	return &Server{
@@ -77,7 +99,80 @@ func OpenAPISpec() ([]byte, error) {
 	return spec, nil
 }
 
-func registerPublicRoutes(api huma.API, queries *data.Queries, logger *slog.Logger) {
+func registerPublicRoutes(
+	api huma.API,
+	queries *data.Queries,
+	sessionScheduler *scheduler.Scheduler,
+	logger *slog.Logger,
+) {
+	type createSessionInput struct {
+		Body struct {
+			Browser         string           `json:"browser" enum:"chromium,firefox,webkit"`
+			Mode            data.SessionMode `json:"mode,omitempty" default:"default" enum:"default,dedicated"`
+			ConnectMetadata map[string]any   `json:"connect_metadata,omitempty" nullable:"false"`
+		}
+	}
+	type createSessionOutput struct {
+		Body Session
+	}
+	huma.Register(api, huma.Operation{
+		OperationID:   "create-session",
+		Method:        http.MethodPost,
+		Path:          "/sessions",
+		Summary:       "Create a session",
+		Tags:          []string{"Sessions"},
+		DefaultStatus: http.StatusCreated,
+		Errors: []int{
+			http.StatusTooManyRequests,
+			http.StatusUnauthorized,
+			http.StatusUnprocessableEntity,
+			http.StatusServiceUnavailable,
+		},
+	}, func(ctx context.Context, input *createSessionInput) (*createSessionOutput, error) {
+		if input.Body.Mode == data.SessionModeDedicated {
+			return nil, huma.Error422UnprocessableEntity("dedicated mode is not available yet")
+		}
+		metadata := input.Body.ConnectMetadata
+		if metadata == nil {
+			metadata = map[string]any{}
+		}
+		encodedMetadata, err := json.Marshal(metadata)
+		if err != nil {
+			return nil, huma.Error422UnprocessableEntity("connect_metadata must be a JSON object")
+		}
+		if len(encodedMetadata) > maxConnectMetadataSize {
+			return nil, huma.Error422UnprocessableEntity("connect_metadata must not exceed 8 KiB")
+		}
+		if sessionScheduler == nil {
+			return nil, internalError(logger, "create session", errors.New("scheduler is not configured"))
+		}
+
+		session, err := sessionScheduler.Admit(ctx, scheduler.ClaimRequest{
+			Browser:         input.Body.Browser,
+			CreatedByKey:    PrincipalFromContext(ctx).KeyID,
+			ConnectMetadata: encodedMetadata,
+		})
+		switch {
+		case err == nil:
+		case errors.Is(err, scheduler.ErrQueueFull):
+			return nil, huma.Error429TooManyRequests("session capacity and queue are full")
+		case errors.Is(err, scheduler.ErrWaitTimeout):
+			return nil, huma.ErrorWithHeaders(
+				huma.Error503ServiceUnavailable("session queue wait timed out"),
+				http.Header{"Retry-After": []string{"1"}},
+			)
+		case errors.Is(err, context.Canceled):
+			return nil, err
+		default:
+			return nil, internalError(logger, "create session", err)
+		}
+		response, err := sessionFromData(session)
+		if err != nil {
+			return nil, internalError(logger, "map created session response", err)
+		}
+		return &createSessionOutput{Body: response}, nil
+	})
+
 	type getSessionInput struct {
 		ID uuid.UUID `path:"id" format:"uuid" doc:"Session ID"`
 	}
@@ -134,9 +229,57 @@ func registerPublicRoutes(api huma.API, queries *data.Queries, logger *slog.Logg
 		}
 		return &listWorkersOutput{Body: response}, nil
 	})
+
+	type capacityOutput struct {
+		Body Capacity
+	}
+	huma.Register(api, huma.Operation{
+		OperationID: "get-capacity",
+		Method:      http.MethodGet,
+		Path:        "/capacity",
+		Summary:     "Get session capacity",
+		Tags:        []string{"Sessions"},
+		Errors: []int{
+			http.StatusUnauthorized,
+			http.StatusServiceUnavailable,
+		},
+	}, func(ctx context.Context, _ *struct{}) (*capacityOutput, error) {
+		if sessionScheduler == nil {
+			return nil, internalError(logger, "get capacity", errors.New("scheduler is not configured"))
+		}
+		capacity, err := sessionScheduler.Capacity(ctx)
+		if err != nil {
+			return nil, internalError(logger, "get capacity", err)
+		}
+		response := Capacity{
+			Browsers:     make([]BrowserCapacity, 0, len(capacity.Browsers)),
+			Queued:       capacity.Queued,
+			MaxQueueSize: capacity.MaxQueueSize,
+		}
+		for _, browser := range capacity.Browsers {
+			response.Browsers = append(response.Browsers, BrowserCapacity{
+				Browser:        browser.Browser,
+				Workers:        browser.Workers,
+				MaxSlots:       browser.MaxSlots,
+				ActiveSessions: browser.ActiveSessions,
+				AvailableSlots: browser.AvailableSlots,
+			})
+			response.Totals.Workers += browser.Workers
+			response.Totals.MaxSlots += browser.MaxSlots
+			response.Totals.ActiveSessions += browser.ActiveSessions
+			response.Totals.AvailableSlots += browser.AvailableSlots
+		}
+		return &capacityOutput{Body: response}, nil
+	})
 }
 
-func registerWorkerRoutes(api huma.API, queries *data.Queries, logger *slog.Logger) {
+func registerWorkerRoutes(
+	api huma.API,
+	pool *pgxpool.Pool,
+	queries *data.Queries,
+	sessionScheduler *scheduler.Scheduler,
+	logger *slog.Logger,
+) {
 	type registerWorkerInput struct {
 		Body struct {
 			Address           string `json:"address" format:"uri" pattern:"^wss?://[^\\s/?#]+" maxLength:"512"`
@@ -165,7 +308,7 @@ func registerWorkerRoutes(api huma.API, queries *data.Queries, logger *slog.Logg
 		if parsed, err := url.Parse(input.Body.Address); err != nil || parsed.Hostname() == "" {
 			return nil, huma.Error422UnprocessableEntity("address must include a hostname")
 		}
-		worker, err := queries.RegisterWorker(ctx, data.RegisterWorkerParams{
+		worker, err := registerWorker(ctx, pool, queries, data.RegisterWorkerParams{
 			ID:                uuid.New(),
 			Address:           input.Body.Address,
 			Browser:           input.Body.Browser,
@@ -180,12 +323,16 @@ func registerWorkerRoutes(api huma.API, queries *data.Queries, logger *slog.Logg
 	})
 
 	type heartbeatInput struct {
-		ID uuid.UUID `path:"id" format:"uuid" doc:"Worker ID"`
+		ID   uuid.UUID `path:"id" format:"uuid" doc:"Worker ID"`
+		Body struct {
+			ActiveSessionIDs []uuid.UUID `json:"active_session_ids" nullable:"false" format:"uuid"`
+		}
 	}
 	type heartbeatOutput struct {
 		Body struct {
-			Status   data.WorkerStatus `json:"status" enum:"available,draining,stalled,shutting_down"`
-			Commands []string          `json:"commands" nullable:"false"`
+			Status          data.WorkerStatus `json:"status" enum:"available,draining,stalled,shutting_down"`
+			Commands        []string          `json:"commands" nullable:"false"`
+			StaleSessionIDs []uuid.UUID       `json:"stale_session_ids" nullable:"false" format:"uuid"`
 		}
 	}
 	huma.Register(api, huma.Operation{
@@ -200,16 +347,36 @@ func registerWorkerRoutes(api huma.API, queries *data.Queries, logger *slog.Logg
 			http.StatusServiceUnavailable,
 		},
 	}, func(ctx context.Context, input *heartbeatInput) (*heartbeatOutput, error) {
-		worker, err := queries.UpdateWorkerHeartbeat(ctx, input.ID)
+		var worker data.Worker
+		staleIDs := []uuid.UUID{}
+		failedIDs := []uuid.UUID{}
+		var err error
+		if sessionScheduler == nil {
+			worker, err = queries.UpdateWorkerHeartbeat(ctx, input.ID)
+		} else {
+			worker, staleIDs, failedIDs, err = sessionScheduler.Heartbeat(
+				ctx,
+				input.ID,
+				input.Body.ActiveSessionIDs,
+			)
+		}
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, huma.Error404NotFound("worker not found")
 		}
 		if err != nil {
 			return nil, internalError(logger, "heartbeat worker", err)
 		}
+		if len(failedIDs) > 0 {
+			logger.Warn(
+				"worker lost sessions",
+				"worker_id", worker.ID,
+				"session_ids", failedIDs,
+			)
+		}
 		output := &heartbeatOutput{}
 		output.Body.Status = worker.Status
 		output.Body.Commands = []string{}
+		output.Body.StaleSessionIDs = staleIDs
 		return output, nil
 	})
 
@@ -249,6 +416,40 @@ func registerWorkerRoutes(api huma.API, queries *data.Queries, logger *slog.Logg
 		}
 		return &workerOutput{Body: workerFromData(worker)}, nil
 	})
+}
+
+func registerWorker(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	queries *data.Queries,
+	params data.RegisterWorkerParams,
+) (_ data.Worker, err error) {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return data.Worker{}, fmt.Errorf("beginning worker registration: %w", err)
+	}
+	defer rollbackTransaction(ctx, tx, &err)
+	txQueries := queries.WithTx(tx)
+
+	worker, err := txQueries.RegisterWorker(ctx, params)
+	if err != nil {
+		return data.Worker{}, fmt.Errorf("inserting worker registration: %w", err)
+	}
+	if err := txQueries.NotifyCapacityChanged(ctx); err != nil {
+		return data.Worker{}, fmt.Errorf("notifying worker capacity: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return data.Worker{}, fmt.Errorf("committing worker registration: %w", err)
+	}
+	return worker, nil
+}
+
+func rollbackTransaction(ctx context.Context, tx pgx.Tx, err *error) {
+	rollbackErr := tx.Rollback(ctx)
+	if rollbackErr == nil || errors.Is(rollbackErr, pgx.ErrTxClosed) {
+		return
+	}
+	*err = errors.Join(*err, fmt.Errorf("rolling back transaction: %w", rollbackErr))
 }
 
 func registerInfrastructureRoutes(api huma.API, pool *pgxpool.Pool, logger *slog.Logger) {

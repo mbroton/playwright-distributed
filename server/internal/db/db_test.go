@@ -1,6 +1,7 @@
 package db_test
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"reflect"
@@ -291,23 +292,20 @@ func TestQueries(t *testing.T) {
 	}
 	assertJSONEqual(t, "GetSession().ConnectMetadata", gotSession.ConnectMetadata, metadata)
 
-	gotSession, err = queries.SetSessionStatus(t.Context(), data.SetSessionStatusParams{
-		ID:     sessionID,
-		Status: data.SessionStatusRunning,
-	})
+	gotSession, err = queries.StartSession(t.Context(), sessionID)
 	if err != nil {
-		t.Fatalf("SetSessionStatus() returned an error: %v", err)
+		t.Fatalf("StartSession() returned an error: %v", err)
 	}
 	if gotSession.Status != data.SessionStatusRunning {
-		t.Fatalf("SetSessionStatus().Status = %q, want %q", gotSession.Status, data.SessionStatusRunning)
+		t.Fatalf("StartSession().Status = %q, want %q", gotSession.Status, data.SessionStatusRunning)
+	}
+	if gotSession.ExpiresAt != nil {
+		t.Fatalf("StartSession().ExpiresAt = %v, want nil", gotSession.ExpiresAt)
 	}
 
-	_, err = queries.SetSessionStatus(t.Context(), data.SetSessionStatusParams{
-		ID:     uuid.New(),
-		Status: data.SessionStatusRunning,
-	})
+	_, err = queries.StartSession(t.Context(), uuid.New())
 	if !errors.Is(err, pgx.ErrNoRows) {
-		t.Fatalf("SetSessionStatus() for missing id error = %v, want %v", err, pgx.ErrNoRows)
+		t.Fatalf("StartSession() for missing id error = %v, want %v", err, pgx.ErrNoRows)
 	}
 
 	renewBefore := databaseTime(t, pool)
@@ -317,6 +315,51 @@ func TestQueries(t *testing.T) {
 	}
 	renewAfter := databaseTime(t, pool)
 	assertTimeBetween(t, "RenewSessionHeartbeat().LastHeartbeat", gotSession.LastHeartbeat, renewBefore, renewAfter)
+
+	capacityListener, err := pool.Acquire(t.Context())
+	if err != nil {
+		t.Fatalf("acquiring capacity listener: %v", err)
+	}
+	defer capacityListener.Release()
+	if _, err := capacityListener.Exec(t.Context(), "LISTEN capacity_changed"); err != nil {
+		t.Fatalf("listening for capacity changes: %v", err)
+	}
+
+	completed, err := queries.CompleteSession(t.Context(), sessionID)
+	if err != nil {
+		t.Fatalf("CompleteSession() returned an error: %v", err)
+	}
+	if completed.Status != data.SessionStatusCompleted {
+		t.Fatalf("CompleteSession().Status = %q, want %q", completed.Status, data.SessionStatusCompleted)
+	}
+	notificationCtx, cancelNotification := context.WithTimeout(t.Context(), time.Second)
+	defer cancelNotification()
+	if _, err := capacityListener.Conn().WaitForNotification(notificationCtx); err != nil {
+		t.Fatalf("waiting for CompleteSession() capacity notification: %v", err)
+	}
+	if _, err := queries.RenewSessionHeartbeat(t.Context(), sessionID); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("RenewSessionHeartbeat() for completed session error = %v, want %v", err, pgx.ErrNoRows)
+	}
+
+	expiredSessionID := testUUID(4)
+	_, err = queries.InsertSession(t.Context(), data.InsertSessionParams{
+		ID:                expiredSessionID,
+		WorkerID:          workerID,
+		Browser:           "chromium",
+		PlaywrightVersion: "1.58.2",
+		WorkerAddress:     "ws://worker:3000",
+		Mode:              data.SessionModeDefault,
+		Status:            data.SessionStatusExpired,
+	})
+	if err != nil {
+		t.Fatalf("InsertSession(expired) returned an error: %v", err)
+	}
+	if _, err := queries.CompleteSession(t.Context(), expiredSessionID); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("CompleteSession() for expired session error = %v, want %v", err, pgx.ErrNoRows)
+	}
+	if _, err := pool.Exec(t.Context(), "DELETE FROM sessions WHERE id = $1", expiredSessionID); err != nil {
+		t.Fatalf("deleting expired transition test session: %v", err)
+	}
 
 	sessions, err := queries.ListSessionsByWorker(t.Context(), data.ListSessionsByWorkerParams{
 		WorkerID:   workerID,

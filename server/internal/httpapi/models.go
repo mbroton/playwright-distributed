@@ -38,6 +38,28 @@ type Session struct {
 	ConnectMetadata   map[string]any     `json:"connect_metadata"`
 }
 
+type BrowserCapacity struct {
+	Browser        string `json:"browser"`
+	Workers        int64  `json:"workers"`
+	MaxSlots       int64  `json:"max_slots"`
+	ActiveSessions int64  `json:"active_sessions"`
+	AvailableSlots int64  `json:"available_slots"`
+}
+
+type CapacityTotals struct {
+	Workers        int64 `json:"workers"`
+	MaxSlots       int64 `json:"max_slots"`
+	ActiveSessions int64 `json:"active_sessions"`
+	AvailableSlots int64 `json:"available_slots"`
+}
+
+type Capacity struct {
+	Browsers     []BrowserCapacity `json:"browsers" nullable:"false"`
+	Totals       CapacityTotals    `json:"totals"`
+	Queued       int               `json:"queued" doc:"Queue depth on this server replica."`
+	MaxQueueSize int               `json:"max_queue_size"`
+}
+
 func workerFromData(worker data.Worker) Worker {
 	return Worker{
 		ID:                worker.ID,

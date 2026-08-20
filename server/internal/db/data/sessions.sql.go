@@ -13,6 +13,59 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const completeSession = `-- name: CompleteSession :one
+WITH updated AS (
+    UPDATE sessions
+    SET status = 'completed'
+    WHERE id = $1
+      AND status = 'running'
+    RETURNING sessions.id, sessions.worker_id, sessions.browser, sessions.playwright_version, sessions.worker_address, sessions.mode, sessions.status, sessions.created_by_key, sessions.created_at, sessions.expires_at, sessions.last_heartbeat, sessions.keep_alive_ms, sessions.connect_metadata
+), notified AS (
+    SELECT pg_notify('capacity_changed', '')
+    FROM updated
+)
+SELECT updated.id, updated.worker_id, updated.browser, updated.playwright_version, updated.worker_address, updated.mode, updated.status, updated.created_by_key, updated.created_at, updated.expires_at, updated.last_heartbeat, updated.keep_alive_ms, updated.connect_metadata
+FROM updated
+CROSS JOIN notified
+`
+
+type CompleteSessionRow struct {
+	ID                uuid.UUID
+	WorkerID          uuid.UUID
+	Browser           string
+	PlaywrightVersion string
+	WorkerAddress     string
+	Mode              SessionMode
+	Status            SessionStatus
+	CreatedByKey      *uuid.UUID
+	CreatedAt         time.Time
+	ExpiresAt         *time.Time
+	LastHeartbeat     time.Time
+	KeepAliveMs       pgtype.Int4
+	ConnectMetadata   []byte
+}
+
+func (q *Queries) CompleteSession(ctx context.Context, id uuid.UUID) (CompleteSessionRow, error) {
+	row := q.db.QueryRow(ctx, completeSession, id)
+	var i CompleteSessionRow
+	err := row.Scan(
+		&i.ID,
+		&i.WorkerID,
+		&i.Browser,
+		&i.PlaywrightVersion,
+		&i.WorkerAddress,
+		&i.Mode,
+		&i.Status,
+		&i.CreatedByKey,
+		&i.CreatedAt,
+		&i.ExpiresAt,
+		&i.LastHeartbeat,
+		&i.KeepAliveMs,
+		&i.ConnectMetadata,
+	)
+	return i, err
+}
+
 const countRunningSessionsByWorker = `-- name: CountRunningSessionsByWorker :one
 SELECT count(*)
 FROM sessions
@@ -27,6 +80,131 @@ func (q *Queries) CountRunningSessionsByWorker(ctx context.Context, workerID uui
 	return count, err
 }
 
+const expireDeadSessions = `-- name: ExpireDeadSessions :many
+UPDATE sessions
+SET status = 'expired'
+WHERE status IN ('pending', 'running')
+  AND (
+      last_heartbeat < now() - $1::bigint * interval '1 microsecond'
+      OR (expires_at IS NOT NULL AND expires_at < now())
+  )
+RETURNING id, worker_id
+`
+
+type ExpireDeadSessionsRow struct {
+	ID       uuid.UUID
+	WorkerID uuid.UUID
+}
+
+func (q *Queries) ExpireDeadSessions(ctx context.Context, sessionTtlMicroseconds int64) ([]ExpireDeadSessionsRow, error) {
+	rows, err := q.db.Query(ctx, expireDeadSessions, sessionTtlMicroseconds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ExpireDeadSessionsRow
+	for rows.Next() {
+		var i ExpireDeadSessionsRow
+		if err := rows.Scan(&i.ID, &i.WorkerID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const failSession = `-- name: FailSession :one
+WITH updated AS (
+    UPDATE sessions
+    SET status = 'failed'
+    WHERE id = $1
+      AND status IN ('pending', 'running')
+    RETURNING sessions.id, sessions.worker_id, sessions.browser, sessions.playwright_version, sessions.worker_address, sessions.mode, sessions.status, sessions.created_by_key, sessions.created_at, sessions.expires_at, sessions.last_heartbeat, sessions.keep_alive_ms, sessions.connect_metadata
+), notified AS (
+    SELECT pg_notify('capacity_changed', '')
+    FROM updated
+)
+SELECT updated.id, updated.worker_id, updated.browser, updated.playwright_version, updated.worker_address, updated.mode, updated.status, updated.created_by_key, updated.created_at, updated.expires_at, updated.last_heartbeat, updated.keep_alive_ms, updated.connect_metadata
+FROM updated
+CROSS JOIN notified
+`
+
+type FailSessionRow struct {
+	ID                uuid.UUID
+	WorkerID          uuid.UUID
+	Browser           string
+	PlaywrightVersion string
+	WorkerAddress     string
+	Mode              SessionMode
+	Status            SessionStatus
+	CreatedByKey      *uuid.UUID
+	CreatedAt         time.Time
+	ExpiresAt         *time.Time
+	LastHeartbeat     time.Time
+	KeepAliveMs       pgtype.Int4
+	ConnectMetadata   []byte
+}
+
+func (q *Queries) FailSession(ctx context.Context, id uuid.UUID) (FailSessionRow, error) {
+	row := q.db.QueryRow(ctx, failSession, id)
+	var i FailSessionRow
+	err := row.Scan(
+		&i.ID,
+		&i.WorkerID,
+		&i.Browser,
+		&i.PlaywrightVersion,
+		&i.WorkerAddress,
+		&i.Mode,
+		&i.Status,
+		&i.CreatedByKey,
+		&i.CreatedAt,
+		&i.ExpiresAt,
+		&i.LastHeartbeat,
+		&i.KeepAliveMs,
+		&i.ConnectMetadata,
+	)
+	return i, err
+}
+
+const failUnreportedWorkerSessions = `-- name: FailUnreportedWorkerSessions :many
+UPDATE sessions
+SET status = 'failed'
+WHERE worker_id = $1
+  AND status = 'running'
+  AND created_at < now() - $2::bigint * interval '1 microsecond'
+  AND id != ALL($3::uuid[])
+RETURNING id
+`
+
+type FailUnreportedWorkerSessionsParams struct {
+	WorkerID          uuid.UUID
+	GraceMicroseconds int64
+	ActiveSessionIds  []uuid.UUID
+}
+
+func (q *Queries) FailUnreportedWorkerSessions(ctx context.Context, arg FailUnreportedWorkerSessionsParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, failUnreportedWorkerSessions, arg.WorkerID, arg.GraceMicroseconds, arg.ActiveSessionIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const getSession = `-- name: GetSession :one
 SELECT id, worker_id, browser, playwright_version, worker_address, mode, status, created_by_key, created_at, expires_at, last_heartbeat, keep_alive_ms, connect_metadata
 FROM sessions
@@ -35,6 +213,76 @@ WHERE id = $1
 
 func (q *Queries) GetSession(ctx context.Context, id uuid.UUID) (Session, error) {
 	row := q.db.QueryRow(ctx, getSession, id)
+	var i Session
+	err := row.Scan(
+		&i.ID,
+		&i.WorkerID,
+		&i.Browser,
+		&i.PlaywrightVersion,
+		&i.WorkerAddress,
+		&i.Mode,
+		&i.Status,
+		&i.CreatedByKey,
+		&i.CreatedAt,
+		&i.ExpiresAt,
+		&i.LastHeartbeat,
+		&i.KeepAliveMs,
+		&i.ConnectMetadata,
+	)
+	return i, err
+}
+
+const insertClaimedSession = `-- name: InsertClaimedSession :one
+INSERT INTO sessions (
+    id,
+    worker_id,
+    browser,
+    playwright_version,
+    worker_address,
+    mode,
+    status,
+    created_by_key,
+    expires_at,
+    last_heartbeat,
+    connect_metadata
+) VALUES (
+    $1,
+    $2,
+    $3,
+    $4,
+    $5,
+    'default',
+    'pending',
+    $6,
+    now() + $7::bigint * interval '1 microsecond',
+    now(),
+    COALESCE($8::jsonb, '{}'::jsonb)
+)
+RETURNING id, worker_id, browser, playwright_version, worker_address, mode, status, created_by_key, created_at, expires_at, last_heartbeat, keep_alive_ms, connect_metadata
+`
+
+type InsertClaimedSessionParams struct {
+	ID                     uuid.UUID
+	WorkerID               uuid.UUID
+	Browser                string
+	PlaywrightVersion      string
+	WorkerAddress          string
+	CreatedByKey           *uuid.UUID
+	PendingTtlMicroseconds int64
+	ConnectMetadata        []byte
+}
+
+func (q *Queries) InsertClaimedSession(ctx context.Context, arg InsertClaimedSessionParams) (Session, error) {
+	row := q.db.QueryRow(ctx, insertClaimedSession,
+		arg.ID,
+		arg.WorkerID,
+		arg.Browser,
+		arg.PlaywrightVersion,
+		arg.WorkerAddress,
+		arg.CreatedByKey,
+		arg.PendingTtlMicroseconds,
+		arg.ConnectMetadata,
+	)
 	var i Session
 	err := row.Scan(
 		&i.ID,
@@ -180,10 +428,47 @@ func (q *Queries) ListSessionsByWorker(ctx context.Context, arg ListSessionsByWo
 	return items, nil
 }
 
+const listStaleWorkerSessionIDs = `-- name: ListStaleWorkerSessionIDs :many
+SELECT reported_id::uuid
+FROM unnest($1::uuid[]) AS reported(reported_id)
+EXCEPT
+SELECT id
+FROM sessions
+WHERE worker_id = $2
+  AND status IN ('pending', 'running')
+ORDER BY 1
+`
+
+type ListStaleWorkerSessionIDsParams struct {
+	ActiveSessionIds []uuid.UUID
+	WorkerID         uuid.UUID
+}
+
+func (q *Queries) ListStaleWorkerSessionIDs(ctx context.Context, arg ListStaleWorkerSessionIDsParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listStaleWorkerSessionIDs, arg.ActiveSessionIds, arg.WorkerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []uuid.UUID
+	for rows.Next() {
+		var reported_id uuid.UUID
+		if err := rows.Scan(&reported_id); err != nil {
+			return nil, err
+		}
+		items = append(items, reported_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const renewSessionHeartbeat = `-- name: RenewSessionHeartbeat :one
 UPDATE sessions
 SET last_heartbeat = now()
 WHERE id = $1
+  AND status = 'running'
 RETURNING id, worker_id, browser, playwright_version, worker_address, mode, status, created_by_key, created_at, expires_at, last_heartbeat, keep_alive_ms, connect_metadata
 `
 
@@ -208,20 +493,19 @@ func (q *Queries) RenewSessionHeartbeat(ctx context.Context, id uuid.UUID) (Sess
 	return i, err
 }
 
-const setSessionStatus = `-- name: SetSessionStatus :one
+const startSession = `-- name: StartSession :one
 UPDATE sessions
-SET status = $2
+SET status = 'running',
+    last_heartbeat = now(),
+    expires_at = NULL
 WHERE id = $1
+  AND status = 'pending'
 RETURNING id, worker_id, browser, playwright_version, worker_address, mode, status, created_by_key, created_at, expires_at, last_heartbeat, keep_alive_ms, connect_metadata
 `
 
-type SetSessionStatusParams struct {
-	ID     uuid.UUID
-	Status SessionStatus
-}
-
-func (q *Queries) SetSessionStatus(ctx context.Context, arg SetSessionStatusParams) (Session, error) {
-	row := q.db.QueryRow(ctx, setSessionStatus, arg.ID, arg.Status)
+// StartSession is intentionally unused until the PR 4 relay attaches sessions.
+func (q *Queries) StartSession(ctx context.Context, id uuid.UUID) (Session, error) {
+	row := q.db.QueryRow(ctx, startSession, id)
 	var i Session
 	err := row.Scan(
 		&i.ID,
