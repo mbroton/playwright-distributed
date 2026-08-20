@@ -1,3 +1,5 @@
+-- TEST ONLY: this bypasses the worker lock and capacity invariant. Production
+-- session inserts must use InsertClaimedSession while holding the worker row lock.
 -- name: InsertSession :one
 INSERT INTO sessions (
     id,
@@ -37,6 +39,7 @@ WHERE id = $1;
 -- name: StartSession :one
 UPDATE sessions
 SET status = 'running',
+    started_at = now(),
     last_heartbeat = now(),
     expires_at = NULL
 WHERE id = $1
@@ -129,7 +132,8 @@ UPDATE sessions
 SET status = 'failed'
 WHERE worker_id = sqlc.arg(worker_id)
   AND status = 'running'
-  AND created_at < now() - sqlc.arg(grace_microseconds)::bigint * interval '1 microsecond'
+  AND started_at IS NOT NULL
+  AND started_at < now() - sqlc.arg(grace_microseconds)::bigint * interval '1 microsecond'
   AND id != ALL(sqlc.arg(active_session_ids)::uuid[])
 RETURNING id;
 

@@ -8,6 +8,7 @@ import (
 	"math/rand/v2"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -29,7 +30,6 @@ type Summary struct {
 
 type Rescuer struct {
 	pool    *pgxpool.Pool
-	queries *data.Queries
 	logger  *slog.Logger
 	options Options
 }
@@ -37,7 +37,6 @@ type Rescuer struct {
 func New(pool *pgxpool.Pool, logger *slog.Logger, options Options) *Rescuer {
 	return &Rescuer{
 		pool:    pool,
-		queries: data.New(pool),
 		logger:  logger,
 		options: options,
 	}
@@ -74,36 +73,18 @@ func (r *Rescuer) Run(ctx context.Context) {
 	}
 }
 
-func (r *Rescuer) Sweep(ctx context.Context) (_ Summary, err error) {
-	tx, err := r.pool.Begin(ctx)
+func (r *Rescuer) Sweep(ctx context.Context) (Summary, error) {
+	stalledWorkers, err := r.stallSilentWorkers(ctx)
 	if err != nil {
-		return Summary{}, fmt.Errorf("beginning rescuer sweep: %w", err)
+		return Summary{}, err
 	}
-	defer rollback(ctx, tx, &err)
-	queries := r.queries.WithTx(tx)
-
-	stalledWorkers, err := queries.StallSilentWorkers(ctx, r.options.WorkerTTL.Microseconds())
+	expiredSessions, err := r.expireDeadSessions(ctx)
 	if err != nil {
-		return Summary{}, fmt.Errorf("stalling silent workers: %w", err)
+		return Summary{}, err
 	}
-	expiredSessions, err := queries.ExpireDeadSessions(ctx, r.options.SessionTTL.Microseconds())
+	removedWorkers, err := r.deleteDeadWorkers(ctx)
 	if err != nil {
-		return Summary{}, fmt.Errorf("expiring dead sessions: %w", err)
-	}
-	if len(expiredSessions) > 0 {
-		if err := queries.NotifyCapacityChanged(ctx); err != nil {
-			return Summary{}, fmt.Errorf("notifying expired session capacity: %w", err)
-		}
-	}
-	removedWorkers, err := queries.DeleteDeadWorkers(ctx, data.DeleteDeadWorkersParams{
-		WorkerTtlMicroseconds:        r.options.WorkerTTL.Microseconds(),
-		StalledWorkerTtlMicroseconds: r.options.StalledWorkerTTL.Microseconds(),
-	})
-	if err != nil {
-		return Summary{}, fmt.Errorf("deleting dead workers: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return Summary{}, fmt.Errorf("committing rescuer sweep: %w", err)
+		return Summary{}, err
 	}
 
 	return Summary{
@@ -111,6 +92,68 @@ func (r *Rescuer) Sweep(ctx context.Context) (_ Summary, err error) {
 		ExpiredSessions: len(expiredSessions),
 		RemovedWorkers:  len(removedWorkers),
 	}, nil
+}
+
+func (r *Rescuer) stallSilentWorkers(ctx context.Context) (_ int64, err error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("beginning stall sweep: %w", err)
+	}
+	defer rollback(ctx, tx, &err)
+	queries := data.New(tx)
+
+	stalledWorkers, err := queries.StallSilentWorkers(ctx, r.options.WorkerTTL.Microseconds())
+	if err != nil {
+		return 0, fmt.Errorf("stalling silent workers: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("committing stall sweep: %w", err)
+	}
+	return stalledWorkers, nil
+}
+
+func (r *Rescuer) expireDeadSessions(ctx context.Context) (_ []data.ExpireDeadSessionsRow, err error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("beginning session expiry sweep: %w", err)
+	}
+	defer rollback(ctx, tx, &err)
+	queries := data.New(tx)
+
+	expiredSessions, err := queries.ExpireDeadSessions(ctx, r.options.SessionTTL.Microseconds())
+	if err != nil {
+		return nil, fmt.Errorf("expiring dead sessions: %w", err)
+	}
+	if len(expiredSessions) > 0 {
+		if err := queries.NotifyCapacityChanged(ctx); err != nil {
+			return nil, fmt.Errorf("notifying expired session capacity: %w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("committing session expiry sweep: %w", err)
+	}
+	return expiredSessions, nil
+}
+
+func (r *Rescuer) deleteDeadWorkers(ctx context.Context) (_ []uuid.UUID, err error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("beginning worker deletion sweep: %w", err)
+	}
+	defer rollback(ctx, tx, &err)
+	queries := data.New(tx)
+
+	removedWorkers, err := queries.DeleteDeadWorkers(ctx, data.DeleteDeadWorkersParams{
+		WorkerTtlMicroseconds:        r.options.WorkerTTL.Microseconds(),
+		StalledWorkerTtlMicroseconds: r.options.StalledWorkerTTL.Microseconds(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("deleting dead workers: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("committing worker deletion sweep: %w", err)
+	}
+	return removedWorkers, nil
 }
 
 func jitter(interval time.Duration) time.Duration {

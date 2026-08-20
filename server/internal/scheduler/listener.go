@@ -33,18 +33,27 @@ func RunListener(ctx context.Context, pool *pgxpool.Pool, waker *Waker, logger *
 	}
 }
 
-func listen(ctx context.Context, pool *pgxpool.Pool, waker *Waker) (bool, error) {
-	connection, err := pool.Acquire(ctx)
+func listen(ctx context.Context, pool *pgxpool.Pool, waker *Waker) (connected bool, err error) {
+	pooledConnection, err := pool.Acquire(ctx)
 	if err != nil {
 		return false, fmt.Errorf("acquiring listener connection: %w", err)
 	}
-	defer connection.Release()
+	// LISTEN is session state. Hijack the connection so no still-listening
+	// connection can return to the pool after an error or cancellation.
+	connection := pooledConnection.Hijack()
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if closeErr := connection.Close(closeCtx); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("closing listener connection: %w", closeErr))
+		}
+	}()
 
 	if _, err := connection.Exec(ctx, "LISTEN capacity_changed"); err != nil {
 		return false, fmt.Errorf("subscribing to capacity changes: %w", err)
 	}
 	for {
-		if _, err := connection.Conn().WaitForNotification(ctx); err != nil {
+		if _, err := connection.WaitForNotification(ctx); err != nil {
 			if errors.Is(err, context.Canceled) {
 				return true, nil
 			}

@@ -4,6 +4,7 @@ components:
       additionalProperties: false
       properties:
         active_sessions:
+          description: Fleet-wide active sessions, including sessions on ineligible workers.
           format: int64
           type: integer
         available_slots:
@@ -50,6 +51,7 @@ components:
       additionalProperties: false
       properties:
         active_sessions:
+          description: Fleet-wide active sessions, including sessions on ineligible workers.
           format: int64
           type: integer
         available_slots:
@@ -245,6 +247,11 @@ components:
           type: string
         playwright_version:
           type: string
+        started_at:
+          format: date-time
+          type:
+            - string
+            - "null"
         status:
           enum:
             - pending
@@ -267,6 +274,7 @@ components:
         - mode
         - status
         - created_at
+        - started_at
         - last_heartbeat
         - connect_metadata
       type: object

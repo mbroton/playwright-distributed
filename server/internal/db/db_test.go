@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -298,6 +299,9 @@ func TestQueries(t *testing.T) {
 	}
 	if gotSession.Status != data.SessionStatusRunning {
 		t.Fatalf("StartSession().Status = %q, want %q", gotSession.Status, data.SessionStatusRunning)
+	}
+	if gotSession.StartedAt == nil {
+		t.Fatal("StartSession().StartedAt is nil")
 	}
 	if gotSession.ExpiresAt != nil {
 		t.Fatalf("StartSession().ExpiresAt = %v, want nil", gotSession.ExpiresAt)
@@ -661,6 +665,16 @@ func TestCountRunningSessionsByWorker(t *testing.T) {
 	}
 	if countB != 1 {
 		t.Fatalf("CountRunningSessionsByWorker(worker B) = %d, want 1", countB)
+	}
+}
+
+func TestOpen_RejectsPoolTooSmallForListener(t *testing.T) {
+	_, err := db.Open(
+		t.Context(),
+		"postgres://server_test:server_test@localhost/server_test?pool_max_conns=1",
+	)
+	if err == nil || !strings.Contains(err.Error(), "max_conns must be at least 2") {
+		t.Fatalf("Open() error = %v, want minimum pool size error", err)
 	}
 }
 

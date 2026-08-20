@@ -5,6 +5,9 @@ export type ClientOptions = {
 };
 
 export type BrowserCapacity = {
+    /**
+     * Fleet-wide active sessions, including sessions on ineligible workers.
+     */
     active_sessions: number;
     available_slots: number;
     browser: string;
@@ -23,6 +26,9 @@ export type Capacity = {
 };
 
 export type CapacityTotals = {
+    /**
+     * Fleet-wide active sessions, including sessions on ineligible workers.
+     */
     active_sessions: number;
     available_slots: number;
     max_slots: number;
@@ -113,6 +119,7 @@ export type Session = {
     last_heartbeat: string;
     mode: 'default' | 'dedicated';
     playwright_version: string;
+    started_at: string | null;
     status: 'pending' | 'running' | 'completed' | 'failed' | 'expired';
     worker_address: string;
     worker_id: string;

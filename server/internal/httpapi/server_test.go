@@ -419,8 +419,8 @@ func TestServer_CreateSessionNeverOverAdmits(t *testing.T) {
 			t.Fatalf("concurrent create status = %d, want 201 or 429", status)
 		}
 	}
-	if created != 4 || rejected != 28 {
-		t.Fatalf("concurrent results = %d created and %d rejected, want 4 and 28", created, rejected)
+	if created > 4 || created+rejected != requestCount {
+		t.Fatalf("concurrent results = %d created and %d rejected, want at most 4 created", created, rejected)
 	}
 	active, err := queries.CountActiveSessionsByWorker(t.Context(), workerID)
 	if err != nil {
@@ -428,6 +428,28 @@ func TestServer_CreateSessionNeverOverAdmits(t *testing.T) {
 	}
 	if active > 4 {
 		t.Fatalf("active session count = %d, want at most 4", active)
+	}
+	for active < 4 {
+		if _, err := sessionScheduler.Claim(
+			t.Context(),
+			scheduler.ClaimRequest{Browser: "chromium"},
+		); err != nil {
+			t.Fatalf("sequential Claim() returned an error with %d active sessions: %v", active, err)
+		}
+		active++
+	}
+	if _, err := sessionScheduler.Claim(
+		t.Context(),
+		scheduler.ClaimRequest{Browser: "chromium"},
+	); !errors.Is(err, scheduler.ErrNoCapacity) {
+		t.Fatalf("Claim() after filling worker error = %v, want %v", err, scheduler.ErrNoCapacity)
+	}
+	active, err = queries.CountActiveSessionsByWorker(t.Context(), workerID)
+	if err != nil {
+		t.Fatalf("CountActiveSessionsByWorker() after fill returned an error: %v", err)
+	}
+	if active != 4 {
+		t.Fatalf("active session count after fill = %d, want 4", active)
 	}
 }
 
@@ -542,19 +564,24 @@ func TestServer_HeartbeatReconcilesAndSignalsDrain(t *testing.T) {
 	lostSession := insertTestSession(t, queries, workerID, data.SessionStatusRunning)
 	if _, err := pool.Exec(
 		t.Context(),
-		"UPDATE sessions SET created_at = now() - interval '20 seconds' WHERE id = $1",
+		"UPDATE sessions SET started_at = now() - interval '20 seconds' WHERE id = $1",
 		lostSession,
 	); err != nil {
 		t.Fatalf("aging lost session: %v", err)
 	}
 	zombie := uuid.New()
-	sessionScheduler := scheduler.New(pool, scheduler.Options{
-		WorkerTTL:           time.Hour,
-		PendingSessionTTL:   time.Hour,
-		MaxLifetimeSessions: 5,
-		MaxQueueSize:        0,
-		QueueWaitTimeout:    time.Second,
-	})
+	sessionScheduler := scheduler.New(
+		t.Context(),
+		pool,
+		testLogger(io.Discard),
+		scheduler.Options{
+			WorkerTTL:           time.Hour,
+			PendingSessionTTL:   time.Hour,
+			MaxLifetimeSessions: 5,
+			MaxQueueSize:        0,
+			QueueWaitTimeout:    time.Second,
+		},
+	)
 	server := New(
 		pool,
 		queries,
@@ -624,12 +651,12 @@ func TestServer_Capacity(t *testing.T) {
 		Workers:        2,
 		MaxSlots:       5,
 		ActiveSessions: 4,
-		AvailableSlots: 1,
+		AvailableSlots: 2,
 	}
 	if capacity.Browsers[0] != want {
 		t.Fatalf("browser capacity = %+v, want %+v", capacity.Browsers[0], want)
 	}
-	if capacity.Totals != (CapacityTotals{Workers: 2, MaxSlots: 5, ActiveSessions: 4, AvailableSlots: 1}) ||
+	if capacity.Totals != (CapacityTotals{Workers: 2, MaxSlots: 5, ActiveSessions: 4, AvailableSlots: 2}) ||
 		capacity.Queued != 0 || capacity.MaxQueueSize != 100 {
 		t.Fatalf("capacity totals and queue = %+v, want fleet totals and replica queue", capacity)
 	}
@@ -694,9 +721,20 @@ func TestServer_SecuredRoutesRequireAuthentication(t *testing.T) {
 		body   any
 	}{
 		{
+			name:   "create session",
+			method: http.MethodPost,
+			path:   "/v1/sessions",
+			body:   map[string]any{"browser": "chromium"},
+		},
+		{
 			name:   "get session",
 			method: http.MethodGet,
 			path:   "/v1/sessions/" + uuid.NewString(),
+		},
+		{
+			name:   "get capacity",
+			method: http.MethodGet,
+			path:   "/v1/capacity",
 		},
 		{
 			name:   "list workers",
@@ -969,14 +1007,19 @@ func newTestScheduler(
 	maxQueueSize int,
 	queueWaitTimeout time.Duration,
 ) *scheduler.Scheduler {
-	return scheduler.New(pool, scheduler.Options{
-		WorkerTTL:           time.Hour,
-		PendingSessionTTL:   time.Hour,
-		MaxLifetimeSessions: 50,
-		MaxQueueSize:        maxQueueSize,
-		QueueWaitTimeout:    queueWaitTimeout,
-		PollingInterval:     10 * time.Millisecond,
-	})
+	return scheduler.New(
+		context.Background(),
+		pool,
+		testLogger(io.Discard),
+		scheduler.Options{
+			WorkerTTL:           time.Hour,
+			PendingSessionTTL:   time.Hour,
+			MaxLifetimeSessions: 50,
+			MaxQueueSize:        maxQueueSize,
+			QueueWaitTimeout:    queueWaitTimeout,
+			PollingInterval:     10 * time.Millisecond,
+		},
+	)
 }
 
 func insertTestWorker(

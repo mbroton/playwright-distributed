@@ -32,6 +32,7 @@ type Session struct {
 	Status            data.SessionStatus `json:"status" enum:"pending,running,completed,failed,expired"`
 	CreatedByKey      *uuid.UUID         `json:"created_by_key,omitempty" format:"uuid"`
 	CreatedAt         time.Time          `json:"created_at"`
+	StartedAt         *time.Time         `json:"started_at" nullable:"true"`
 	ExpiresAt         *time.Time         `json:"expires_at,omitempty"`
 	LastHeartbeat     time.Time          `json:"last_heartbeat"`
 	KeepAliveMs       *int32             `json:"keep_alive_ms,omitempty"`
@@ -42,14 +43,14 @@ type BrowserCapacity struct {
 	Browser        string `json:"browser"`
 	Workers        int64  `json:"workers"`
 	MaxSlots       int64  `json:"max_slots"`
-	ActiveSessions int64  `json:"active_sessions"`
+	ActiveSessions int64  `json:"active_sessions" doc:"Fleet-wide active sessions, including sessions on ineligible workers."`
 	AvailableSlots int64  `json:"available_slots"`
 }
 
 type CapacityTotals struct {
 	Workers        int64 `json:"workers"`
 	MaxSlots       int64 `json:"max_slots"`
-	ActiveSessions int64 `json:"active_sessions"`
+	ActiveSessions int64 `json:"active_sessions" doc:"Fleet-wide active sessions, including sessions on ineligible workers."`
 	AvailableSlots int64 `json:"available_slots"`
 }
 
@@ -96,6 +97,7 @@ func sessionFromData(session data.Session) (Session, error) {
 		Status:            session.Status,
 		CreatedByKey:      session.CreatedByKey,
 		CreatedAt:         session.CreatedAt,
+		StartedAt:         session.StartedAt,
 		ExpiresAt:         session.ExpiresAt,
 		LastHeartbeat:     session.LastHeartbeat,
 		KeepAliveMs:       keepAliveMs,

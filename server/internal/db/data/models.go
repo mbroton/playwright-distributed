@@ -164,6 +164,7 @@ type Session struct {
 	Status            SessionStatus
 	CreatedByKey      *uuid.UUID
 	CreatedAt         time.Time
+	StartedAt         *time.Time
 	ExpiresAt         *time.Time
 	LastHeartbeat     time.Time
 	KeepAliveMs       pgtype.Int4

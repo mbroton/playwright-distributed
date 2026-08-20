@@ -34,6 +34,9 @@ WHERE (
     ) OR (
         w.status = 'stalled'
         AND w.last_heartbeat < now() - $2::bigint * interval '1 microsecond'
+    ) OR (
+        w.status = 'draining'
+        AND w.last_heartbeat < now() - $2::bigint * interval '1 microsecond'
     )
   )
   AND NOT EXISTS (
@@ -81,18 +84,29 @@ func (q *Queries) DeleteWorker(ctx context.Context, id uuid.UUID) error {
 }
 
 const getCapacityByBrowser = `-- name: GetCapacityByBrowser :many
-WITH eligible AS (
+WITH eligible_workers AS (
+    SELECT
+        w.browser,
+        w.max_slots,
+        count(s.id) AS active_count
+    FROM workers AS w
+    LEFT JOIN sessions AS s
+      ON s.worker_id = w.id
+     AND s.status IN ('pending', 'running')
+    WHERE w.status = 'available'
+      AND w.last_heartbeat > now() - $1::bigint * interval '1 microsecond'
+      AND (
+          $2::bigint = 0
+          OR w.lifetime_sessions < $2::bigint
+      )
+    GROUP BY w.id
+), eligible AS (
     SELECT
         browser,
         count(*) AS workers,
-        COALESCE(sum(max_slots), 0)::bigint AS max_slots
-    FROM workers
-    WHERE status = 'available'
-      AND last_heartbeat > now() - $1::bigint * interval '1 microsecond'
-      AND (
-          $2::bigint = 0
-          OR lifetime_sessions < $2::bigint
-      )
+        COALESCE(sum(max_slots), 0)::bigint AS max_slots,
+        COALESCE(sum(GREATEST(max_slots::bigint - active_count, 0)), 0)::bigint AS available_slots
+    FROM eligible_workers
     GROUP BY browser
 ), active AS (
     SELECT browser, count(*) AS active_sessions
@@ -109,10 +123,7 @@ SELECT
     COALESCE(eligible.workers, 0)::bigint AS workers,
     COALESCE(eligible.max_slots, 0)::bigint AS max_slots,
     COALESCE(active.active_sessions, 0)::bigint AS active_sessions,
-    GREATEST(
-        COALESCE(eligible.max_slots, 0) - COALESCE(active.active_sessions, 0),
-        0
-    )::bigint AS available_slots
+    COALESCE(eligible.available_slots, 0)::bigint AS available_slots
 FROM browsers
 LEFT JOIN eligible USING (browser)
 LEFT JOIN active USING (browser)

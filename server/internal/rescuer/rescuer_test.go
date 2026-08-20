@@ -27,6 +27,9 @@ func TestRescuer_Sweep(t *testing.T) {
 
 	staleAvailable := insertWorker(t, pool, queries, data.WorkerStatusAvailable, time.Minute, 1)
 	staleDraining := insertWorker(t, pool, queries, data.WorkerStatusDraining, 20*time.Minute, 1)
+	youngDraining := insertWorker(t, pool, queries, data.WorkerStatusDraining, time.Minute, 1)
+	busyDraining := insertWorker(t, pool, queries, data.WorkerStatusDraining, 20*time.Minute, 1)
+	busyDrainingSession := insertSession(t, queries, busyDraining, data.SessionStatusRunning)
 	shuttingDown := insertWorker(t, pool, queries, data.WorkerStatusShuttingDown, time.Minute, 1)
 	deadStalled := insertWorker(t, pool, queries, data.WorkerStatusStalled, 20*time.Minute, 1)
 	busyStalled := insertWorker(t, pool, queries, data.WorkerStatusStalled, 20*time.Minute, 1)
@@ -55,11 +58,14 @@ func TestRescuer_Sweep(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Sweep() returned an error: %v", err)
 	}
-	if summary.StalledWorkers != 1 || summary.ExpiredSessions != 2 || summary.RemovedWorkers != 2 {
-		t.Fatalf("Sweep() = %+v, want 1 stalled, 2 expired, and 2 removed", summary)
+	if summary.StalledWorkers != 1 || summary.ExpiredSessions != 2 || summary.RemovedWorkers != 3 {
+		t.Fatalf("Sweep() = %+v, want 1 stalled, 2 expired, and 3 removed", summary)
 	}
 	assertWorkerStatus(t, queries, staleAvailable, data.WorkerStatusStalled)
-	assertWorkerStatus(t, queries, staleDraining, data.WorkerStatusDraining)
+	assertWorkerMissing(t, queries, staleDraining)
+	assertWorkerStatus(t, queries, youngDraining, data.WorkerStatusDraining)
+	assertWorkerStatus(t, queries, busyDraining, data.WorkerStatusDraining)
+	assertSessionStatus(t, queries, busyDrainingSession, data.SessionStatusRunning)
 	assertWorkerMissing(t, queries, shuttingDown)
 	assertWorkerMissing(t, queries, deadStalled)
 	assertWorkerStatus(t, queries, busyStalled, data.WorkerStatusStalled)
@@ -67,13 +73,18 @@ func TestRescuer_Sweep(t *testing.T) {
 	assertSessionStatus(t, queries, staleRunning, data.SessionStatusExpired)
 	assertSessionStatus(t, queries, expiredPending, data.SessionStatusExpired)
 
-	claimScheduler := scheduler.New(pool, scheduler.Options{
-		WorkerTTL:           time.Hour,
-		PendingSessionTTL:   time.Hour,
-		MaxLifetimeSessions: 50,
-		MaxQueueSize:        0,
-		QueueWaitTimeout:    time.Second,
-	})
+	claimScheduler := scheduler.New(
+		t.Context(),
+		pool,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		scheduler.Options{
+			WorkerTTL:           time.Hour,
+			PendingSessionTTL:   time.Hour,
+			MaxLifetimeSessions: 50,
+			MaxQueueSize:        0,
+			QueueWaitTimeout:    time.Second,
+		},
+	)
 	session, err := claimScheduler.Claim(t.Context(), scheduler.ClaimRequest{Browser: "chromium"})
 	if err != nil {
 		t.Fatalf("Claim() after rescue returned an error: %v", err)
@@ -87,14 +98,19 @@ func TestRescuer_FullCrashRecoveryLoop(t *testing.T) {
 	pool := newMigratedTestPool(t)
 	queries := data.New(pool)
 	insertWorker(t, pool, queries, data.WorkerStatusAvailable, 0, 1)
-	claimScheduler := scheduler.New(pool, scheduler.Options{
-		WorkerTTL:           time.Hour,
-		PendingSessionTTL:   time.Hour,
-		MaxLifetimeSessions: 50,
-		MaxQueueSize:        1,
-		QueueWaitTimeout:    2 * time.Second,
-		PollingInterval:     10 * time.Millisecond,
-	})
+	claimScheduler := scheduler.New(
+		t.Context(),
+		pool,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		scheduler.Options{
+			WorkerTTL:           time.Hour,
+			PendingSessionTTL:   time.Hour,
+			MaxLifetimeSessions: 50,
+			MaxQueueSize:        1,
+			QueueWaitTimeout:    2 * time.Second,
+			PollingInterval:     10 * time.Millisecond,
+		},
+	)
 	first, err := claimScheduler.Claim(t.Context(), scheduler.ClaimRequest{Browser: "chromium"})
 	if err != nil {
 		t.Fatalf("first Claim() returned an error: %v", err)

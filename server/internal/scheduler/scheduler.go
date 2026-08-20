@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -16,16 +18,17 @@ import (
 )
 
 const (
-	maxClaimAttempts       = 8
-	claimRetryDelay        = 5 * time.Millisecond
-	defaultPollingInterval = time.Second
-	reconciliationGrace    = 15 * time.Second
+	maxClaimAttempts           = 8
+	claimRetryDelay            = 5 * time.Millisecond
+	defaultPollingInterval     = time.Second
+	defaultReconciliationGrace = 15 * time.Second
 )
 
 var (
 	ErrNoCapacity  = errors.New("scheduler: no capacity")
 	ErrQueueFull   = errors.New("scheduler: queue full")
 	ErrWaitTimeout = errors.New("scheduler: queue wait timeout")
+	ErrDraining    = errors.New("scheduler: draining")
 )
 
 type Options struct {
@@ -35,6 +38,7 @@ type Options struct {
 	MaxQueueSize        int
 	QueueWaitTimeout    time.Duration
 	PollingInterval     time.Duration
+	ReconciliationGrace time.Duration
 }
 
 type ClaimRequest struct {
@@ -53,6 +57,8 @@ type Scheduler struct {
 	pool    *pgxpool.Pool
 	queries *data.Queries
 	waker   *Waker
+	logger  *slog.Logger
+	drain   <-chan struct{}
 
 	workerTTL           time.Duration
 	pendingSessionTTL   time.Duration
@@ -60,27 +66,43 @@ type Scheduler struct {
 	maxQueueSize        int
 	queueWaitTimeout    time.Duration
 	pollingInterval     time.Duration
+	reconciliationGrace time.Duration
 
 	queueMu sync.Mutex
 	queued  int
 }
 
-func New(pool *pgxpool.Pool, options Options) *Scheduler {
+func New(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	logger *slog.Logger,
+	options Options,
+) *Scheduler {
 	pollingInterval := options.PollingInterval
 	if pollingInterval <= 0 {
 		pollingInterval = defaultPollingInterval
+	}
+	reconciliationGrace := options.ReconciliationGrace
+	if reconciliationGrace == 0 {
+		reconciliationGrace = defaultReconciliationGrace
+	}
+	if logger == nil {
+		logger = slog.Default()
 	}
 
 	return &Scheduler{
 		pool:                pool,
 		queries:             data.New(pool),
 		waker:               NewWaker(),
+		logger:              logger,
+		drain:               ctx.Done(),
 		workerTTL:           options.WorkerTTL,
 		pendingSessionTTL:   options.PendingSessionTTL,
 		maxLifetimeSessions: options.MaxLifetimeSessions,
 		maxQueueSize:        options.MaxQueueSize,
 		queueWaitTimeout:    options.QueueWaitTimeout,
 		pollingInterval:     pollingInterval,
+		reconciliationGrace: reconciliationGrace,
 	}
 }
 
@@ -111,8 +133,16 @@ func (s *Scheduler) Claim(ctx context.Context, request ClaimRequest) (data.Sessi
 
 func (s *Scheduler) Admit(ctx context.Context, request ClaimRequest) (data.Session, error) {
 	session, err := s.Claim(ctx, request)
+	if err == nil {
+		return session, nil
+	}
 	if !errors.Is(err, ErrNoCapacity) {
-		return session, err
+		return data.Session{}, err
+	}
+	select {
+	case <-s.drain:
+		return data.Session{}, ErrDraining
+	default:
 	}
 	if !s.enterQueue() {
 		return data.Session{}, ErrQueueFull
@@ -123,29 +153,34 @@ func (s *Scheduler) Admit(ctx context.Context, request ClaimRequest) (data.Sessi
 	defer unsubscribe()
 	waitCtx, cancel := context.WithTimeout(ctx, s.queueWaitTimeout)
 	defer cancel()
-	ticker := time.NewTicker(s.pollingInterval)
-	defer ticker.Stop()
+	pollTimer := time.NewTimer(jitteredPollingInterval(s.pollingInterval))
+	defer pollTimer.Stop()
+	loggedClaimError := false
 
 	for {
-		session, err = s.Claim(waitCtx, request)
-		if waitCtx.Err() != nil {
-			if errors.Is(waitCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
-				return data.Session{}, ErrWaitTimeout
-			}
-			return data.Session{}, ctx.Err()
+		session, _, err = s.claimOnce(waitCtx, request, []uuid.UUID{})
+		if err == nil {
+			return session, nil
 		}
-		if !errors.Is(err, ErrNoCapacity) {
-			return session, err
+		if waitErr := s.queueWaitError(ctx, waitCtx); waitErr != nil {
+			return data.Session{}, waitErr
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return data.Session{}, err
+		}
+		if !errors.Is(err, ErrNoCapacity) && !loggedClaimError {
+			s.logger.Warn("queued session claim failed; waiting to retry", "error", err)
+			loggedClaimError = true
 		}
 
 		select {
 		case <-waitCtx.Done():
-			if errors.Is(waitCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
-				return data.Session{}, ErrWaitTimeout
-			}
-			return data.Session{}, ctx.Err()
+			return data.Session{}, s.queueWaitError(ctx, waitCtx)
+		case <-s.drain:
+			return data.Session{}, ErrDraining
 		case <-wake:
-		case <-ticker.C:
+		case <-pollTimer.C:
+			pollTimer.Reset(jitteredPollingInterval(s.pollingInterval))
 		}
 	}
 }
@@ -185,7 +220,7 @@ func (s *Scheduler) Heartbeat(
 
 	failedIDs, err := queries.FailUnreportedWorkerSessions(ctx, data.FailUnreportedWorkerSessionsParams{
 		WorkerID:          workerID,
-		GraceMicroseconds: reconciliationGrace.Microseconds(),
+		GraceMicroseconds: s.reconciliationGrace.Microseconds(),
 		ActiveSessionIds:  activeSessionIDs,
 	})
 	if err != nil {
@@ -247,7 +282,9 @@ func (s *Scheduler) claimOnce(
 	request ClaimRequest,
 	excluded []uuid.UUID,
 ) (_ data.Session, fullWorkerID *uuid.UUID, err error) {
-	tx, err := s.pool.Begin(ctx)
+	// Capacity invariant: READ COMMITTED gives the recount a fresh snapshot after
+	// the worker row lock. Production inserts hold that lock until commit.
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return data.Session{}, nil, fmt.Errorf("beginning session claim: %w", err)
 	}
@@ -266,7 +303,6 @@ func (s *Scheduler) claimOnce(
 	if err != nil {
 		return data.Session{}, nil, fmt.Errorf("selecting claimable worker: %w", err)
 	}
-
 	activeCount, err := queries.CountActiveSessionsByWorker(ctx, worker.ID)
 	if err != nil {
 		return data.Session{}, nil, fmt.Errorf("recounting worker sessions: %w", err)
@@ -276,8 +312,6 @@ func (s *Scheduler) claimOnce(
 		return data.Session{}, &workerID, ErrNoCapacity
 	}
 
-	// Capacity invariant: pending or running sessions are inserted only while
-	// this worker row is locked. All other transitions only free capacity.
 	session, err := queries.InsertClaimedSession(ctx, data.InsertClaimedSessionParams{
 		ID:                     uuid.New(),
 		WorkerID:               worker.ID,
@@ -294,11 +328,28 @@ func (s *Scheduler) claimOnce(
 	if _, err := queries.IncrementWorkerLifetimeSessions(ctx, worker.ID); err != nil {
 		return data.Session{}, nil, fmt.Errorf("incrementing worker lifetime sessions: %w", err)
 	}
+	// Cancellation during this commit round trip can hide a committed row. The
+	// pending-session TTL is the deliberate backstop; retrying could over-admit.
 	if err := tx.Commit(ctx); err != nil {
 		return data.Session{}, nil, fmt.Errorf("committing session claim: %w", err)
 	}
 
 	return session, nil, nil
+}
+
+func (s *Scheduler) queueWaitError(ctx, waitCtx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-s.drain:
+		return ErrDraining
+	default:
+	}
+	if errors.Is(waitCtx.Err(), context.DeadlineExceeded) {
+		return ErrWaitTimeout
+	}
+	return waitCtx.Err()
 }
 
 func (s *Scheduler) enterQueue() bool {
@@ -326,6 +377,11 @@ func waitForRetry(ctx context.Context, delay time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+func jitteredPollingInterval(interval time.Duration) time.Duration {
+	span := interval * 2 / 5
+	return interval*4/5 + time.Duration(rand.Int64N(int64(span)+1))
 }
 
 func rollback(ctx context.Context, tx pgx.Tx, err *error) {

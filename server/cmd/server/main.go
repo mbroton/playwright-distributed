@@ -86,7 +86,9 @@ func run(ctx context.Context, args []string, stdout io.Writer, logger *slog.Logg
 		address = defaultListenAddress
 	}
 	authenticator := httpapi.NewTokenAuthenticator(queries, logger)
-	sessionScheduler := scheduler.New(pool, scheduler.Options{
+	servicesCtx, stopServices := context.WithCancel(ctx)
+	defer stopServices()
+	sessionScheduler := scheduler.New(servicesCtx, pool, logger, scheduler.Options{
 		WorkerTTL:           runtimeConfig.WorkerHeartbeatTTL,
 		PendingSessionTTL:   runtimeConfig.PendingSessionTTL,
 		MaxLifetimeSessions: runtimeConfig.MaxLifetimeSessions,
@@ -100,8 +102,6 @@ func run(ctx context.Context, args []string, stdout io.Writer, logger *slog.Logg
 		logger,
 		httpapi.WithScheduler(sessionScheduler),
 	)
-	servicesCtx, stopServices := context.WithCancel(ctx)
-	defer stopServices()
 	go scheduler.RunListener(servicesCtx, pool, sessionScheduler.Waker(), logger)
 	go rescuer.New(pool, logger, rescuer.Options{
 		WorkerTTL:        runtimeConfig.WorkerHeartbeatTTL,

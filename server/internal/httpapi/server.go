@@ -161,6 +161,11 @@ func registerPublicRoutes(
 				huma.Error503ServiceUnavailable("session queue wait timed out"),
 				http.Header{"Retry-After": []string{"1"}},
 			)
+		case errors.Is(err, scheduler.ErrDraining):
+			return nil, huma.ErrorWithHeaders(
+				huma.Error503ServiceUnavailable("server is shutting down"),
+				http.Header{"Retry-After": []string{"1"}},
+			)
 		case errors.Is(err, context.Canceled):
 			return nil, err
 		default:
