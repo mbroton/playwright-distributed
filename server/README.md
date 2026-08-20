@@ -29,7 +29,8 @@ The server uses these environment variables:
   not set `?browser=`. Its default is `chromium`. Valid values are `chromium`,
   `firefox`, and `webkit`.
 - `WORKER_DIAL_TIMEOUT` is the total time limit for a worker WebSocket dial.
-  Its default is `10s`.
+  Its default is `10s`. It must be less than the `15s` session reconciliation
+  grace, or the server refuses to start.
 - `RELAY_WRITE_TIMEOUT` limits each relay write. Its default is `30s`.
 - `RELAY_PING_INTERVAL` controls how often the relay pings each peer. Its
   default is `20s`. It must be less than `RELAY_PONG_TIMEOUT`.

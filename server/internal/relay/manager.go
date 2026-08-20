@@ -85,6 +85,16 @@ func NewManager(queries *data.Queries, logger *slog.Logger, options Options) *Ma
 	}
 }
 
+// Accepting reports whether new attachments would currently be admitted. It
+// is advisory: BeginAttach is the authoritative atomic gate. Handlers use it
+// to refuse early, before admission claims a session that a draining
+// BeginAttach would then abandon as pending until the TTL.
+func (m *Manager) Accepting() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return !m.draining
+}
+
 // BeginAttach reserves shutdown ownership for an attachment.
 func (m *Manager) BeginAttach(sessionID uuid.UUID) (*AttachReservation, error) {
 	m.mu.Lock()

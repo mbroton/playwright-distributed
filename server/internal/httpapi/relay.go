@@ -153,6 +153,11 @@ func (h *relayHandler) preflight(w http.ResponseWriter, request *http.Request) b
 		writeRelayError(w, http.StatusForbidden, "websocket origin is not allowed")
 		return false
 	}
+	if !h.manager.Accepting() {
+		w.Header().Set("Retry-After", "1")
+		writeRelayError(w, http.StatusServiceUnavailable, "server is shutting down")
+		return false
+	}
 	return true
 }
 

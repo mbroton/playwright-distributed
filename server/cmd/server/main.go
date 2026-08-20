@@ -140,6 +140,9 @@ func run(ctx context.Context, args []string, stdout io.Writer, logger *slog.Logg
 }
 
 func validateRuntimeConfig(runtimeConfig config.Config) error {
+	// scheduler.New in run() leaves Options.ReconciliationGrace unset, so the
+	// default IS the active grace. If a config knob for it ever appears, this
+	// check must compare against the configured value instead.
 	if runtimeConfig.WorkerDialTimeout >= scheduler.DefaultReconciliationGrace {
 		return fmt.Errorf(
 			"WORKER_DIAL_TIMEOUT must be less than the session reconciliation grace (%s)",
