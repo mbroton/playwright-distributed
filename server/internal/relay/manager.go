@@ -19,10 +19,26 @@ import (
 
 const (
 	copyBufferSize       = 32 * 1024
+	closeFrameTimeout    = 2 * time.Second
 	terminalQueryTimeout = 5 * time.Second
+
+	// ShutdownCleanupBudget covers the two sequential close-frame writes and
+	// the terminal database transition after the shutdown grace period.
+	ShutdownCleanupBudget = 2*closeFrameTimeout + terminalQueryTimeout
 )
 
-var ErrDraining = errors.New("relay manager is draining")
+var (
+	ErrDraining       = errors.New("relay manager is draining")
+	ErrDuplicateRelay = errors.New("duplicate relay")
+)
+
+type registerResult uint8
+
+const (
+	registerAccepted registerResult = iota
+	registerDraining
+	registerDuplicate
+)
 
 type Options struct {
 	WriteTimeout      time.Duration
@@ -76,13 +92,17 @@ func (m *Manager) Run(sessionID uuid.UUID, client, worker *websocket.Conn) error
 		default:
 		}
 	}
-	if !m.register(sessionID, stop) {
-		closePeer(client, websocket.CloseGoingAway, "server shutting down", m.options.WriteTimeout)
-		closePeer(worker, websocket.CloseGoingAway, "server shutting down", m.options.WriteTimeout)
-		_ = client.Close()
-		_ = worker.Close()
+	switch m.register(sessionID, stop) {
+	case registerDraining:
+		m.closeConnections(sessionID, client, worker, websocket.CloseGoingAway, "server shutting down")
 		m.recordOutcome(sessionID, true)
 		return ErrDraining
+	case registerDuplicate:
+		m.closeConnections(sessionID, client, worker, websocket.CloseInternalServerErr, "duplicate relay")
+		// Implicit sessions have fresh UUIDs, and explicit sessions pass the
+		// StartSession guard before Run. A duplicate is therefore defensive.
+		m.logger.Error("duplicate relay", "session_id", sessionID)
+		return ErrDuplicateRelay
 	}
 	defer m.unregister(sessionID)
 
@@ -106,10 +126,7 @@ func (m *Manager) Run(sessionID uuid.UUID, client, worker *websocket.Conn) error
 
 	event := <-events
 	cancel()
-	closePeer(client, event.code, event.reason, m.options.WriteTimeout)
-	closePeer(worker, event.code, event.reason, m.options.WriteTimeout)
-	_ = client.Close()
-	_ = worker.Close()
+	m.closeConnections(sessionID, client, worker, event.code, event.reason)
 	goroutines.Wait()
 	m.recordOutcome(sessionID, event.normal)
 	if event.err != nil {
@@ -161,18 +178,18 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	}
 }
 
-func (m *Manager) register(sessionID uuid.UUID, stop func(relayEvent)) bool {
+func (m *Manager) register(sessionID uuid.UUID, stop func(relayEvent)) registerResult {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.draining {
-		return false
+		return registerDraining
 	}
 	if _, exists := m.live[sessionID]; exists {
-		return false
+		return registerDuplicate
 	}
 	m.live[sessionID] = stop
 	m.wg.Add(1)
-	return true
+	return registerAccepted
 }
 
 func (m *Manager) unregister(sessionID uuid.UUID) {
@@ -260,9 +277,12 @@ func copyMessages(src, dst *websocket.Conn, options Options) relayEvent {
 			&deadlineReader{conn: src, reader: reader, timeout: options.PongTimeout},
 			buffer,
 		)
+		if copyErr != nil {
+			return errorEvent(copyErr)
+		}
 		deadlineErr := dst.SetWriteDeadline(time.Now().Add(options.WriteTimeout))
 		closeErr := writer.Close()
-		if err := errors.Join(copyErr, deadlineErr, closeErr); err != nil {
+		if err := errors.Join(deadlineErr, closeErr); err != nil {
 			return errorEvent(err)
 		}
 	}
@@ -289,6 +309,13 @@ func pingPeers(ctx context.Context, client, worker *websocket.Conn, options Opti
 func errorEvent(err error) relayEvent {
 	var closeErr *websocket.CloseError
 	if errors.As(err, &closeErr) {
+		if closeErr.Code != websocket.CloseNoStatusReceived && !isValidReceivedCloseCode(closeErr.Code) {
+			return relayEvent{
+				code:   websocket.CloseInternalServerErr,
+				reason: "peer connection lost",
+				err:    err,
+			}
+		}
 		return relayEvent{
 			code:   closeErr.Code,
 			reason: closeErr.Text,
@@ -303,21 +330,58 @@ func errorEvent(err error) relayEvent {
 	}
 }
 
+func isValidReceivedCloseCode(code int) bool {
+	switch code {
+	case websocket.CloseNormalClosure,
+		websocket.CloseGoingAway,
+		websocket.CloseProtocolError,
+		websocket.CloseUnsupportedData,
+		websocket.CloseInvalidFramePayloadData,
+		websocket.ClosePolicyViolation,
+		websocket.CloseMessageTooBig,
+		websocket.CloseMandatoryExtension,
+		websocket.CloseInternalServerErr,
+		websocket.CloseServiceRestart,
+		websocket.CloseTryAgainLater:
+		return true
+	default:
+		return code >= 3000 && code <= 4999
+	}
+}
+
 func isNormalCloseCode(code int) bool {
 	return code == websocket.CloseNormalClosure ||
 		code == websocket.CloseGoingAway ||
 		code == websocket.CloseNoStatusReceived
 }
 
-func closePeer(conn *websocket.Conn, code int, reason string, timeout time.Duration) {
-	if conn == nil {
+func (m *Manager) closeConnections(
+	sessionID uuid.UUID,
+	client, worker *websocket.Conn,
+	code int,
+	reason string,
+) {
+	clientErr := closePeer(client, code, reason)
+	workerErr := closePeer(worker, code, reason)
+	_ = client.Close()
+	_ = worker.Close()
+	m.logCloseError(sessionID, "client", clientErr)
+	m.logCloseError(sessionID, "worker", workerErr)
+}
+
+func (m *Manager) logCloseError(sessionID uuid.UUID, peer string, err error) {
+	if err == nil || errors.Is(err, websocket.ErrCloseSent) || errors.Is(err, net.ErrClosed) {
 		return
+	}
+	m.logger.Debug("send relay close", "session_id", sessionID, "peer", peer, "error", err)
+}
+
+func closePeer(conn *websocket.Conn, code int, reason string) error {
+	if conn == nil {
+		return nil
 	}
 	message := websocket.FormatCloseMessage(code, reason)
-	if err := conn.WriteControl(websocket.CloseMessage, message, time.Now().Add(timeout)); err != nil &&
-		!errors.Is(err, net.ErrClosed) {
-		return
-	}
+	return conn.WriteControl(websocket.CloseMessage, message, time.Now().Add(closeFrameTimeout))
 }
 
 type deadlineReader struct {

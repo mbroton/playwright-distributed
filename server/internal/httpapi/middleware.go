@@ -88,5 +88,10 @@ func (w *loggingResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if !ok {
 		return nil, nil, errors.New("http response writer does not support hijacking")
 	}
-	return hijacker.Hijack()
+	connection, readWriter, err := hijacker.Hijack()
+	if err == nil {
+		w.status = http.StatusSwitchingProtocols
+		w.wroteHeader = true
+	}
+	return connection, readWriter, err
 }

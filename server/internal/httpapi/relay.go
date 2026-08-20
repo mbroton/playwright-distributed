@@ -161,16 +161,7 @@ func (h *relayHandler) preflight(w http.ResponseWriter, request *http.Request) b
 }
 
 func (h *relayHandler) attach(w http.ResponseWriter, request *http.Request, session data.Session) {
-	worker, err := h.dialWorker(request, session)
-	if err != nil {
-		h.failSession(session.ID)
-		h.logger.Warn("dial session worker", "session_id", session.ID, "error", err)
-		writeRelayError(w, http.StatusBadGateway, "worker connection failed")
-		return
-	}
-
 	if _, err := h.queries.StartSession(request.Context(), session.ID); err != nil {
-		_ = worker.Close()
 		if errors.Is(err, pgx.ErrNoRows) {
 			h.writeRejectedStart(w, request, session.ID)
 			return
@@ -181,14 +172,34 @@ func (h *relayHandler) attach(w http.ResponseWriter, request *http.Request, sess
 		return
 	}
 
+	worker, err := h.dialWorker(request, session)
+	if err != nil {
+		h.failSession(session.ID)
+		h.logger.Warn("dial session worker", "session_id", session.ID, "error", err)
+		writeRelayError(w, http.StatusBadGateway, "worker connection failed")
+		return
+	}
+
 	client, err := h.upgrader.Upgrade(w, request, nil)
 	if err != nil {
-		_ = worker.Close()
+		closeErr := worker.WriteControl(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseInternalServerErr, "client upgrade failed"),
+			time.Now().Add(time.Second),
+		)
+		if connectionErr := worker.Close(); connectionErr != nil {
+			closeErr = errors.Join(closeErr, connectionErr)
+		}
+		if closeErr != nil && !errors.Is(closeErr, websocket.ErrCloseSent) {
+			h.logger.Debug("close worker after client upgrade failure", "session_id", session.ID, "error", closeErr)
+		}
 		h.failSession(session.ID)
 		h.logger.Warn("upgrade relay client", "session_id", session.ID, "error", err)
 		return
 	}
-	if err := h.manager.Run(session.ID, client, worker); err != nil && !errors.Is(err, relay.ErrDraining) {
+	if err := h.manager.Run(session.ID, client, worker); err != nil &&
+		!errors.Is(err, relay.ErrDraining) &&
+		!errors.Is(err, relay.ErrDuplicateRelay) {
 		h.logger.Error("run relay", "session_id", session.ID, "error", err)
 	}
 }
@@ -200,6 +211,10 @@ func (h *relayHandler) dialWorker(request *http.Request, session data.Session) (
 	if userAgent := request.UserAgent(); userAgent != "" {
 		headers.Set("User-Agent", userAgent)
 	}
+	// Playwright changes this header set across client versions. Prefix
+	// forwarding is deliberate because the client is authenticated and the
+	// worker is trusted infrastructure. Use an allow-list if workers later use
+	// client-controlled headers for privileged actions.
 	for name, values := range request.Header {
 		if !strings.HasPrefix(strings.ToLower(name), "x-playwright-") {
 			continue

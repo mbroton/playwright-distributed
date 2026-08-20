@@ -7,15 +7,18 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"server/internal/db/data"
@@ -32,9 +35,41 @@ const (
 )
 
 type echoWorker struct {
-	server  *httptest.Server
-	headers chan http.Header
-	closes  chan *websocket.CloseError
+	server   *httptest.Server
+	headers  chan http.Header
+	closes   chan workerClose
+	upgrades atomic.Int32
+}
+
+type workerClose struct {
+	sessionID string
+	err       *websocket.CloseError
+}
+
+type messageObservingWorker struct {
+	server     *httptest.Server
+	messages   chan []byte
+	readErrors chan error
+}
+
+type failingRenewDB struct {
+	data.DBTX
+	err error
+}
+
+func (db failingRenewDB) QueryRow(ctx context.Context, query string, args ...interface{}) pgx.Row {
+	if strings.Contains(query, "-- name: RenewSessionHeartbeat :one") {
+		return errorRow{err: db.err}
+	}
+	return db.DBTX.QueryRow(ctx, query, args...)
+}
+
+type errorRow struct {
+	err error
+}
+
+func (row errorRow) Scan(...interface{}) error {
+	return row.err
 }
 
 type lockedBuffer struct {
@@ -142,7 +177,7 @@ func TestRelay_ImplicitEndToEnd(t *testing.T) {
 	); err != nil {
 		t.Fatalf("closing client WebSocket: %v", err)
 	}
-	workerClose := receiveClose(t, worker.closes)
+	workerClose := receiveClose(t, worker, session.ID)
 	if workerClose.Code != websocket.CloseNormalClosure || workerClose.Text != "done" {
 		t.Fatalf("worker close = %d %q, want 1000 %q", workerClose.Code, workerClose.Text, "done")
 	}
@@ -174,6 +209,9 @@ func TestRelay_ImplicitEndToEnd(t *testing.T) {
 		t.Fatalf("x-pwd-session-id = %q, want %s", forwarded.Get("x-pwd-session-id"), session.ID)
 	}
 	waitForCondition(t, time.Second, func() bool { return strings.Contains(logs.String(), "http request") })
+	if !strings.Contains(logs.String(), `"status":101`) {
+		t.Fatalf("relay request log does not contain status 101: %s", logs.String())
+	}
 	if strings.Contains(logs.String(), token) || strings.Contains(logs.String(), "?token=") {
 		t.Fatalf("relay logs contain token material: %s", logs.String())
 	}
@@ -252,8 +290,9 @@ func TestRelay_HTTPPreflightAndAuth(t *testing.T) {
 			t.Fatalf("Bearer relay dial returned an error: %v", err)
 		}
 		assertMessage(t, client, []byte("worker-ready"))
+		session := latestSession(t, pool, queries)
 		closeWebSocket(t, client, websocket.CloseNormalClosure, "bearer done")
-		_ = receiveClose(t, worker.closes)
+		_ = receiveClose(t, worker, session.ID)
 	})
 
 	t.Run("no-auth mode", func(t *testing.T) {
@@ -268,8 +307,89 @@ func TestRelay_HTTPPreflightAndAuth(t *testing.T) {
 			t.Fatalf("no-auth relay dial returned an error: %v", err)
 		}
 		assertMessage(t, client, []byte("worker-ready"))
+		session := latestSession(t, pool, queries)
 		closeWebSocket(t, client, websocket.CloseNormalClosure, "done")
-		_ = receiveClose(t, worker.closes)
+		_ = receiveClose(t, worker, session.ID)
+	})
+}
+
+func TestRelay_DrainGates(t *testing.T) {
+	pool := newMigratedTestPool(t)
+	queries := data.New(pool)
+
+	t.Run("pre-upgrade request is rejected", func(t *testing.T) {
+		truncateTables(t, pool)
+		worker := newEchoWorker(t)
+		insertRelayWorker(t, queries, worker.wsURL(), "chromium", "1.62.1", 1)
+		logger := testLogger(io.Discard)
+		manager := newTestRelayManager(queries, logger, relay.Options{})
+		server := newRelayHTTPServer(t, pool, NoAuthAuthenticator{}, manager, logger, 0)
+		if err := manager.Shutdown(t.Context()); err != nil {
+			t.Fatalf("Manager.Shutdown() returned an error: %v", err)
+		}
+
+		_, response, err := websocket.DefaultDialer.Dial(wsURL(server.URL)+"/", nil)
+		if err == nil || response == nil || response.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("draining relay response = %v, error = %v; want 503", response, err)
+		}
+		body, readErr := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		if readErr != nil {
+			t.Fatalf("reading drain response: %v", readErr)
+		}
+		if !strings.Contains(string(body), "server is shutting down") {
+			t.Fatalf("drain response body = %s, want shutdown reason", body)
+		}
+		if got := worker.upgrades.Load(); got != 0 {
+			t.Fatalf("worker upgrades = %d, want 0", got)
+		}
+	})
+
+	t.Run("drain between preflight and register closes upgraded client", func(t *testing.T) {
+		truncateTables(t, pool)
+		worker, dialStarted, releaseDial := newGatedEchoWorker(t)
+		insertRelayWorker(t, queries, worker.wsURL(), "chromium", "1.62.1", 1)
+		logger := testLogger(io.Discard)
+		manager := newTestRelayManager(queries, logger, relay.Options{})
+		server := newRelayHTTPServer(t, pool, NoAuthAuthenticator{}, manager, logger, 0)
+
+		type dialResult struct {
+			connection *websocket.Conn
+			response   *http.Response
+			err        error
+		}
+		dialDone := make(chan dialResult, 1)
+		go func() {
+			connection, response, err := websocket.DefaultDialer.Dial(wsURL(server.URL)+"/", nil)
+			dialDone <- dialResult{connection: connection, response: response, err: err}
+		}()
+		select {
+		case <-dialStarted:
+		case <-time.After(time.Second):
+			t.Fatal("worker dial did not start")
+		}
+		if err := manager.Shutdown(t.Context()); err != nil {
+			t.Fatalf("Manager.Shutdown() returned an error: %v", err)
+		}
+		releaseDial()
+
+		result := <-dialDone
+		if result.err != nil || result.response == nil || result.response.StatusCode != http.StatusSwitchingProtocols {
+			t.Fatalf("racing drain dial response = %v, error = %v; want 101", result.response, result.err)
+		}
+		defer result.connection.Close()
+		closeErr := readClose(t, result.connection)
+		if closeErr.Code != websocket.CloseGoingAway || closeErr.Text != "server shutting down" {
+			t.Fatalf("racing drain close = %d %q, want 1001 server shutting down", closeErr.Code, closeErr.Text)
+		}
+		session := latestSession(t, pool, queries)
+		waitForSession(t, queries, session.ID, func(current data.Session) bool {
+			return current.Status == data.SessionStatusCompleted
+		})
+		workerClose := receiveClose(t, worker, session.ID)
+		if workerClose.Code != websocket.CloseGoingAway || workerClose.Text != "server shutting down" {
+			t.Fatalf("racing drain worker close = %d %q, want 1001 server shutting down", workerClose.Code, workerClose.Text)
+		}
 	})
 }
 
@@ -304,8 +424,9 @@ func TestRelay_ExplicitAttachAndTermination(t *testing.T) {
 		err        error
 	}
 	start := make(chan struct{})
-	results := make(chan attachResult, 2)
-	for range 2 {
+	const attachCount = 8
+	results := make(chan attachResult, attachCount)
+	for range attachCount {
 		go func() {
 			<-start
 			connection, response, err := websocket.DefaultDialer.Dial(
@@ -318,21 +439,33 @@ func TestRelay_ExplicitAttachAndTermination(t *testing.T) {
 	close(start)
 	var winner *websocket.Conn
 	conflicts := 0
-	for range 2 {
+	for range attachCount {
 		result := <-results
 		if result.err == nil {
+			if result.response == nil || result.response.StatusCode != http.StatusSwitchingProtocols {
+				t.Fatalf("successful attach response = %v, want 101", result.response)
+			}
 			winner = result.connection
 			continue
 		}
-		if result.response != nil && result.response.StatusCode == http.StatusConflict {
+		if result.response != nil &&
+			(result.response.StatusCode == http.StatusConflict || result.response.StatusCode == http.StatusGone) {
 			conflicts++
 			_ = result.response.Body.Close()
 			continue
 		}
-		t.Fatalf("concurrent attach result = %+v, want upgrade or 409", result)
+		t.Fatalf("concurrent attach result = %+v, want upgrade, 409, or 410", result)
 	}
-	if winner == nil || conflicts != 1 {
-		t.Fatalf("concurrent attaches: winner = %v, conflicts = %d; want one each", winner != nil, conflicts)
+	if winner == nil || conflicts != attachCount-1 {
+		t.Fatalf(
+			"concurrent attaches: winner = %v, rejections = %d; want one winner and %d rejections",
+			winner != nil,
+			conflicts,
+			attachCount-1,
+		)
+	}
+	if got := worker.upgrades.Load(); got != 1 {
+		t.Fatalf("worker upgrades = %d, want 1", got)
 	}
 	defer winner.Close()
 	assertMessage(t, winner, []byte("worker-ready"))
@@ -360,7 +493,7 @@ func TestRelay_ExplicitAttachAndTermination(t *testing.T) {
 	if closeErr.Code != websocket.CloseGoingAway || closeErr.Text != "session terminated" {
 		t.Fatalf("client close = %d %q, want 1001 %q", closeErr.Code, closeErr.Text, "session terminated")
 	}
-	workerClose := receiveClose(t, worker.closes)
+	workerClose := receiveClose(t, worker, session.ID)
 	if workerClose.Code != websocket.CloseGoingAway || workerClose.Text != "session terminated" {
 		t.Fatalf("worker close = %d %q, want 1001 session terminated", workerClose.Code, workerClose.Text)
 	}
@@ -389,7 +522,7 @@ func TestRelay_ExplicitAttachAndTermination(t *testing.T) {
 	}
 	assertMessage(t, normalClient, []byte("worker-ready"))
 	closeWebSocket(t, normalClient, websocket.CloseNormalClosure, "explicit done")
-	normalWorkerClose := receiveClose(t, worker.closes)
+	normalWorkerClose := receiveClose(t, worker, normalSession.ID)
 	if normalWorkerClose.Code != websocket.CloseNormalClosure {
 		t.Fatalf("normal explicit worker close = %d, want 1000", normalWorkerClose.Code)
 	}
@@ -449,7 +582,7 @@ func TestRelay_VersionRoutingAndDialFailure(t *testing.T) {
 			t.Fatalf("implicit session worker = %s, want 1.62 worker %s", claimed.WorkerID, matchingID)
 		}
 		closeWebSocket(t, client, websocket.CloseNormalClosure, "done")
-		_ = receiveClose(t, worker62.closes)
+		_ = receiveClose(t, worker62, claimed.ID)
 		withoutVersion, _, err := websocket.DefaultDialer.Dial(wsURL(server.URL)+"/", nil)
 		if err != nil {
 			t.Fatalf("versionless implicit dial returned an error: %v", err)
@@ -459,9 +592,9 @@ func TestRelay_VersionRoutingAndDialFailure(t *testing.T) {
 		closeWebSocket(t, withoutVersion, websocket.CloseNormalClosure, "done")
 		switch versionlessSession.WorkerID {
 		case matchingID:
-			_ = receiveClose(t, worker62.closes)
+			_ = receiveClose(t, worker62, versionlessSession.ID)
 		case incompatibleID:
-			_ = receiveClose(t, worker63.closes)
+			_ = receiveClose(t, worker63, versionlessSession.ID)
 		default:
 			t.Fatalf("versionless session used unknown worker %s", versionlessSession.WorkerID)
 		}
@@ -500,7 +633,7 @@ func TestRelay_VersionRoutingAndDialFailure(t *testing.T) {
 		}
 	})
 
-	t.Run("dial failure happens before upgrade and frees capacity", func(t *testing.T) {
+	t.Run("dial failure after start happens before upgrade and frees capacity", func(t *testing.T) {
 		truncateTables(t, pool)
 		workerURL := newSlowHandshakeWorker(t)
 		insertRelayWorker(t, queries, workerURL, "chromium", "1.62.1", 1)
@@ -520,16 +653,16 @@ func TestRelay_VersionRoutingAndDialFailure(t *testing.T) {
 			var count int
 			err := pool.QueryRow(
 				t.Context(),
-				"SELECT count(*) FROM sessions WHERE status = 'pending'",
+				"SELECT count(*) FROM sessions WHERE status = 'running'",
 			).Scan(&count)
 			return err == nil && count == 1
 		})
 		var failedSessionID uuid.UUID
 		if err := pool.QueryRow(
 			t.Context(),
-			"SELECT id FROM sessions WHERE status = 'pending' LIMIT 1",
+			"SELECT id FROM sessions WHERE status = 'running' LIMIT 1",
 		).Scan(&failedSessionID); err != nil {
-			t.Fatalf("selecting dial-pending session: %v", err)
+			t.Fatalf("selecting dial-running session: %v", err)
 		}
 		waitingScheduler := newTestScheduler(pool, 1, time.Second)
 		type claimResult struct {
@@ -568,6 +701,39 @@ func TestRelay_VersionRoutingAndDialFailure(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatal("waiting claim did not proceed after dial failure")
 		}
+	})
+
+	t.Run("client upgrade failure closes worker cleanly", func(t *testing.T) {
+		truncateTables(t, pool)
+		worker := newEchoWorker(t)
+		insertRelayWorker(t, queries, worker.wsURL(), "chromium", "1.62.1", 1)
+		logger := testLogger(io.Discard)
+		manager := newTestRelayManager(queries, logger, relay.Options{})
+		server := newRelayHTTPServer(t, pool, NoAuthAuthenticator{}, manager, logger, 0)
+		request, err := http.NewRequest(http.MethodGet, server.URL+"/", nil)
+		if err != nil {
+			t.Fatalf("creating invalid upgrade request: %v", err)
+		}
+		request.Header.Set("Connection", "Upgrade")
+		request.Header.Set("Upgrade", "websocket")
+		request.Header.Set("Sec-WebSocket-Version", "13")
+		request.Header.Set("Sec-WebSocket-Key", "invalid")
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatalf("invalid upgrade request returned an error: %v", err)
+		}
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusBadRequest {
+			t.Fatalf("invalid upgrade status = %d, want %d", response.StatusCode, http.StatusBadRequest)
+		}
+		session := latestSession(t, pool, queries)
+		workerClose := receiveClose(t, worker, session.ID)
+		if workerClose.Code != websocket.CloseInternalServerErr || workerClose.Text != "client upgrade failed" {
+			t.Fatalf("upgrade-failure worker close = %d %q, want 1011 client upgrade failed", workerClose.Code, workerClose.Text)
+		}
+		waitForSession(t, queries, session.ID, func(current data.Session) bool {
+			return current.Status == data.SessionStatusFailed
+		})
 	})
 }
 
@@ -630,7 +796,41 @@ func TestRelay_LivenessBlockedPeerAndShutdown(t *testing.T) {
 			t.Fatalf("idle session status = %q, want running", session.Status)
 		}
 		closeWebSocket(t, client, websocket.CloseNormalClosure, "done")
-		_ = receiveClose(t, worker.closes)
+		_ = receiveClose(t, worker, session.ID)
+	})
+
+	t.Run("heartbeat database failure does not stop relay", func(t *testing.T) {
+		truncateTables(t, pool)
+		worker := newEchoWorker(t)
+		insertRelayWorker(t, queries, worker.wsURL(), "chromium", "1.62.1", 1)
+		errRenew := errors.New("database unavailable")
+		var logs lockedBuffer
+		logger := testLogger(&logs)
+		managerQueries := data.New(failingRenewDB{DBTX: pool, err: errRenew})
+		manager := newTestRelayManager(managerQueries, logger, relay.Options{
+			HeartbeatInterval: 10 * time.Millisecond,
+		})
+		server := newRelayHTTPServer(t, pool, NoAuthAuthenticator{}, manager, logger, 0)
+		client, _, err := websocket.DefaultDialer.Dial(wsURL(server.URL)+"/", nil)
+		if err != nil {
+			t.Fatalf("renewal-failure relay dial returned an error: %v", err)
+		}
+		defer client.Close()
+		assertMessage(t, client, []byte("worker-ready"))
+		waitForCondition(t, time.Second, func() bool {
+			return strings.Contains(logs.String(), "renew session heartbeat") &&
+				strings.Contains(logs.String(), errRenew.Error())
+		})
+		if err := client.WriteMessage(websocket.TextMessage, []byte("still-live")); err != nil {
+			t.Fatalf("writing after renewal failure: %v", err)
+		}
+		assertMessage(t, client, []byte("still-live"))
+		session := latestSession(t, pool, queries)
+		closeWebSocket(t, client, websocket.CloseNormalClosure, "done")
+		_ = receiveClose(t, worker, session.ID)
+		waitForSession(t, queries, session.ID, func(current data.Session) bool {
+			return current.Status == data.SessionStatusCompleted
+		})
 	})
 
 	t.Run("peer that does not process pings is failed", func(t *testing.T) {
@@ -687,6 +887,68 @@ func TestRelay_LivenessBlockedPeerAndShutdown(t *testing.T) {
 			t.Fatalf("shutdown session status = %q, want completed", session.Status)
 		}
 	})
+
+	t.Run("shutdown interrupts a blocked data writer", func(t *testing.T) {
+		truncateTables(t, pool)
+		workerURL, releaseWorker, workerClosed := newBlockedWorkerWithCloseSignal(t)
+		insertRelayWorker(t, queries, workerURL, "chromium", "1.62.1", 1)
+		logger := testLogger(io.Discard)
+		manager := newTestRelayManager(queries, logger, relay.Options{
+			WriteTimeout:  30 * time.Second,
+			PingInterval:  time.Hour,
+			PongTimeout:   time.Hour,
+			ShutdownGrace: 20 * time.Millisecond,
+		})
+		server := newRelayHTTPServer(t, pool, NoAuthAuthenticator{}, manager, logger, 0)
+		client, _, err := websocket.DefaultDialer.Dial(wsURL(server.URL)+"/", nil)
+		if err != nil {
+			t.Fatalf("blocked-shutdown relay dial returned an error: %v", err)
+		}
+		defer client.Close()
+		writerStarted := make(chan struct{})
+		writerDone := make(chan struct{})
+		go func() {
+			defer close(writerDone)
+			payload := bytes.Repeat([]byte("blocked-shutdown"), 256*1024)
+			close(writerStarted)
+			for {
+				if err := client.WriteMessage(websocket.BinaryMessage, payload); err != nil {
+					return
+				}
+			}
+		}()
+		<-writerStarted
+		time.Sleep(100 * time.Millisecond)
+
+		shutdownCtx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+		defer cancel()
+		started := time.Now()
+		if err := manager.Shutdown(shutdownCtx); err != nil {
+			t.Fatalf("Manager.Shutdown() with blocked writer returned an error: %v", err)
+		}
+		if elapsed := time.Since(started); elapsed >= 3*time.Second {
+			t.Fatalf("Manager.Shutdown() duration = %v, want less than 3s", elapsed)
+		}
+		closeErr := readClose(t, client)
+		if closeErr.Code != websocket.CloseGoingAway || closeErr.Text != "server shutting down" {
+			t.Fatalf("blocked shutdown close = %d %q, want 1001 server shutting down", closeErr.Code, closeErr.Text)
+		}
+		releaseWorker()
+		select {
+		case <-workerClosed:
+		case <-time.After(time.Second):
+			t.Fatal("worker connection stayed open after shutdown")
+		}
+		select {
+		case <-writerDone:
+		case <-time.After(time.Second):
+			t.Fatal("client writer stayed blocked after shutdown")
+		}
+		session := latestSession(t, pool, queries)
+		if session.Status != data.SessionStatusCompleted {
+			t.Fatalf("blocked-shutdown session status = %q, want completed", session.Status)
+		}
+	})
 }
 
 func TestRelay_CloseCodeForwardingAndBlockedWrite(t *testing.T) {
@@ -726,12 +988,88 @@ func TestRelay_CloseCodeForwardingAndBlockedWrite(t *testing.T) {
 			t.Fatalf("client-close relay dial returned an error: %v", err)
 		}
 		assertMessage(t, client, []byte("worker-ready"))
+		session := latestSession(t, pool, queries)
 		closeWebSocket(t, client, 4008, "client restart")
-		closeErr := receiveClose(t, worker.closes)
+		closeErr := receiveClose(t, worker, session.ID)
 		if closeErr.Code != 4008 || closeErr.Text != "client restart" {
 			t.Fatalf("worker close = %d %q, want 4008 client restart", closeErr.Code, closeErr.Text)
 		}
+		waitForSession(t, queries, session.ID, func(current data.Session) bool {
+			return current.Status == data.SessionStatusFailed
+		})
+	})
+
+	t.Run("worker transport loss becomes valid client close", func(t *testing.T) {
+		truncateTables(t, pool)
+		workerURL := newAbortingWorker(t)
+		insertRelayWorker(t, queries, workerURL, "chromium", "1.62.1", 1)
+		logger := testLogger(io.Discard)
+		manager := newTestRelayManager(queries, logger, relay.Options{})
+		server := newRelayHTTPServer(t, pool, NoAuthAuthenticator{}, manager, logger, 0)
+		client, _, err := websocket.DefaultDialer.Dial(wsURL(server.URL)+"/", nil)
+		if err != nil {
+			t.Fatalf("aborting-worker relay dial returned an error: %v", err)
+		}
+		defer client.Close()
+		closeErr := readClose(t, client)
+		if closeErr.Code != websocket.CloseInternalServerErr || closeErr.Text != "peer connection lost" {
+			t.Fatalf("transport-loss close = %d %q, want 1011 peer connection lost", closeErr.Code, closeErr.Text)
+		}
 		session := latestSession(t, pool, queries)
+		waitForSession(t, queries, session.ID, func(current data.Session) bool {
+			return current.Status == data.SessionStatusFailed
+		})
+	})
+
+	t.Run("client transport loss becomes valid worker close", func(t *testing.T) {
+		truncateTables(t, pool)
+		worker := newEchoWorker(t)
+		insertRelayWorker(t, queries, worker.wsURL(), "chromium", "1.62.1", 1)
+		logger := testLogger(io.Discard)
+		manager := newTestRelayManager(queries, logger, relay.Options{})
+		server := newRelayHTTPServer(t, pool, NoAuthAuthenticator{}, manager, logger, 0)
+		client, _, err := websocket.DefaultDialer.Dial(wsURL(server.URL)+"/", nil)
+		if err != nil {
+			t.Fatalf("client-loss relay dial returned an error: %v", err)
+		}
+		assertMessage(t, client, []byte("worker-ready"))
+		session := latestSession(t, pool, queries)
+		if err := client.UnderlyingConn().Close(); err != nil {
+			t.Fatalf("closing client TCP connection: %v", err)
+		}
+		closeErr := receiveClose(t, worker, session.ID)
+		if closeErr.Code != websocket.CloseInternalServerErr || closeErr.Text != "peer connection lost" {
+			t.Fatalf("client-loss worker close = %d %q, want 1011 peer connection lost", closeErr.Code, closeErr.Text)
+		}
+		waitForSession(t, queries, session.ID, func(current data.Session) bool {
+			return current.Status == data.SessionStatusFailed
+		})
+	})
+
+	t.Run("incomplete source message is not completed at worker", func(t *testing.T) {
+		truncateTables(t, pool)
+		worker := newMessageObservingWorker(t)
+		insertRelayWorker(t, queries, worker.wsURL(), "chromium", "1.62.1", 1)
+		logger := testLogger(io.Discard)
+		manager := newTestRelayManager(queries, logger, relay.Options{})
+		server := newRelayHTTPServer(t, pool, NoAuthAuthenticator{}, manager, logger, 0)
+		client, _, err := websocket.DefaultDialer.Dial(wsURL(server.URL)+"/", nil)
+		if err != nil {
+			t.Fatalf("partial-message relay dial returned an error: %v", err)
+		}
+		assertMessage(t, client, []byte("worker-ready"))
+		session := latestSession(t, pool, queries)
+		writeNonFinalClientFrame(t, client.UnderlyingConn(), []byte("partial protocol message"))
+		if err := client.UnderlyingConn().Close(); err != nil {
+			t.Fatalf("closing partial-message TCP connection: %v", err)
+		}
+		select {
+		case message := <-worker.messages:
+			t.Fatalf("worker received completed truncated message %q", message)
+		case <-worker.readErrors:
+		case <-time.After(2 * time.Second):
+			t.Fatal("worker did not observe relay teardown")
+		}
 		waitForSession(t, queries, session.ID, func(current data.Session) bool {
 			return current.Status == data.SessionStatusFailed
 		})
@@ -784,17 +1122,45 @@ func TestRelay_CloseCodeForwardingAndBlockedWrite(t *testing.T) {
 
 func newEchoWorker(t *testing.T) *echoWorker {
 	t.Helper()
+	return newEchoWorkerWithGate(t, nil, nil)
+}
+
+func newGatedEchoWorker(t *testing.T) (*echoWorker, <-chan struct{}, func()) {
+	t.Helper()
+	dialStarted := make(chan struct{})
+	releaseDial := make(chan struct{})
+	worker := newEchoWorkerWithGate(t, dialStarted, releaseDial)
+	var once sync.Once
+	release := func() {
+		once.Do(func() { close(releaseDial) })
+	}
+	t.Cleanup(release)
+	return worker, dialStarted, release
+}
+
+func newEchoWorkerWithGate(
+	t *testing.T,
+	dialStarted chan<- struct{},
+	releaseDial <-chan struct{},
+) *echoWorker {
+	t.Helper()
 	worker := &echoWorker{
 		headers: make(chan http.Header, 1),
-		closes:  make(chan *websocket.CloseError, 4),
+		closes:  make(chan workerClose, 8),
 	}
 	upgrader := websocket.Upgrader{}
 	worker.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if dialStarted != nil {
+			close(dialStarted)
+			<-releaseDial
+		}
 		connection, err := upgrader.Upgrade(w, request, nil)
 		if err != nil {
 			return
 		}
 		defer connection.Close()
+		worker.upgrades.Add(1)
+		sessionID := request.Header.Get("x-pwd-session-id")
 		select {
 		case worker.headers <- request.Header.Clone():
 		default:
@@ -807,9 +1173,9 @@ func newEchoWorker(t *testing.T) *echoWorker {
 			messageType, reader, err := connection.NextReader()
 			if err != nil {
 				var closeErr *websocket.CloseError
-				if errors.As(err, &closeErr) {
+				if errors.As(err, &closeErr) && closeErr.Code != websocket.CloseAbnormalClosure {
 					select {
-					case worker.closes <- closeErr:
+					case worker.closes <- workerClose{sessionID: sessionID, err: closeErr}:
 					default:
 					}
 				}
@@ -860,6 +1226,36 @@ func newBlockedWorker(t *testing.T) (string, func()) {
 	return wsURL(server.URL), stop
 }
 
+func newBlockedWorkerWithCloseSignal(t *testing.T) (string, func(), <-chan struct{}) {
+	t.Helper()
+	release := make(chan struct{})
+	closed := make(chan struct{})
+	var releaseOnce sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		connection, err := (&websocket.Upgrader{}).Upgrade(w, request, nil)
+		if err != nil {
+			return
+		}
+		defer connection.Close()
+		<-release
+		for {
+			if _, _, err := connection.ReadMessage(); err != nil {
+				close(closed)
+				return
+			}
+		}
+	}))
+	stop := func() {
+		releaseOnce.Do(func() { close(release) })
+	}
+	t.Cleanup(func() {
+		stop()
+		server.CloseClientConnections()
+		server.Close()
+	})
+	return wsURL(server.URL), stop, closed
+}
+
 func newClosingWorker(t *testing.T, code int, reason string) string {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
@@ -879,6 +1275,55 @@ func newClosingWorker(t *testing.T, code int, reason string) string {
 		server.Close()
 	})
 	return wsURL(server.URL)
+}
+
+func newAbortingWorker(t *testing.T) string {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		connection, err := (&websocket.Upgrader{}).Upgrade(w, request, nil)
+		if err != nil {
+			return
+		}
+		_ = connection.UnderlyingConn().Close()
+	}))
+	t.Cleanup(func() {
+		server.CloseClientConnections()
+		server.Close()
+	})
+	return wsURL(server.URL)
+}
+
+func newMessageObservingWorker(t *testing.T) *messageObservingWorker {
+	t.Helper()
+	worker := &messageObservingWorker{
+		messages:   make(chan []byte, 1),
+		readErrors: make(chan error, 1),
+	}
+	worker.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		connection, err := (&websocket.Upgrader{}).Upgrade(w, request, nil)
+		if err != nil {
+			return
+		}
+		defer connection.Close()
+		if err := connection.WriteMessage(websocket.TextMessage, []byte("worker-ready")); err != nil {
+			return
+		}
+		_, message, err := connection.ReadMessage()
+		if err != nil {
+			worker.readErrors <- err
+			return
+		}
+		worker.messages <- message
+	}))
+	t.Cleanup(func() {
+		worker.server.CloseClientConnections()
+		worker.server.Close()
+	})
+	return worker
+}
+
+func (w *messageObservingWorker) wsURL() string {
+	return wsURL(w.server.URL)
 }
 
 func newSlowHandshakeWorker(t *testing.T) string {
@@ -1084,14 +1529,41 @@ func closeWebSocket(t *testing.T, connection *websocket.Conn, code int, reason s
 	}
 }
 
-func receiveClose(t *testing.T, closes <-chan *websocket.CloseError) *websocket.CloseError {
+func writeNonFinalClientFrame(t *testing.T, connection net.Conn, payload []byte) {
 	t.Helper()
-	select {
-	case closeErr := <-closes:
-		return closeErr
-	case <-time.After(2 * time.Second):
-		t.Fatal("worker did not receive a close frame")
-		return nil
+	if len(payload) > 125 {
+		t.Fatalf("test payload length = %d, want at most 125", len(payload))
+	}
+	mask := [4]byte{0x12, 0x34, 0x56, 0x78}
+	frame := make([]byte, 0, 2+len(mask)+len(payload))
+	frame = append(frame, websocket.BinaryMessage, 0x80|byte(len(payload)))
+	frame = append(frame, mask[:]...)
+	for index, value := range payload {
+		frame = append(frame, value^mask[index%len(mask)])
+	}
+	written, err := connection.Write(frame)
+	if err != nil {
+		t.Fatalf("writing non-final client frame: %v", err)
+	}
+	if written != len(frame) {
+		t.Fatalf("non-final frame bytes written = %d, want %d", written, len(frame))
+	}
+}
+
+func receiveClose(t *testing.T, worker *echoWorker, sessionID uuid.UUID) *websocket.CloseError {
+	t.Helper()
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case closeEvent := <-worker.closes:
+			if closeEvent.sessionID == sessionID.String() {
+				return closeEvent.err
+			}
+		case <-timer.C:
+			t.Fatalf("worker did not receive a close frame for session %s", sessionID)
+			return nil
+		}
 	}
 }
 

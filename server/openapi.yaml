@@ -212,6 +212,7 @@ components:
         playwright_version:
           maxLength: 64
           minLength: 1
+          pattern: ^[0-9]+\.[0-9]+\.[0-9]+
           type: string
       required:
         - address

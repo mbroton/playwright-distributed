@@ -127,7 +127,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, logger *slog.Logg
 		address,
 		controlPlane.Handler,
 		runtimeConfig.QueueWaitTimeout+runtimeConfig.WorkerDialTimeout+shutdownBuffer,
-		runtimeConfig.ShutdownGracePeriod+runtimeConfig.WorkerDialTimeout+shutdownBuffer,
+		runtimeConfig.ShutdownGracePeriod+relay.ShutdownCleanupBudget+shutdownBuffer,
 		relayManager,
 		logger,
 	)

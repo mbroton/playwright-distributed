@@ -54,14 +54,14 @@ The WebSocket routes are not part of the OpenAPI document.
 ```text
 GET /?browser=chromium&token=pwd_...
     -> claim a worker and create a session
-    -> dial the worker
     -> start the session
+    -> dial the worker
     -> upgrade the client
 
 GET /sessions/{id}?token=pwd_...
     -> load a pending session
-    -> dial its worker
     -> start the session
+    -> dial its worker
     -> upgrade the client
 ```
 
@@ -78,6 +78,12 @@ The relay forwards `User-Agent` and `x-playwright-*` request headers to the
 worker. It does not forward authorization, cookies, or query tokens. It also
 sends `x-pwd-session-id` with the session UUID.
 
+The relay streams each message through a fixed buffer. Relay memory use is
+bounded, but the relay deliberately has no per-message size limit. The
+worker's WebSocket payload limit is the backstop. This design replaces a
+relay read limit, which would reject messages before the worker can apply its
+own limit.
+
 `DELETE /v1/sessions/{id}` completes a pending or running session. The relay
 owner sees the change on its next session heartbeat and closes both WebSocket
 peers with code `1001`. The maximum normal detection delay is one
@@ -90,6 +96,9 @@ server apikey create --name deployment
 server apikey list
 server apikey revoke --id <uuid>
 ```
+
+All valid API keys have equal trust. Any valid key can read or delete any
+session. Per-key session scope is planned for a later phase.
 
 ## Authentication bootstrap mode
 
