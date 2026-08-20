@@ -59,6 +59,13 @@ type Manager struct {
 	wg       sync.WaitGroup
 }
 
+// AttachReservation keeps an attachment visible to Shutdown before Run starts.
+type AttachReservation struct {
+	manager   *Manager
+	sessionID uuid.UUID
+	consumed  sync.Once
+}
+
 type relayEvent struct {
 	code   int
 	reason string
@@ -78,13 +85,24 @@ func NewManager(queries *data.Queries, logger *slog.Logger, options Options) *Ma
 	}
 }
 
-func (m *Manager) Accepting() bool {
+// BeginAttach reserves shutdown ownership for an attachment.
+func (m *Manager) BeginAttach(sessionID uuid.UUID) (*AttachReservation, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return !m.draining
+	if m.draining {
+		return nil, ErrDraining
+	}
+	m.wg.Add(1)
+	return &AttachReservation{manager: m, sessionID: sessionID}, nil
 }
 
-func (m *Manager) Run(sessionID uuid.UUID, client, worker *websocket.Conn) error {
+// Release ends a reservation that Run did not adopt.
+func (r *AttachReservation) Release() {
+	r.consumed.Do(r.manager.wg.Done)
+}
+
+func (m *Manager) Run(reservation *AttachReservation, client, worker *websocket.Conn) error {
+	sessionID := reservation.sessionID
 	events := make(chan relayEvent, 4)
 	stop := func(event relayEvent) {
 		select {
@@ -92,7 +110,7 @@ func (m *Manager) Run(sessionID uuid.UUID, client, worker *websocket.Conn) error
 		default:
 		}
 	}
-	switch m.register(sessionID, stop) {
+	switch m.register(reservation, stop) {
 	case registerDraining:
 		m.closeConnections(sessionID, client, worker, websocket.CloseGoingAway, "server shutting down")
 		m.recordOutcome(sessionID, true)
@@ -178,17 +196,18 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	}
 }
 
-func (m *Manager) register(sessionID uuid.UUID, stop func(relayEvent)) registerResult {
+func (m *Manager) register(reservation *AttachReservation, stop func(relayEvent)) registerResult {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.draining {
 		return registerDraining
 	}
+	sessionID := reservation.sessionID
 	if _, exists := m.live[sessionID]; exists {
 		return registerDuplicate
 	}
 	m.live[sessionID] = stop
-	m.wg.Add(1)
+	reservation.consumed.Do(func() {})
 	return registerAccepted
 }
 
@@ -331,6 +350,8 @@ func errorEvent(err error) relayEvent {
 }
 
 func isValidReceivedCloseCode(code int) bool {
+	// Keep this list aligned with gorilla/websocket's private
+	// validReceivedCloseCodes map in v1.5.3.
 	switch code {
 	case websocket.CloseNormalClosure,
 		websocket.CloseGoingAway,
@@ -361,8 +382,8 @@ func (m *Manager) closeConnections(
 	code int,
 	reason string,
 ) {
-	clientErr := closePeer(client, code, reason)
-	workerErr := closePeer(worker, code, reason)
+	clientErr := ClosePeer(client, code, reason)
+	workerErr := ClosePeer(worker, code, reason)
 	_ = client.Close()
 	_ = worker.Close()
 	m.logCloseError(sessionID, "client", clientErr)
@@ -376,7 +397,8 @@ func (m *Manager) logCloseError(sessionID uuid.UUID, peer string, err error) {
 	m.logger.Debug("send relay close", "session_id", sessionID, "peer", peer, "error", err)
 }
 
-func closePeer(conn *websocket.Conn, code int, reason string) error {
+// ClosePeer sends a WebSocket close frame with the relay close deadline.
+func ClosePeer(conn *websocket.Conn, code int, reason string) error {
 	if conn == nil {
 		return nil
 	}

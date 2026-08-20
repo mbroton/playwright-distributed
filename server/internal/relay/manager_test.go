@@ -1,9 +1,12 @@
 package relay
 
 import (
+	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -14,11 +17,20 @@ func TestManager_RegisterDistinguishesDrainAndDuplicate(t *testing.T) {
 	sessionID := uuid.New()
 	events := make(chan relayEvent, 1)
 	stop := func(event relayEvent) { events <- event }
-	if got := manager.register(sessionID, stop); got != registerAccepted {
+	reservation, err := manager.BeginAttach(sessionID)
+	if err != nil {
+		t.Fatalf("BeginAttach() returned an error: %v", err)
+	}
+	if got := manager.register(reservation, stop); got != registerAccepted {
 		t.Fatalf("first register result = %d, want accepted", got)
 	}
 	t.Cleanup(func() { manager.unregister(sessionID) })
-	if got := manager.register(sessionID, func(relayEvent) {}); got != registerDuplicate {
+	duplicate, err := manager.BeginAttach(sessionID)
+	if err != nil {
+		t.Fatalf("duplicate BeginAttach() returned an error: %v", err)
+	}
+	defer duplicate.Release()
+	if got := manager.register(duplicate, func(relayEvent) {}); got != registerDuplicate {
 		t.Fatalf("duplicate register result = %d, want duplicate", got)
 	}
 
@@ -26,9 +38,51 @@ func TestManager_RegisterDistinguishesDrainAndDuplicate(t *testing.T) {
 	if event := <-events; event.reason != "owner" {
 		t.Fatalf("registered owner event reason = %q, want owner", event.reason)
 	}
+	draining, err := manager.BeginAttach(uuid.New())
+	if err != nil {
+		t.Fatalf("draining BeginAttach() returned an error before drain: %v", err)
+	}
+	defer draining.Release()
 	manager.draining = true
-	if got := manager.register(uuid.New(), func(relayEvent) {}); got != registerDraining {
+	if got := manager.register(draining, func(relayEvent) {}); got != registerDraining {
 		t.Fatalf("draining register result = %d, want draining", got)
+	}
+}
+
+func TestManager_ShutdownWaitsForAttachReservation(t *testing.T) {
+	manager := NewManager(nil, slog.New(slog.NewTextHandler(io.Discard, nil)), Options{
+		ShutdownGrace: time.Millisecond,
+	})
+	reservation, err := manager.BeginAttach(uuid.New())
+	if err != nil {
+		t.Fatalf("BeginAttach() returned an error: %v", err)
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- manager.Shutdown(shutdownCtx) }()
+
+	for {
+		probe, beginErr := manager.BeginAttach(uuid.New())
+		if errors.Is(beginErr, ErrDraining) {
+			break
+		}
+		if beginErr != nil {
+			t.Fatalf("BeginAttach() during shutdown returned an error: %v", beginErr)
+		}
+		probe.Release()
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case err := <-shutdownDone:
+		t.Fatalf("Shutdown() returned before reservation release: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	reservation.Release()
+	if err := <-shutdownDone; err != nil {
+		t.Fatalf("Shutdown() returned an error: %v", err)
 	}
 }
 

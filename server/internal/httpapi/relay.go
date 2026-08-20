@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -152,15 +153,23 @@ func (h *relayHandler) preflight(w http.ResponseWriter, request *http.Request) b
 		writeRelayError(w, http.StatusForbidden, "websocket origin is not allowed")
 		return false
 	}
-	if !h.manager.Accepting() {
-		w.Header().Set("Retry-After", "1")
-		writeRelayError(w, http.StatusServiceUnavailable, "server is shutting down")
-		return false
-	}
 	return true
 }
 
 func (h *relayHandler) attach(w http.ResponseWriter, request *http.Request, session data.Session) {
+	reservation, err := h.manager.BeginAttach(session.ID)
+	if errors.Is(err, relay.ErrDraining) {
+		w.Header().Set("Retry-After", "1")
+		writeRelayError(w, http.StatusServiceUnavailable, "server is shutting down")
+		return
+	}
+	if err != nil {
+		h.logger.Error("reserve relay attachment", "session_id", session.ID, "error", err)
+		writeRelayError(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+	defer reservation.Release()
+
 	if _, err := h.queries.StartSession(request.Context(), session.ID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			h.writeRejectedStart(w, request, session.ID)
@@ -182,22 +191,20 @@ func (h *relayHandler) attach(w http.ResponseWriter, request *http.Request, sess
 
 	client, err := h.upgrader.Upgrade(w, request, nil)
 	if err != nil {
-		closeErr := worker.WriteControl(
-			websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.CloseInternalServerErr, "client upgrade failed"),
-			time.Now().Add(time.Second),
-		)
+		closeErr := relay.ClosePeer(worker, websocket.CloseInternalServerErr, "client upgrade failed")
 		if connectionErr := worker.Close(); connectionErr != nil {
 			closeErr = errors.Join(closeErr, connectionErr)
 		}
-		if closeErr != nil && !errors.Is(closeErr, websocket.ErrCloseSent) {
+		if closeErr != nil &&
+			!errors.Is(closeErr, websocket.ErrCloseSent) &&
+			!errors.Is(closeErr, net.ErrClosed) {
 			h.logger.Debug("close worker after client upgrade failure", "session_id", session.ID, "error", closeErr)
 		}
 		h.failSession(session.ID)
 		h.logger.Warn("upgrade relay client", "session_id", session.ID, "error", err)
 		return
 	}
-	if err := h.manager.Run(session.ID, client, worker); err != nil &&
+	if err := h.manager.Run(reservation, client, worker); err != nil &&
 		!errors.Is(err, relay.ErrDraining) &&
 		!errors.Is(err, relay.ErrDuplicateRelay) {
 		h.logger.Error("run relay", "session_id", session.ID, "error", err)

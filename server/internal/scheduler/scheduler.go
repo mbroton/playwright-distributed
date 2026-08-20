@@ -18,10 +18,13 @@ import (
 )
 
 const (
-	maxClaimAttempts           = 8
-	claimRetryDelay            = 5 * time.Millisecond
-	defaultPollingInterval     = time.Second
-	defaultReconciliationGrace = 15 * time.Second
+	maxClaimAttempts       = 8
+	claimRetryDelay        = 5 * time.Millisecond
+	defaultPollingInterval = time.Second
+	// DefaultReconciliationGrace must exceed WORKER_DIAL_TIMEOUT. A session has
+	// started_at set while the server dials its worker, before worker heartbeats
+	// can report the session as active.
+	DefaultReconciliationGrace = 15 * time.Second
 )
 
 var (
@@ -86,7 +89,7 @@ func New(
 	}
 	reconciliationGrace := options.ReconciliationGrace
 	if reconciliationGrace <= 0 {
-		reconciliationGrace = defaultReconciliationGrace
+		reconciliationGrace = DefaultReconciliationGrace
 	}
 	if logger == nil {
 		logger = slog.Default()

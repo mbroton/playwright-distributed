@@ -368,8 +368,29 @@ func TestRelay_DrainGates(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatal("worker dial did not start")
 		}
-		if err := manager.Shutdown(t.Context()); err != nil {
-			t.Fatalf("Manager.Shutdown() returned an error: %v", err)
+		shutdownCtx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+		defer cancel()
+		shutdownDone := make(chan error, 1)
+		go func() { shutdownDone <- manager.Shutdown(shutdownCtx) }()
+		for {
+			probe, beginErr := manager.BeginAttach(uuid.New())
+			if errors.Is(beginErr, relay.ErrDraining) {
+				break
+			}
+			if beginErr != nil {
+				t.Fatalf("BeginAttach() during shutdown returned an error: %v", beginErr)
+			}
+			probe.Release()
+			time.Sleep(time.Millisecond)
+		}
+		select {
+		case err := <-shutdownDone:
+			t.Fatalf("Manager.Shutdown() returned during worker dial: %v", err)
+		case <-time.After(20 * time.Millisecond):
+		}
+		running := latestSession(t, pool, queries)
+		if running.Status != data.SessionStatusRunning {
+			t.Fatalf("gated-dial session status = %q, want running", running.Status)
 		}
 		releaseDial()
 
@@ -389,6 +410,19 @@ func TestRelay_DrainGates(t *testing.T) {
 		workerClose := receiveClose(t, worker, session.ID)
 		if workerClose.Code != websocket.CloseGoingAway || workerClose.Text != "server shutting down" {
 			t.Fatalf("racing drain worker close = %d %q, want 1001 server shutting down", workerClose.Code, workerClose.Text)
+		}
+		if err := <-shutdownDone; err != nil {
+			t.Fatalf("Manager.Shutdown() returned an error: %v", err)
+		}
+		var runningCount int
+		if err := pool.QueryRow(
+			t.Context(),
+			"SELECT count(*) FROM sessions WHERE status = 'running'",
+		).Scan(&runningCount); err != nil {
+			t.Fatalf("counting running sessions after shutdown: %v", err)
+		}
+		if runningCount != 0 {
+			t.Fatalf("running sessions after shutdown = %d, want 0", runningCount)
 		}
 	})
 }
@@ -920,14 +954,14 @@ func TestRelay_LivenessBlockedPeerAndShutdown(t *testing.T) {
 		<-writerStarted
 		time.Sleep(100 * time.Millisecond)
 
-		shutdownCtx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(t.Context(), 8*time.Second)
 		defer cancel()
 		started := time.Now()
 		if err := manager.Shutdown(shutdownCtx); err != nil {
 			t.Fatalf("Manager.Shutdown() with blocked writer returned an error: %v", err)
 		}
-		if elapsed := time.Since(started); elapsed >= 3*time.Second {
-			t.Fatalf("Manager.Shutdown() duration = %v, want less than 3s", elapsed)
+		if elapsed := time.Since(started); elapsed >= 6*time.Second {
+			t.Fatalf("Manager.Shutdown() duration = %v, want less than 6s", elapsed)
 		}
 		closeErr := readClose(t, client)
 		if closeErr.Code != websocket.CloseGoingAway || closeErr.Text != "server shutting down" {

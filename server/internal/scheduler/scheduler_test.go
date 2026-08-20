@@ -33,11 +33,11 @@ func TestNew_DefaultsNonPositiveReconciliationGrace(t *testing.T) {
 				slog.New(slog.NewTextHandler(io.Discard, nil)),
 				Options{ReconciliationGrace: grace},
 			)
-			if sessionScheduler.reconciliationGrace != defaultReconciliationGrace {
+			if sessionScheduler.reconciliationGrace != DefaultReconciliationGrace {
 				t.Fatalf(
 					"reconciliation grace = %s, want default %s",
 					sessionScheduler.reconciliationGrace,
-					defaultReconciliationGrace,
+					DefaultReconciliationGrace,
 				)
 			}
 		})

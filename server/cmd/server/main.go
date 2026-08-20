@@ -79,6 +79,9 @@ func run(ctx context.Context, args []string, stdout io.Writer, logger *slog.Logg
 	if err != nil {
 		return fmt.Errorf("loading server configuration: %w", err)
 	}
+	if err := validateRuntimeConfig(runtimeConfig); err != nil {
+		return err
+	}
 	if err := db.Migrate(ctx, pool); err != nil {
 		return err
 	}
@@ -127,10 +130,23 @@ func run(ctx context.Context, args []string, stdout io.Writer, logger *slog.Logg
 		address,
 		controlPlane.Handler,
 		runtimeConfig.QueueWaitTimeout+runtimeConfig.WorkerDialTimeout+shutdownBuffer,
-		runtimeConfig.ShutdownGracePeriod+relay.ShutdownCleanupBudget+shutdownBuffer,
+		runtimeConfig.ShutdownGracePeriod+
+			runtimeConfig.WorkerDialTimeout+
+			relay.ShutdownCleanupBudget+
+			shutdownBuffer,
 		relayManager,
 		logger,
 	)
+}
+
+func validateRuntimeConfig(runtimeConfig config.Config) error {
+	if runtimeConfig.WorkerDialTimeout >= scheduler.DefaultReconciliationGrace {
+		return fmt.Errorf(
+			"WORKER_DIAL_TIMEOUT must be less than the session reconciliation grace (%s)",
+			scheduler.DefaultReconciliationGrace,
+		)
+	}
+	return nil
 }
 
 func serve(
