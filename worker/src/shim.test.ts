@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
-import type { IncomingMessage } from 'node:http';
+import http, { type IncomingMessage } from 'node:http';
+import net from 'node:net';
+import { Duplex } from 'node:stream';
 import test from 'node:test';
 import WebSocket, { WebSocketServer } from 'ws';
 import { WebSocketShim } from './shim.js';
@@ -84,16 +86,104 @@ test('a client close closes the browser-side socket', async t => {
     assert.equal(fixture.shim.activeConnectionCount, 0);
 });
 
-async function createFixture(): Promise<{
+test('does not drop a frame sent as soon as the client opens', async t => {
+    const fixture = await createFixture(200);
+    t.after(() => fixture.close());
+
+    const upstreamMessage = fixture.nextUpstreamMessage();
+    const client = new WebSocket(fixture.shimUrl, {
+        headers: { 'x-pwd-session-id': sessionId },
+    });
+    client.once('open', () => client.send('first frame'));
+    t.after(() => client.terminate());
+
+    assert.deepEqual(await upstreamMessage, {
+        data: Buffer.from('first frame'),
+        isBinary: false,
+    });
+});
+
+test('shutdown resolves with a live session', async t => {
+    const fixture = await createFixture();
+    t.after(() => fixture.close());
+    const client = await connect(fixture.shimUrl, sessionId);
+    await waitFor(() => fixture.shim.activeConnectionCount === 1);
+
+    await bounded(fixture.shim.shutdown(), 500);
+    await waitForClose(client);
+});
+
+test('resetting rejected upgrades does not emit an uncaught exception', async t => {
+    const fixture = await createFixture();
+    t.after(() => fixture.close());
+    const uncaught: unknown[] = [];
+    const onUncaught = (error: unknown) => uncaught.push(error);
+    process.on('uncaughtException', onUncaught);
+    t.after(() => process.off('uncaughtException', onUncaught));
+
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+        await resetRejectedUpgrade(fixture.shimUrl);
+    }
+    await delay(30);
+
+    assert.deepEqual(uncaught, []);
+});
+
+test('removes a pending session ID after a malformed handshake', async t => {
+    const fixture = await createFixture();
+    t.after(() => fixture.close());
+
+    await sendMalformedUpgrade(fixture.shimUrl, sessionId);
+    const client = await connect(fixture.shimUrl, sessionId);
+    client.close();
+    await waitForClose(client);
+});
+
+test('shutting down takes precedence over duplicate session rejection', async t => {
+    const fixture = await createFixture();
+    t.after(() => fixture.close());
+    const internals = fixture.shim as unknown as {
+        shuttingDown: boolean;
+        pendingSessionIds: Set<string>;
+        handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void;
+    };
+    internals.shuttingDown = true;
+    internals.pendingSessionIds.add(sessionId);
+    let response = '';
+    const socket = new Duplex({
+        read() {},
+        write(chunk, _encoding, callback) {
+            response += chunk.toString();
+            callback();
+        },
+    });
+
+    internals.handleUpgrade(
+        { headers: { 'x-pwd-session-id': sessionId } } as unknown as IncomingMessage,
+        socket,
+        Buffer.alloc(0),
+    );
+
+    assert.match(response, /^HTTP\/1\.1 503 /);
+});
+
+async function createFixture(upstreamHandshakeDelayMs = 0): Promise<{
     shim: WebSocketShim;
     shimUrl: string;
     nextUpstreamRequest: () => Promise<IncomingMessage>;
     nextUpstreamSocket: () => Promise<WebSocket>;
+    nextUpstreamMessage: () => Promise<{ data: Buffer; isBinary: boolean }>;
     close: () => Promise<void>;
 }> {
-    const browser = new WebSocketServer({ host: '127.0.0.1', port: 0 });
-    await waitForListening(browser);
-    const browserAddress = browser.address();
+    const browserServer = http.createServer();
+    const browser = new WebSocketServer({ noServer: true });
+    browserServer.on('upgrade', (request, socket, head) => {
+        setTimeout(() => browser.handleUpgrade(request, socket, head, client => {
+            browser.emit('connection', client, request);
+        }), upstreamHandshakeDelayMs);
+    });
+    await listen(browserServer);
+    const browserAddress = browserServer.address();
     if (!browserAddress || typeof browserAddress === 'string') {
         throw new Error('fake browser did not use a TCP port');
     }
@@ -102,6 +192,8 @@ async function createFixture(): Promise<{
     const requestWaiters: Array<(request: IncomingMessage) => void> = [];
     const sockets: WebSocket[] = [];
     const socketWaiters: Array<(socket: WebSocket) => void> = [];
+    const messages: Array<{ data: Buffer; isBinary: boolean }> = [];
+    const messageWaiters: Array<(message: { data: Buffer; isBinary: boolean }) => void> = [];
     browser.on('connection', (socket, request) => {
         const requestWaiter = requestWaiters.shift();
         if (requestWaiter) {
@@ -115,12 +207,22 @@ async function createFixture(): Promise<{
         } else {
             sockets.push(socket);
         }
-        socket.on('message', (data, isBinary) => socket.send(data, { binary: isBinary }));
+        socket.on('message', (data, isBinary) => {
+            const message = { data: Buffer.from(data as Buffer), isBinary };
+            const waiter = messageWaiters.shift();
+            if (waiter) {
+                waiter(message);
+            } else {
+                messages.push(message);
+            }
+            socket.send(data, { binary: isBinary });
+        });
     });
 
     const shim = new WebSocketShim(`ws://127.0.0.1:${browserAddress.port}`, 0, '127.0.0.1');
     await shim.start();
 
+    let closePromise: Promise<void> | null = null;
     return {
         shim,
         shimUrl: `ws://127.0.0.1:${shim.listeningPort}`,
@@ -132,12 +234,20 @@ async function createFixture(): Promise<{
             const socket = sockets.shift();
             return socket ? Promise.resolve(socket) : new Promise(resolve => socketWaiters.push(resolve));
         },
-        close: async () => {
-            await shim.shutdown();
-            for (const socket of browser.clients) {
-                socket.terminate();
-            }
-            await new Promise<void>(resolve => browser.close(() => resolve()));
+        nextUpstreamMessage: () => {
+            const message = messages.shift();
+            return message ? Promise.resolve(message) : new Promise(resolve => messageWaiters.push(resolve));
+        },
+        close: () => {
+            closePromise ??= (async () => {
+                await shim.shutdown();
+                for (const socket of browser.clients) {
+                    socket.terminate();
+                }
+                await new Promise<void>(resolve => browser.close(() => resolve()));
+                await new Promise<void>(resolve => browserServer.close(() => resolve()));
+            })();
+            return closePromise;
         },
     };
 }
@@ -182,11 +292,66 @@ function waitForClose(socket: WebSocket): Promise<{ code: number; reason: Buffer
     });
 }
 
-function waitForListening(server: WebSocketServer): Promise<void> {
+function listen(server: http.Server): Promise<void> {
     return new Promise((resolve, reject) => {
-        server.once('listening', resolve);
         server.once('error', reject);
+        server.listen(0, '127.0.0.1', resolve);
     });
+}
+
+async function resetRejectedUpgrade(url: string): Promise<void> {
+    const parsed = new URL(url);
+    const socket = net.createConnection(Number(parsed.port), parsed.hostname);
+    socket.on('error', () => undefined);
+    await new Promise<void>(resolve => socket.once('connect', resolve));
+    socket.write(
+        'GET / HTTP/1.1\r\n' +
+        `Host: ${parsed.host}\r\n` +
+        'Connection: Upgrade\r\n' +
+        'Upgrade: websocket\r\n' +
+        'Sec-WebSocket-Version: 13\r\n' +
+        'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n' +
+        'x-pwd-session-id: invalid\r\n\r\n',
+    );
+    await delay(1);
+    socket.resetAndDestroy();
+}
+
+async function sendMalformedUpgrade(url: string, id: string): Promise<void> {
+    const parsed = new URL(url);
+    const socket = net.createConnection(Number(parsed.port), parsed.hostname);
+    socket.on('error', () => undefined);
+    await new Promise<void>(resolve => socket.once('connect', resolve));
+    const closed = new Promise<void>(resolve => socket.once('close', () => resolve()));
+    const response = new Promise<void>(resolve => {
+        socket.once('data', () => resolve());
+        socket.once('close', () => resolve());
+    });
+    socket.write(
+        'GET / HTTP/1.1\r\n' +
+        `Host: ${parsed.host}\r\n` +
+        'Connection: Upgrade\r\n' +
+        'Upgrade: websocket\r\n' +
+        'Sec-WebSocket-Version: 13\r\n' +
+        'Sec-WebSocket-Key: invalid\r\n' +
+        `x-pwd-session-id: ${id}\r\n\r\n`,
+    );
+    await bounded(response, 500);
+    socket.destroy();
+    await closed;
+}
+
+function delay(delayMs: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, delayMs));
+}
+
+async function bounded(operation: Promise<void>, timeoutMs: number): Promise<void> {
+    await Promise.race([
+        operation,
+        delay(timeoutMs).then(() => {
+            throw new Error(`operation did not finish within ${timeoutMs}ms`);
+        }),
+    ]);
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {

@@ -1,4 +1,4 @@
-import { client } from './api/client.gen.js';
+import { createClient, createConfig, type Client } from './api/client/index.js';
 import {
     heartbeatWorker,
     registerWorker,
@@ -18,37 +18,55 @@ export class ControlPlaneError extends Error {
     }
 }
 
-type Sleep = (delayMs: number) => Promise<void>;
+type Sleep = (delayMs: number, signal?: AbortSignal) => Promise<void>;
+
+const registrationTimeoutMs = 5_000;
+const statusTimeoutMs = 2_000;
 
 export class ControlPlaneClient {
+    private readonly client: Client;
+
     constructor(
         serverUrl: string,
         apiKey?: string,
-        private readonly sleep: Sleep = delay => new Promise(resolve => setTimeout(resolve, delay)),
+        private readonly heartbeatTimeoutMs = 5_000,
+        private readonly sleep: Sleep = abortableDelay,
     ) {
-        client.setConfig({
+        this.client = createClient(createConfig({
             baseUrl: serverUrl.replace(/\/$/, ''),
             headers: { Authorization: apiKey ? `Bearer ${apiKey}` : null },
-        });
+        }));
     }
 
     async register(
         registration: RegisterWorkerInputBody,
         attempts = 30,
         retryDelayMs = 1000,
+        signal?: AbortSignal,
     ): Promise<Worker> {
         let lastError: unknown;
         for (let attempt = 1; attempt <= attempts; attempt += 1) {
+            signal?.throwIfAborted();
             try {
-                const result = await registerWorker({ body: registration });
+                const result = await registerWorker({
+                    body: registration,
+                    client: this.client,
+                    signal: requestSignal(registrationTimeoutMs, signal),
+                });
                 if (result.data) {
                     return result.data;
                 }
                 throw responseError('register worker', result.response, result.error);
             } catch (error) {
                 lastError = error;
+                if (signal?.aborted) {
+                    signal.throwIfAborted();
+                }
+                if (isNonRetryableClientError(error)) {
+                    throw error;
+                }
                 if (attempt < attempts) {
-                    await this.sleep(retryDelayMs);
+                    await this.sleep(retryDelayMs, signal);
                 }
             }
         }
@@ -62,6 +80,8 @@ export class ControlPlaneClient {
         const result = await heartbeatWorker({
             path: { id: workerId },
             body: { active_session_ids: activeSessionIds },
+            client: this.client,
+            signal: requestSignal(this.heartbeatTimeoutMs),
         });
         if (result.data) {
             return result.data;
@@ -77,13 +97,46 @@ export class ControlPlaneClient {
         const result = await setWorkerStatus({
             path: { id: workerId },
             body: { status },
-            signal,
+            client: this.client,
+            signal: requestSignal(statusTimeoutMs, signal),
         });
         if (result.data) {
             return result.data;
         }
         throw responseError('set worker status', result.response, result.error);
     }
+}
+
+function requestSignal(timeoutMs: number, signal?: AbortSignal): AbortSignal {
+    const timeout = AbortSignal.timeout(timeoutMs);
+    return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
+function isNonRetryableClientError(error: unknown): boolean {
+    return error instanceof ControlPlaneError &&
+        error.status !== undefined &&
+        error.status >= 400 &&
+        error.status < 500 &&
+        error.status !== 408 &&
+        error.status !== 429;
+}
+
+function abortableDelay(delayMs: number, signal?: AbortSignal): Promise<void> {
+    return new Promise((resolve, reject) => {
+        if (signal?.aborted) {
+            reject(signal.reason);
+            return;
+        }
+        const onAbort = () => {
+            clearTimeout(timer);
+            reject(signal!.reason);
+        };
+        const timer = setTimeout(() => {
+            signal?.removeEventListener('abort', onAbort);
+            resolve();
+        }, delayMs);
+        signal?.addEventListener('abort', onAbort, { once: true });
+    });
 }
 
 function responseError(operation: string, response: Response | undefined, error: unknown): ControlPlaneError {

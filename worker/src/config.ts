@@ -33,11 +33,11 @@ export interface WorkerConfig {
 
 const schema = z.object({
     SERVER_URL: z.url({ protocol: /^https?$/, message: 'SERVER_URL must be an http(s) URL' }),
-    WORKER_API_KEY: z.string().min(1).optional(),
+    WORKER_API_KEY: z.string().transform(value => value || undefined).optional(),
     BROWSER_TYPE: z.enum(['chromium', 'firefox', 'webkit']).default('chromium'),
     PORT: z.coerce.number().int().min(1).max(65535).default(3131),
     PRIVATE_HOSTNAME: z.string().min(1).optional(),
-    MAX_SLOTS: z.coerce.number().int().min(1).default(5),
+    MAX_SLOTS: z.coerce.number().int().min(1).max(1024).default(5),
     HEADLESS: z.enum(['true', 'false']).default('true').transform(value => value === 'true'),
     HEARTBEAT_INTERVAL: z.coerce.number().int().min(1).default(5),
     DRAIN_TIMEOUT: z.coerce.number().int().min(0).default(300),

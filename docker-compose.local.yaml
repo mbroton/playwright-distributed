@@ -37,6 +37,7 @@ services:
     security_opt:
       - seccomp=./worker/seccomp_profile.json
     shm_size: "1gb"
+    stop_grace_period: 45s
     environment:
       - SERVER_URL=http://server:8080
       # Supported values: chromium, firefox, webkit
@@ -44,6 +45,7 @@ services:
       # Port for browser relay connections
       - PORT=3131
       - LOG_FORMAT=text
+      - DRAIN_TIMEOUT=30
       # Maximum number of concurrent browser sessions
       - MAX_SLOTS=5
     depends_on:
@@ -59,12 +61,14 @@ services:
     security_opt:
       - seccomp=./worker/seccomp_profile.json
     shm_size: "1gb"
+    stop_grace_period: 45s
     environment:
       - SERVER_URL=http://server:8080
       - BROWSER_TYPE=firefox
       # Port for browser relay connections
       - PORT=3131
       - LOG_FORMAT=text
+      - DRAIN_TIMEOUT=30
       # Maximum number of concurrent browser sessions
       - MAX_SLOTS=5
     depends_on:
@@ -80,12 +84,14 @@ services:
     security_opt:
       - seccomp=./worker/seccomp_profile.json
     shm_size: "1gb"
+    stop_grace_period: 45s
     environment:
       - SERVER_URL=http://server:8080
       - BROWSER_TYPE=webkit
       # Port for browser relay connections
       - PORT=3131
       - LOG_FORMAT=text
+      - DRAIN_TIMEOUT=30
       # Maximum number of concurrent browser sessions
       - MAX_SLOTS=5
     depends_on:

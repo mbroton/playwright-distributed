@@ -8,12 +8,20 @@ interface SessionSockets {
     upstream: WebSocket;
 }
 
+interface PendingSession {
+    clientSocket: Duplex;
+    upstream: WebSocket;
+}
+
 interface ShimEvents {
     sessionClose: [sessionId: string];
 }
 
 const sessionHeader = 'x-pwd-session-id';
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const upstreamHandshakeTimeoutMs = 10_000;
+const shutdownTimeoutMs = 1_000;
+const backpressureHighWaterMark = 1024 * 1024;
 
 export class WebSocketShim extends EventEmitter<ShimEvents> {
     private readonly server = http.createServer((_request, response) => {
@@ -22,8 +30,9 @@ export class WebSocketShim extends EventEmitter<ShimEvents> {
     private readonly webSocketServer = new WebSocketServer({ noServer: true });
     private readonly sessions = new Map<string, SessionSockets>();
     private readonly pendingSessionIds = new Set<string>();
-    private readonly pendingSessions = new Map<string, SessionSockets>();
+    private readonly pendingSessions = new Map<string, PendingSession>();
     private shuttingDown = false;
+    private shutdownPromise: Promise<void> | null = null;
     private listenPort: number | null = null;
 
     constructor(
@@ -84,74 +93,121 @@ export class WebSocketShim extends EventEmitter<ShimEvents> {
         this.removeSession(sessionId);
     }
 
-    async shutdown(): Promise<void> {
+    shutdown(): Promise<void> {
+        if (!this.shutdownPromise) {
+            this.shutdownPromise = this.runShutdown();
+        }
+        return this.shutdownPromise;
+    }
+
+    private async runShutdown(): Promise<void> {
         this.shuttingDown = true;
-        await new Promise<void>((resolve, reject) => {
-            if (!this.server.listening) {
-                resolve();
-                return;
-            }
-            this.server.close(error => error ? reject(error) : resolve());
-        });
+        const sessionSockets = [...this.sessions.values()];
         for (const sessionId of this.activeSessionIds) {
             this.closeSession(sessionId, 1001, 'worker shutting down');
         }
         for (const [sessionId, session] of this.pendingSessions) {
-            closeSocket(session.client, 1001, 'worker shutting down');
-            closeSocket(session.upstream, 1001, 'worker shutting down');
             this.pendingSessions.delete(sessionId);
             this.pendingSessionIds.delete(sessionId);
+            session.upstream.terminate();
+            if (!session.clientSocket.destroyed) {
+                rejectUpgrade(session.clientSocket, 503, 'Worker is shutting down');
+            }
         }
-        this.webSocketServer.close();
+
+        const closed = Promise.all([
+            closeWebSocketServer(this.webSocketServer),
+            closeHttpServer(this.server),
+        ]).then(() => undefined);
+        this.server.closeAllConnections();
+        await waitWithDeadline(closed, shutdownTimeoutMs, () => {
+            for (const session of sessionSockets) {
+                session.client.terminate();
+                session.upstream.terminate();
+            }
+            this.server.closeAllConnections();
+        });
     }
 
     private handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
+        socket.on('error', () => socket.destroy());
         const sessionId = singleHeader(request.headers[sessionHeader]);
         if (!sessionId || !uuidPattern.test(sessionId)) {
             rejectUpgrade(socket, 400, 'Invalid x-pwd-session-id');
-            return;
-        }
-        if (this.pendingSessionIds.has(sessionId) || this.sessions.has(sessionId)) {
-            rejectUpgrade(socket, 409, 'Session is already connected');
             return;
         }
         if (this.shuttingDown) {
             rejectUpgrade(socket, 503, 'Worker is shutting down');
             return;
         }
+        if (this.pendingSessionIds.has(sessionId) || this.sessions.has(sessionId)) {
+            rejectUpgrade(socket, 409, 'Session is already connected');
+            return;
+        }
 
         this.pendingSessionIds.add(sessionId);
-        this.webSocketServer.handleUpgrade(request, socket, head, client => {
-            this.connectUpstream(sessionId, request, client);
-        });
-    }
-
-    private connectUpstream(sessionId: string, request: IncomingMessage, client: WebSocket): void {
         const upstream = new WebSocket(this.browserEndpoint, {
             headers: forwardedHeaders(request.headers),
+            handshakeTimeout: upstreamHandshakeTimeoutMs,
         });
-        this.pendingSessions.set(sessionId, { client, upstream });
-        const failBeforeOpen = () => {
-            this.pendingSessionIds.delete(sessionId);
-            this.pendingSessions.delete(sessionId);
-            closeSocket(client, 1011, 'browser connection failed');
-        };
-        upstream.once('error', failBeforeOpen);
-        client.once('close', failBeforeOpen);
+        let onUpstreamError = () => undefined;
+        upstream.on('error', () => onUpstreamError());
+        this.pendingSessions.set(sessionId, { clientSocket: socket, upstream });
 
-        upstream.once('open', () => {
-            upstream.off('error', failBeforeOpen);
-            client.off('close', failBeforeOpen);
+        const clearPending = (): boolean => {
+            if (this.pendingSessions.get(sessionId)?.upstream !== upstream) {
+                return false;
+            }
             this.pendingSessionIds.delete(sessionId);
             this.pendingSessions.delete(sessionId);
-            if (client.readyState !== WebSocket.OPEN || this.shuttingDown) {
-                closeSocket(upstream, 1001, 'client disconnected');
-                closeSocket(client, 1001, 'worker shutting down');
+            socket.off('close', abortDial);
+            upstream.off('open', acceptClient);
+            return true;
+        };
+        const abortDial = () => {
+            if (clearPending()) {
+                upstream.terminate();
+            }
+        };
+        const rejectClient = (status: number, message: string) => {
+            if (!clearPending()) {
                 return;
             }
-            this.sessions.set(sessionId, { client, upstream });
-            this.pipeSession(sessionId, client, upstream);
-        });
+            upstream.terminate();
+            if (!socket.destroyed) {
+                rejectUpgrade(socket, status, message);
+            }
+        };
+        const acceptClient = () => {
+            if (this.shuttingDown) {
+                rejectClient(503, 'Worker is shutting down');
+                return;
+            }
+            if (socket.destroyed) {
+                abortDial();
+                return;
+            }
+            try {
+                this.webSocketServer.handleUpgrade(request, socket, head, client => {
+                    client.once('error', () => this.closeSession(sessionId, 1011, 'client connection failed'));
+                    this.sessions.set(sessionId, { client, upstream });
+                    this.pipeSession(sessionId, client, upstream);
+                    clearPending();
+                });
+            } catch {
+                rejectClient(400, 'Invalid WebSocket upgrade');
+            }
+        };
+
+        socket.once('close', abortDial);
+        onUpstreamError = () => {
+            if (this.pendingSessions.has(sessionId)) {
+                rejectClient(502, 'Browser connection failed');
+            } else {
+                this.closeSession(sessionId, 1011, 'browser connection failed');
+            }
+        };
+        upstream.once('open', acceptClient);
     }
 
     private pipeSession(sessionId: string, client: WebSocket, upstream: WebSocket): void {
@@ -160,8 +216,6 @@ export class WebSocketShim extends EventEmitter<ShimEvents> {
 
         client.once('close', (code, reason) => this.closePeer(sessionId, upstream, code, reason));
         upstream.once('close', (code, reason) => this.closePeer(sessionId, client, code, reason));
-        client.once('error', () => this.closeSession(sessionId, 1011, 'client connection failed'));
-        upstream.once('error', () => this.closeSession(sessionId, 1011, 'browser connection failed'));
     }
 
     private closePeer(sessionId: string, peer: WebSocket, code: number, reason: Buffer): void {
@@ -193,24 +247,26 @@ function forwardedHeaders(headers: IncomingHttpHeaders): IncomingHttpHeaders {
 }
 
 function forwardMessages(source: WebSocket, target: WebSocket, onError: () => void): void {
-    let pendingWrites = 0;
+    let paused = false;
     source.on('message', (data: RawData, isBinary: boolean) => {
         if (target.readyState !== WebSocket.OPEN) {
             onError();
             return;
         }
-        pendingWrites += 1;
-        source.pause();
         target.send(data, { binary: isBinary }, error => {
-            pendingWrites -= 1;
             if (error) {
                 onError();
                 return;
             }
-            if (pendingWrites === 0) {
+            if (paused && target.bufferedAmount <= backpressureHighWaterMark) {
+                paused = false;
                 source.resume();
             }
         });
+        if (!paused && target.bufferedAmount > backpressureHighWaterMark) {
+            paused = true;
+            source.pause();
+        }
     });
 }
 
@@ -232,6 +288,40 @@ function rejectUpgrade(socket: Duplex, status: number, message: string): void {
         `Content-Length: ${Buffer.byteLength(message)}\r\n\r\n` +
         message,
     );
+}
+
+function closeWebSocketServer(server: WebSocketServer): Promise<void> {
+    return new Promise(resolve => server.close(() => resolve()));
+}
+
+function closeHttpServer(server: http.Server): Promise<void> {
+    return new Promise((resolve, reject) => {
+        if (!server.listening) {
+            resolve();
+            return;
+        }
+        server.close(error => error ? reject(error) : resolve());
+    });
+}
+
+async function waitWithDeadline(
+    operation: Promise<void>,
+    timeoutMs: number,
+    onTimeout: () => void,
+): Promise<void> {
+    let timer: NodeJS.Timeout | null = null;
+    await Promise.race([
+        operation,
+        new Promise<void>(resolve => {
+            timer = setTimeout(() => {
+                onTimeout();
+                resolve();
+            }, timeoutMs);
+        }),
+    ]);
+    if (timer) {
+        clearTimeout(timer);
+    }
 }
 
 function singleHeader(value: string | string[] | undefined): string | undefined {

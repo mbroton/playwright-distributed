@@ -54,6 +54,18 @@ test('uses PRIVATE_HOSTNAME when set', () => {
     assert.equal(config.shim.privateHostname, 'worker-1');
 });
 
+test('accepts the server MAX_SLOTS limit and rejects larger values', () => {
+    assert.equal(parseConfig({ ...requiredEnvironment, MAX_SLOTS: '1024' }).shim.maxSlots, 1024);
+    assert.throws(() => parseConfig({ ...requiredEnvironment, MAX_SLOTS: '1025' }), ZodError);
+});
+
+test('treats an empty WORKER_API_KEY as unset', () => {
+    assert.deepEqual(
+        parseConfig({ ...requiredEnvironment, WORKER_API_KEY: '' }).controlPlane,
+        { serverUrl: requiredEnvironment.SERVER_URL },
+    );
+});
+
 test('parses boolean strings and rejects other boolean forms', () => {
     assert.equal(parseConfig({ ...requiredEnvironment, HEADLESS: 'false' }).browser.headless, false);
     assert.equal(parseConfig({ ...requiredEnvironment, HEADLESS: 'true' }).browser.headless, true);

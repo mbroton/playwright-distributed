@@ -2,8 +2,10 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import test from 'node:test';
+import WebSocket, { WebSocketServer } from 'ws';
 import { ControlPlaneClient } from './control-plane.js';
 import type { WorkerConfig } from './config.js';
+import { WebSocketShim } from './shim.js';
 import type {
     BrowserServerLike,
     ControlPlaneLike,
@@ -40,6 +42,44 @@ test('control-plane client sends bearer authorization on every API call', async 
     ]);
 });
 
+test('control-plane clients keep independent base URLs and authorization', async t => {
+    const firstRequests: Array<string | undefined> = [];
+    const secondRequests: Array<string | undefined> = [];
+    const first = await startControlPlane(async (request, response) => {
+        firstRequests.push(request.headers.authorization);
+        sendJSON(response, 201, { id: 'worker-1' });
+    });
+    const second = await startControlPlane(async (request, response) => {
+        secondRequests.push(request.headers.authorization);
+        sendJSON(response, 201, { id: 'worker-2' });
+    });
+    t.after(() => Promise.all([first.close(), second.close()]));
+
+    const firstClient = new ControlPlaneClient(first.url, 'first-secret');
+    const secondClient = new ControlPlaneClient(second.url, 'second-secret');
+    assert.equal((await firstClient.register(registration, 1)).id, 'worker-1');
+    assert.equal((await secondClient.register(registration, 1)).id, 'worker-2');
+
+    assert.deepEqual(firstRequests, ['Bearer first-secret']);
+    assert.deepEqual(secondRequests, ['Bearer second-secret']);
+});
+
+test('registration stops after one non-retryable response', async t => {
+    let attempts = 0;
+    const server = await startControlPlane(async (_request, response) => {
+        attempts += 1;
+        sendJSON(response, 422, { detail: 'address is invalid' });
+    });
+    t.after(() => server.close());
+
+    const controlPlane = new ControlPlaneClient(server.url);
+    await assert.rejects(
+        controlPlane.register(registration),
+        /HTTP 422: address is invalid/,
+    );
+    assert.equal(attempts, 1);
+});
+
 test('heartbeat is single-flight, reports sessions, and closes stale sessions', async t => {
     let concurrentHeartbeats = 0;
     let maxConcurrentHeartbeats = 0;
@@ -53,7 +93,7 @@ test('heartbeat is single-flight, reports sessions, and closes stale sessions', 
             concurrentHeartbeats += 1;
             maxConcurrentHeartbeats = Math.max(maxConcurrentHeartbeats, concurrentHeartbeats);
             heartbeatBodies.push(await readJSON(request));
-            await delay(40);
+            await delay(4);
             concurrentHeartbeats -= 1;
             sendJSON(response, 200, {
                 status: 'available',
@@ -77,6 +117,29 @@ test('heartbeat is single-flight, reports sessions, and closes stale sessions', 
     assert.deepEqual(shim.closedSessions, [{ sessionId: activeId, code: 1001 }]);
 });
 
+test('heartbeat requests time out and the loop keeps ticking', async t => {
+    let heartbeatAttempts = 0;
+    const server = await startControlPlane(async (request, response) => {
+        if (request.url === '/internal/workers') {
+            sendJSON(response, 201, { id: 'worker-1' });
+            return;
+        }
+        if (request.url?.endsWith('/heartbeat')) {
+            heartbeatAttempts += 1;
+            return;
+        }
+        sendJSON(response, 200, { id: 'worker-1' });
+    });
+    t.after(() => server.close());
+
+    const worker = createWorker(server.url, new FakeShim());
+    await worker.start();
+    await waitFor(() => heartbeatAttempts >= 3, 250);
+    await worker.shutdown(0);
+
+    assert.ok(heartbeatAttempts >= 3);
+});
+
 test('heartbeat draining status enters drain mode', async t => {
     const server = await startControlPlane(async (request, response) => {
         if (request.url === '/internal/workers') {
@@ -97,6 +160,19 @@ test('heartbeat draining status enters drain mode', async t => {
     await worker.shutdown(0);
 
     assert.equal(worker.state, 'shutting_down');
+});
+
+test('a draining worker re-asserts drain intent after an available heartbeat', async () => {
+    const controlPlane = new FakeControlPlane();
+    const shim = new FakeShim([activeId]);
+    const worker = createInjectedWorker(controlPlane, shim, 5_000);
+    await worker.start();
+    await worker.requestDrain('SIGTERM');
+
+    await waitFor(() => controlPlane.statuses.includes('draining'));
+    await worker.shutdown(0);
+
+    assert.equal(controlPlane.statuses[0], 'draining');
 });
 
 test('heartbeat 404 registers a new worker ID', async t => {
@@ -152,7 +228,92 @@ test('drain timeout forces shutdown with active connections', async () => {
     assert.equal(await worker.waitForExit(), 0);
 
     assert.equal(shim.shutdownCalled, true);
-    assert.deepEqual(controlPlane.statuses, ['shutting_down']);
+    assert.ok(controlPlane.statuses.includes('draining'));
+    assert.equal(controlPlane.statuses.at(-1), 'shutting_down');
+});
+
+test('drain timeout exits with a live session on the real shim', async t => {
+    const browser = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+    await waitForWebSocketServer(browser);
+    const address = browser.address();
+    if (!address || typeof address === 'string') {
+        throw new Error('browser fixture did not use a TCP port');
+    }
+    browser.on('connection', socket => socket.on('message', data => socket.send(data)));
+    const browserServer = new NetworkBrowser(browser, `ws://127.0.0.1:${address.port}`);
+    const controlPlane = new FakeControlPlane();
+    let shim!: WebSocketShim;
+    const worker = new BrowserWorker(testConfig(30, 0), {
+        controlPlane,
+        createShim: (endpoint, port) => {
+            shim = new WebSocketShim(endpoint, port, '127.0.0.1');
+            return shim;
+        },
+        launchBrowser: async () => browserServer,
+        exit: () => undefined,
+    });
+    t.after(() => browserServer.kill());
+    await worker.start();
+    const client = await connectWebSocket(`ws://127.0.0.1:${shim.listeningPort}`, activeId);
+    await waitFor(() => shim?.activeConnectionCount === 1);
+
+    await worker.requestDrain('control plane');
+    assert.equal(await bounded(worker.waitForExit(), 500), 0);
+    assert.equal(worker.state, 'shutting_down');
+    client.terminate();
+});
+
+test('startup does not resume after shutdown wins a registration race', async () => {
+    let resolveRegistration!: (worker: { id: string }) => void;
+    let registrationStarted = false;
+    let heartbeatCalls = 0;
+    const controlPlane: ControlPlaneLike = {
+        register: () => {
+            registrationStarted = true;
+            return new Promise(resolve => {
+                resolveRegistration = resolve;
+            });
+        },
+        heartbeat: async () => {
+            heartbeatCalls += 1;
+            return { status: 'available', stale_session_ids: [] };
+        },
+        setStatus: async () => undefined,
+    };
+    const worker = createInjectedWorker(controlPlane, new FakeShim(), 5_000);
+    const start = worker.start();
+    await waitFor(() => registrationStarted);
+
+    await worker.requestDrain('SIGTERM', true);
+    resolveRegistration({ id: 'late-worker' });
+    await start;
+    await delay(40);
+
+    assert.equal(worker.state, 'shutting_down');
+    assert.equal(heartbeatCalls, 0);
+});
+
+test('a hanging cleanup step cannot block worker exit', async () => {
+    const worker = new BrowserWorker(testConfig(5_000), {
+        controlPlane: new FakeControlPlane(),
+        createShim: () => new HangingShutdownShim(),
+        launchBrowser: async () => new FakeBrowser(),
+        exit: () => undefined,
+        cleanupTimeoutMs: 20,
+    });
+    await worker.start();
+
+    await worker.requestDrain('control plane');
+    assert.equal(await bounded(worker.waitForExit(), 200), 0);
+});
+
+test('registration uses the port that the shim bound', async () => {
+    const controlPlane = new FakeControlPlane();
+    const worker = createInjectedWorker(controlPlane, new FakeShim([], 4321), 5_000);
+    await worker.start();
+    await worker.shutdown(0);
+
+    assert.equal(controlPlane.registrations[0]?.address, 'ws://worker-test:4321/');
 });
 
 test('browser close timeout kills the browser before exit', async () => {
@@ -186,7 +347,7 @@ class FakeShim extends EventEmitter implements ShimLike {
     shutdownCalled = false;
     private readonly sessions: string[];
 
-    constructor(sessionIds: string[] = []) {
+    constructor(sessionIds: string[] = [], readonly listeningPort = 3131) {
         super();
         this.sessions = [...sessionIds];
     }
@@ -216,6 +377,12 @@ class FakeShim extends EventEmitter implements ShimLike {
     }
 }
 
+class HangingShutdownShim extends FakeShim {
+    override async shutdown(): Promise<void> {
+        await new Promise<void>(() => undefined);
+    }
+}
+
 class FakeBrowser extends EventEmitter implements BrowserServerLike {
     killCalled = false;
 
@@ -240,10 +407,43 @@ class FakeBrowser extends EventEmitter implements BrowserServerLike {
     }
 }
 
+class NetworkBrowser extends EventEmitter implements BrowserServerLike {
+    private closed = false;
+
+    constructor(
+        private readonly server: WebSocketServer,
+        private readonly endpoint: string,
+    ) {
+        super();
+    }
+
+    wsEndpoint(): string {
+        return this.endpoint;
+    }
+
+    async close(): Promise<void> {
+        if (this.closed) {
+            return;
+        }
+        this.closed = true;
+        await new Promise<void>(resolve => this.server.close(() => resolve()));
+        this.emit('close');
+    }
+
+    async kill(): Promise<void> {
+        for (const socket of this.server.clients) {
+            socket.terminate();
+        }
+        await this.close();
+    }
+}
+
 class FakeControlPlane implements ControlPlaneLike {
     readonly statuses: string[] = [];
+    readonly registrations: WorkerRegistration[] = [];
 
-    async register(_registration: WorkerRegistration): Promise<{ id: string }> {
+    async register(registration: WorkerRegistration): Promise<{ id: string }> {
+        this.registrations.push(registration);
         return { id: 'worker-1' };
     }
 
@@ -257,8 +457,9 @@ class FakeControlPlane implements ControlPlaneLike {
 }
 
 function createWorker(serverUrl: string, shim: FakeShim): BrowserWorker {
-    return new BrowserWorker(testConfig(1_000), {
-        controlPlane: new ControlPlaneClient(serverUrl),
+    const config = testConfig(1_000);
+    return new BrowserWorker(config, {
+        controlPlane: new ControlPlaneClient(serverUrl, undefined, config.lifecycle.heartbeatIntervalMs),
         createShim: () => shim,
         launchBrowser: async () => new FakeBrowser(),
         exit: () => undefined,
@@ -278,11 +479,11 @@ function createInjectedWorker(
     });
 }
 
-function testConfig(drainTimeoutMs: number): WorkerConfig {
+function testConfig(drainTimeoutMs: number, port = 3131): WorkerConfig {
     return {
         controlPlane: { serverUrl: 'http://127.0.0.1:1' },
         browser: { type: 'chromium', headless: true },
-        shim: { port: 3131, privateHostname: 'worker-test', maxSlots: 5 },
+        shim: { port, privateHostname: 'worker-test', maxSlots: 5 },
         lifecycle: { heartbeatIntervalMs: 10, drainTimeoutMs },
         logging: { level: 'error', format: 'json' },
     };
@@ -304,7 +505,10 @@ async function startControlPlane(
     }
     return {
         url: `http://127.0.0.1:${address.port}`,
-        close: () => new Promise(resolve => server.close(() => resolve())),
+        close: () => new Promise(resolve => {
+            server.close(() => resolve());
+            server.closeAllConnections();
+        }),
     };
 }
 
@@ -333,4 +537,29 @@ async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<voi
         }
         await delay(5);
     }
+}
+
+function waitForWebSocketServer(server: WebSocketServer): Promise<void> {
+    return new Promise((resolve, reject) => {
+        server.once('listening', resolve);
+        server.once('error', reject);
+    });
+}
+
+function connectWebSocket(url: string, id: string): Promise<WebSocket> {
+    return new Promise((resolve, reject) => {
+        const socket = new WebSocket(url, { headers: { 'x-pwd-session-id': id } });
+        socket.on('error', () => undefined);
+        socket.once('open', () => resolve(socket));
+        socket.once('error', reject);
+    });
+}
+
+async function bounded<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
+    return Promise.race([
+        operation,
+        delay(timeoutMs).then(() => {
+            throw new Error(`operation did not finish within ${timeoutMs}ms`);
+        }),
+    ]);
 }

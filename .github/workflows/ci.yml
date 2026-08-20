@@ -211,6 +211,20 @@ jobs:
             fi
           done
 
+      - name: Verify worker drains on stop
+        run: |
+          docker compose -f docker-compose.local.yaml stop -t 40 worker
+          container_id="$(docker compose -f docker-compose.local.yaml ps -aq worker)"
+          test "$(docker inspect --format '{{.State.ExitCode}}' "$container_id")" -eq 0
+          docker compose -f docker-compose.local.yaml logs worker | grep -q 'Worker is draining'
+
+      - name: Verify worker scaling
+        run: |
+          docker compose -f docker-compose.local.yaml up -d --scale worker=3
+          sleep 10
+          workers="$(curl -fsS http://127.0.0.1:8080/v1/capacity | jq '[.browsers[] | select(.browser == "chromium")][0].workers // 0')"
+          test "$workers" -eq 3
+
       - name: Show service logs on failure
         if: failure()
         run: docker compose -f docker-compose.local.yaml logs
