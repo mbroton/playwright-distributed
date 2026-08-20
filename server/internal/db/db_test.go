@@ -13,7 +13,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
@@ -265,26 +264,28 @@ func TestQueries(t *testing.T) {
 
 	metadata := []byte(`{"browserName":"chromium"}`)
 	sessionBefore := databaseTime(t, pool)
-	session, err := queries.InsertSession(t.Context(), data.InsertSessionParams{
-		ID:                sessionID,
-		WorkerID:          workerID,
-		Browser:           "chromium",
-		PlaywrightVersion: "1.58.2",
-		WorkerAddress:     "ws://worker:3000",
-		Mode:              data.SessionModeDedicated,
-		Status:            data.SessionStatusPending,
-		CreatedByKey:      &keyID,
-		ExpiresAt:         timePointer(now.Add(time.Hour)),
-		KeepAliveMs:       pgtype.Int4{Int32: 30_000, Valid: true},
-		ConnectMetadata:   metadata,
+	keepAliveMs := int32(30_000)
+	mustInsertTestSession(t, pool, testSessionSpec{
+		id:                sessionID,
+		workerID:          workerID,
+		browser:           "chromium",
+		playwrightVersion: "1.58.2",
+		workerAddress:     "ws://worker:3000",
+		mode:              data.SessionModeDedicated,
+		status:            data.SessionStatusPending,
+		createdByKey:      &keyID,
+		expiresAt:         timePointer(now.Add(time.Hour)),
+		keepAliveMs:       &keepAliveMs,
+		connectMetadata:   metadata,
 	})
-	if err != nil {
-		t.Fatalf("InsertSession() returned an error: %v", err)
-	}
 	sessionAfter := databaseTime(t, pool)
-	assertTimeBetween(t, "InsertSession().LastHeartbeat", session.LastHeartbeat, sessionBefore, sessionAfter)
+	session, err := queries.GetSession(t.Context(), sessionID)
+	if err != nil {
+		t.Fatalf("GetSession() after test insert returned an error: %v", err)
+	}
+	assertTimeBetween(t, "inserted session LastHeartbeat", session.LastHeartbeat, sessionBefore, sessionAfter)
 	if session.ID != sessionID || session.Mode != data.SessionModeDedicated || session.CreatedAt.IsZero() {
-		t.Fatalf("InsertSession() = %+v, want inserted dedicated session", session)
+		t.Fatalf("inserted session = %+v, want dedicated session", session)
 	}
 
 	gotSession, err := queries.GetSession(t.Context(), sessionID)
@@ -346,18 +347,11 @@ func TestQueries(t *testing.T) {
 	}
 
 	expiredSessionID := testUUID(4)
-	_, err = queries.InsertSession(t.Context(), data.InsertSessionParams{
-		ID:                expiredSessionID,
-		WorkerID:          workerID,
-		Browser:           "chromium",
-		PlaywrightVersion: "1.58.2",
-		WorkerAddress:     "ws://worker:3000",
-		Mode:              data.SessionModeDefault,
-		Status:            data.SessionStatusExpired,
+	mustInsertTestSession(t, pool, testSessionSpec{
+		id:       expiredSessionID,
+		workerID: workerID,
+		status:   data.SessionStatusExpired,
 	})
-	if err != nil {
-		t.Fatalf("InsertSession(expired) returned an error: %v", err)
-	}
 	if _, err := queries.CompleteSession(t.Context(), expiredSessionID); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("CompleteSession() for expired session error = %v, want %v", err, pgx.ErrNoRows)
 	}
@@ -434,14 +428,11 @@ func TestEnumConstraints(t *testing.T) {
 	}
 	for index, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			_, err := queries.InsertSession(t.Context(), data.InsertSessionParams{
-				ID:                testUUID(byte(11 + index)),
-				WorkerID:          workerID,
-				Browser:           "chromium",
-				PlaywrightVersion: "1.58.2",
-				WorkerAddress:     "ws://worker:3000",
-				Mode:              test.mode,
-				Status:            test.status,
+			err := insertTestSession(t, pool, testSessionSpec{
+				id:       testUUID(byte(11 + index)),
+				workerID: workerID,
+				mode:     test.mode,
+				status:   test.status,
 			})
 			assertPGCode(t, test.name, err, "22P02")
 		})
@@ -456,29 +447,24 @@ func TestForeignKeys(t *testing.T) {
 	missingWorkerSessionID := testUUID(22)
 	keySessionID := testUUID(24)
 
-	_, err := queries.InsertSession(t.Context(), data.InsertSessionParams{
-		ID:                missingWorkerSessionID,
-		WorkerID:          workerID,
-		Browser:           "firefox",
-		PlaywrightVersion: "1.57.0",
-		WorkerAddress:     "ws://removed-worker:3000",
-		Mode:              data.SessionModeDefault,
-		Status:            data.SessionStatusCompleted,
+	err := insertTestSession(t, pool, testSessionSpec{
+		id:                missingWorkerSessionID,
+		workerID:          workerID,
+		browser:           "firefox",
+		playwrightVersion: "1.57.0",
+		workerAddress:     "ws://removed-worker:3000",
+		status:            data.SessionStatusCompleted,
 	})
 	if err != nil {
-		t.Fatalf("InsertSession() with missing worker returned an error: %v", err)
+		t.Fatalf("inserting session with missing worker: %v", err)
 	}
 
 	insertWorker(t, queries, workerID)
-	_, err = queries.InsertSession(t.Context(), data.InsertSessionParams{
-		ID:                testUUID(23),
-		WorkerID:          workerID,
-		Browser:           "chromium",
-		PlaywrightVersion: "1.58.2",
-		WorkerAddress:     "ws://worker:3000",
-		Mode:              data.SessionModeDefault,
-		Status:            data.SessionStatusPending,
-		CreatedByKey:      &keyID,
+	err = insertTestSession(t, pool, testSessionSpec{
+		id:           testUUID(23),
+		workerID:     workerID,
+		status:       data.SessionStatusPending,
+		createdByKey: &keyID,
 	})
 	assertPGCode(t, "missing api key", err, "23503")
 
@@ -491,18 +477,14 @@ func TestForeignKeys(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InsertAPIKey() returned an error: %v", err)
 	}
-	_, err = queries.InsertSession(t.Context(), data.InsertSessionParams{
-		ID:                keySessionID,
-		WorkerID:          workerID,
-		Browser:           "chromium",
-		PlaywrightVersion: "1.58.2",
-		WorkerAddress:     "ws://worker:3000",
-		Mode:              data.SessionModeDefault,
-		Status:            data.SessionStatusPending,
-		CreatedByKey:      &keyID,
+	err = insertTestSession(t, pool, testSessionSpec{
+		id:           keySessionID,
+		workerID:     workerID,
+		status:       data.SessionStatusPending,
+		createdByKey: &keyID,
 	})
 	if err != nil {
-		t.Fatalf("InsertSession() returned an error: %v", err)
+		t.Fatalf("inserting session with API key: %v", err)
 	}
 
 	if err := queries.DeleteWorker(t.Context(), workerID); err != nil {
@@ -563,49 +545,49 @@ func TestCheckConstraints(t *testing.T) {
 	)
 	assertPGCode(t, "negative worker lifetime sessions", err, "23514")
 
-	_, err = queries.InsertSession(t.Context(), data.InsertSessionParams{
-		ID:                testUUID(31),
-		WorkerID:          workerID,
-		Browser:           "chromium",
-		PlaywrightVersion: "1.58.2",
-		WorkerAddress:     "ws://worker:3000",
-		Mode:              data.SessionModeDefault,
-		Status:            data.SessionStatusPending,
-		KeepAliveMs:       pgtype.Int4{Int32: -1, Valid: true},
+	negativeKeepAlive := int32(-1)
+	err = insertTestSession(t, pool, testSessionSpec{
+		id:          testUUID(31),
+		workerID:    workerID,
+		status:      data.SessionStatusPending,
+		keepAliveMs: &negativeKeepAlive,
 	})
 	assertPGCode(t, "negative session keep alive", err, "23514")
 
-	_, err = queries.InsertSession(t.Context(), data.InsertSessionParams{
-		ID:                testUUID(32),
-		WorkerID:          workerID,
-		Browser:           "invalid",
-		PlaywrightVersion: "1.58.2",
-		WorkerAddress:     "ws://worker:3000",
-		Mode:              data.SessionModeDefault,
-		Status:            data.SessionStatusPending,
+	err = insertTestSession(t, pool, testSessionSpec{
+		id:       testUUID(32),
+		workerID: workerID,
+		browser:  "invalid",
+		status:   data.SessionStatusPending,
 	})
 	assertPGCode(t, "invalid session browser", err, "23514")
+
+	_, err = pool.Exec(
+		t.Context(),
+		`INSERT INTO sessions (
+    id, worker_id, browser, playwright_version, worker_address,
+    mode, status, last_heartbeat
+) VALUES ($1, $2, 'chromium', '1.58.2', 'ws://worker:3000', 'default', 'running', now())`,
+		testUUID(33),
+		workerID,
+	)
+	assertPGCode(t, "running session without started_at", err, "23514")
 }
 
-func TestInsertSessionDefaultMetadata(t *testing.T) {
+func TestSessionDefaultMetadata(t *testing.T) {
 	pool := newMigratedTestPool(t)
 	queries := data.New(pool)
 	workerID := testUUID(40)
 	sessionID := testUUID(41)
 	insertWorker(t, queries, workerID)
 
-	_, err := queries.InsertSession(t.Context(), data.InsertSessionParams{
-		ID:                sessionID,
-		WorkerID:          workerID,
-		Browser:           "chromium",
-		PlaywrightVersion: "1.58.2",
-		WorkerAddress:     "ws://worker:3000",
-		Mode:              data.SessionModeDefault,
-		Status:            data.SessionStatusPending,
-		ConnectMetadata:   nil,
+	err := insertTestSession(t, pool, testSessionSpec{
+		id:       sessionID,
+		workerID: workerID,
+		status:   data.SessionStatusPending,
 	})
 	if err != nil {
-		t.Fatalf("InsertSession() with nil metadata returned an error: %v", err)
+		t.Fatalf("inserting session with nil metadata: %v", err)
 	}
 
 	session, err := queries.GetSession(t.Context(), sessionID)
@@ -647,9 +629,9 @@ func TestCountRunningSessionsByWorker(t *testing.T) {
 	insertWorker(t, queries, workerA)
 	insertWorker(t, queries, workerB)
 
-	insertSession(t, queries, testUUID(62), workerA, data.SessionStatusRunning)
-	insertSession(t, queries, testUUID(63), workerA, data.SessionStatusCompleted)
-	insertSession(t, queries, testUUID(64), workerB, data.SessionStatusRunning)
+	mustInsertTestSession(t, pool, testSessionSpec{id: testUUID(62), workerID: workerA, status: data.SessionStatusRunning})
+	mustInsertTestSession(t, pool, testSessionSpec{id: testUUID(63), workerID: workerA, status: data.SessionStatusCompleted})
+	mustInsertTestSession(t, pool, testSessionSpec{id: testUUID(64), workerID: workerB, status: data.SessionStatusRunning})
 
 	countA, err := queries.CountRunningSessionsByWorker(t.Context(), workerA)
 	if err != nil {
@@ -668,12 +650,12 @@ func TestCountRunningSessionsByWorker(t *testing.T) {
 	}
 }
 
-func TestOpen_RejectsPoolTooSmallForListener(t *testing.T) {
+func TestOpen_RequiresOperationalPoolHeadroom(t *testing.T) {
 	_, err := db.Open(
 		t.Context(),
 		"postgres://server_test:server_test@localhost/server_test?pool_max_conns=1",
 	)
-	if err == nil || !strings.Contains(err.Error(), "max_conns must be at least 2") {
+	if err == nil || !strings.Contains(err.Error(), "max_conns must be at least 2 for operational headroom") {
 		t.Fatalf("Open() error = %v, want minimum pool size error", err)
 	}
 }
@@ -735,26 +717,65 @@ func insertWorker(t *testing.T, queries *data.Queries, id uuid.UUID) {
 	}
 }
 
-func insertSession(
-	t *testing.T,
-	queries *data.Queries,
-	id uuid.UUID,
-	workerID uuid.UUID,
-	status data.SessionStatus,
-) {
-	t.Helper()
+type testSessionSpec struct {
+	id                uuid.UUID
+	workerID          uuid.UUID
+	browser           string
+	playwrightVersion string
+	workerAddress     string
+	mode              data.SessionMode
+	status            data.SessionStatus
+	createdByKey      *uuid.UUID
+	expiresAt         *time.Time
+	keepAliveMs       *int32
+	connectMetadata   []byte
+}
 
-	_, err := queries.InsertSession(t.Context(), data.InsertSessionParams{
-		ID:                id,
-		WorkerID:          workerID,
-		Browser:           "chromium",
-		PlaywrightVersion: "1.58.2",
-		WorkerAddress:     "ws://worker:3000",
-		Mode:              data.SessionModeDefault,
-		Status:            status,
-	})
-	if err != nil {
-		t.Fatalf("InsertSession() returned an error: %v", err)
+func insertTestSession(t *testing.T, pool *pgxpool.Pool, spec testSessionSpec) error {
+	t.Helper()
+	if spec.browser == "" {
+		spec.browser = "chromium"
+	}
+	if spec.playwrightVersion == "" {
+		spec.playwrightVersion = "1.58.2"
+	}
+	if spec.workerAddress == "" {
+		spec.workerAddress = "ws://worker:3000"
+	}
+	if spec.mode == "" {
+		spec.mode = data.SessionModeDefault
+	}
+
+	_, err := pool.Exec(
+		t.Context(),
+		`INSERT INTO sessions (
+    id, worker_id, browser, playwright_version, worker_address, mode, status,
+    created_by_key, started_at, expires_at, last_heartbeat, keep_alive_ms,
+    connect_metadata
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8,
+    CASE WHEN $7::session_status = 'running' THEN now() END,
+    $9, now(), $10, COALESCE($11::jsonb, '{}'::jsonb)
+)`,
+		spec.id,
+		spec.workerID,
+		spec.browser,
+		spec.playwrightVersion,
+		spec.workerAddress,
+		spec.mode,
+		spec.status,
+		spec.createdByKey,
+		spec.expiresAt,
+		spec.keepAliveMs,
+		spec.connectMetadata,
+	)
+	return err
+}
+
+func mustInsertTestSession(t *testing.T, pool *pgxpool.Pool, spec testSessionSpec) {
+	t.Helper()
+	if err := insertTestSession(t, pool, spec); err != nil {
+		t.Fatalf("inserting test session: %v", err)
 	}
 }
 

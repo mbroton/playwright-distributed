@@ -8,6 +8,7 @@ components:
           format: int64
           type: integer
         available_slots:
+          description: Free slots on eligible workers; can exceed max_slots - active_sessions, which is fleet-wide.
           format: int64
           type: integer
         browser:
@@ -55,6 +56,7 @@ components:
           format: int64
           type: integer
         available_slots:
+          description: Free slots on eligible workers; can exceed max_slots - active_sessions, which is fleet-wide.
           format: int64
           type: integer
         max_slots:

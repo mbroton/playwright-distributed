@@ -25,10 +25,11 @@ const (
 )
 
 var (
-	ErrNoCapacity  = errors.New("scheduler: no capacity")
-	ErrQueueFull   = errors.New("scheduler: queue full")
-	ErrWaitTimeout = errors.New("scheduler: queue wait timeout")
-	ErrDraining    = errors.New("scheduler: draining")
+	ErrNoCapacity      = errors.New("scheduler: no capacity")
+	ErrQueueFull       = errors.New("scheduler: queue full")
+	ErrWaitTimeout     = errors.New("scheduler: queue wait timeout")
+	ErrDraining        = errors.New("scheduler: draining")
+	errUncertainCommit = errors.New("scheduler: uncertain session claim commit")
 )
 
 type Options struct {
@@ -54,11 +55,11 @@ type Capacity struct {
 }
 
 type Scheduler struct {
-	pool    *pgxpool.Pool
-	queries *data.Queries
-	waker   *Waker
-	logger  *slog.Logger
-	drain   <-chan struct{}
+	pool         *pgxpool.Pool
+	queries      *data.Queries
+	waker        *Waker
+	logger       *slog.Logger
+	lifecycleCtx context.Context
 
 	workerTTL           time.Duration
 	pendingSessionTTL   time.Duration
@@ -83,7 +84,7 @@ func New(
 		pollingInterval = defaultPollingInterval
 	}
 	reconciliationGrace := options.ReconciliationGrace
-	if reconciliationGrace == 0 {
+	if reconciliationGrace <= 0 {
 		reconciliationGrace = defaultReconciliationGrace
 	}
 	if logger == nil {
@@ -95,7 +96,7 @@ func New(
 		queries:             data.New(pool),
 		waker:               NewWaker(),
 		logger:              logger,
-		drain:               ctx.Done(),
+		lifecycleCtx:        ctx,
 		workerTTL:           options.WorkerTTL,
 		pendingSessionTTL:   options.PendingSessionTTL,
 		maxLifetimeSessions: options.MaxLifetimeSessions,
@@ -132,6 +133,9 @@ func (s *Scheduler) Claim(ctx context.Context, request ClaimRequest) (data.Sessi
 }
 
 func (s *Scheduler) Admit(ctx context.Context, request ClaimRequest) (data.Session, error) {
+	if s.isDraining() {
+		return data.Session{}, ErrDraining
+	}
 	session, err := s.Claim(ctx, request)
 	if err == nil {
 		return session, nil
@@ -139,10 +143,8 @@ func (s *Scheduler) Admit(ctx context.Context, request ClaimRequest) (data.Sessi
 	if !errors.Is(err, ErrNoCapacity) {
 		return data.Session{}, err
 	}
-	select {
-	case <-s.drain:
+	if s.isDraining() {
 		return data.Session{}, ErrDraining
-	default:
 	}
 	if !s.enterQueue() {
 		return data.Session{}, ErrQueueFull
@@ -156,11 +158,29 @@ func (s *Scheduler) Admit(ctx context.Context, request ClaimRequest) (data.Sessi
 	pollTimer := time.NewTimer(jitteredPollingInterval(s.pollingInterval))
 	defer pollTimer.Stop()
 	loggedClaimError := false
+	excluded := []uuid.UUID{}
 
 	for {
-		session, _, err = s.claimOnce(waitCtx, request, []uuid.UUID{})
+		if waitErr := s.queueWaitError(ctx, waitCtx); waitErr != nil {
+			return data.Session{}, waitErr
+		}
+
+		claimCtx, cancelClaim := context.WithCancel(waitCtx)
+		stopDrainCancel := context.AfterFunc(s.lifecycleCtx, cancelClaim)
+		session, fullWorkerID, claimErr := s.claimOnce(claimCtx, request, excluded)
+		stopDrainCancel()
+		cancelClaim()
+		err = claimErr
 		if err == nil {
 			return session, nil
+		}
+		if errors.Is(err, ErrNoCapacity) && fullWorkerID != nil {
+			excluded = append(excluded, *fullWorkerID)
+			continue
+		}
+		excluded = excluded[:0]
+		if errors.Is(err, errUncertainCommit) {
+			return data.Session{}, err
 		}
 		if waitErr := s.queueWaitError(ctx, waitCtx); waitErr != nil {
 			return data.Session{}, waitErr
@@ -176,7 +196,7 @@ func (s *Scheduler) Admit(ctx context.Context, request ClaimRequest) (data.Sessi
 		select {
 		case <-waitCtx.Done():
 			return data.Session{}, s.queueWaitError(ctx, waitCtx)
-		case <-s.drain:
+		case <-s.lifecycleCtx.Done():
 			return data.Session{}, ErrDraining
 		case <-wake:
 		case <-pollTimer.C:
@@ -328,10 +348,11 @@ func (s *Scheduler) claimOnce(
 	if _, err := queries.IncrementWorkerLifetimeSessions(ctx, worker.ID); err != nil {
 		return data.Session{}, nil, fmt.Errorf("incrementing worker lifetime sessions: %w", err)
 	}
-	// Cancellation during this commit round trip can hide a committed row. The
-	// pending-session TTL is the deliberate backstop; retrying could over-admit.
+	// Cancellation or a connection failure during this commit round trip can
+	// hide a committed row. The pending-session TTL is the backstop for that
+	// maybe-committed row; never auto-retry past an uncertain commit.
 	if err := tx.Commit(ctx); err != nil {
-		return data.Session{}, nil, fmt.Errorf("committing session claim: %w", err)
+		return data.Session{}, nil, fmt.Errorf("%w: %v", errUncertainCommit, err)
 	}
 
 	return session, nil, nil
@@ -342,7 +363,7 @@ func (s *Scheduler) queueWaitError(ctx, waitCtx context.Context) error {
 		return err
 	}
 	select {
-	case <-s.drain:
+	case <-s.lifecycleCtx.Done():
 		return ErrDraining
 	default:
 	}
@@ -350,6 +371,10 @@ func (s *Scheduler) queueWaitError(ctx, waitCtx context.Context) error {
 		return ErrWaitTimeout
 	}
 	return waitCtx.Err()
+}
+
+func (s *Scheduler) isDraining() bool {
+	return s.lifecycleCtx.Err() != nil
 }
 
 func (s *Scheduler) enterQueue() bool {

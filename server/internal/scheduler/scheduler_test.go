@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
@@ -22,6 +23,26 @@ import (
 )
 
 const postgresImage = "postgres:18-alpine"
+
+func TestNew_DefaultsNonPositiveReconciliationGrace(t *testing.T) {
+	for _, grace := range []time.Duration{0, -time.Second} {
+		t.Run(grace.String(), func(t *testing.T) {
+			sessionScheduler := New(
+				t.Context(),
+				nil,
+				slog.New(slog.NewTextHandler(io.Discard, nil)),
+				Options{ReconciliationGrace: grace},
+			)
+			if sessionScheduler.reconciliationGrace != defaultReconciliationGrace {
+				t.Fatalf(
+					"reconciliation grace = %s, want default %s",
+					sessionScheduler.reconciliationGrace,
+					defaultReconciliationGrace,
+				)
+			}
+		})
+	}
+}
 
 func TestScheduler_Claims(t *testing.T) {
 	pool := newMigratedTestPool(t)
@@ -150,13 +171,19 @@ func TestScheduler_Claims(t *testing.T) {
 		}
 	})
 
-	t.Run("recount skips a worker filled after selection", func(t *testing.T) {
+	t.Run("read committed recount overrides repeatable read pool default", func(t *testing.T) {
 		truncate(t, pool)
 		workerA := insertWorker(t, pool, queries, workerSpec{maxSlots: 1, lifetimeSessions: 10})
 		workerB := insertWorker(t, pool, queries, workerSpec{maxSlots: 1})
 		selected := make(chan struct{})
 		resume := make(chan struct{})
-		config, err := pgxpool.ParseConfig(pool.Config().ConnString())
+		claimDSN := withDSNOption(
+			t,
+			pool.Config().ConnString(),
+			"options",
+			`-c default_transaction_isolation=repeatable\ read`,
+		)
+		config, err := pgxpool.ParseConfig(claimDSN)
 		if err != nil {
 			t.Fatalf("parsing traced pool config: %v", err)
 		}
@@ -169,6 +196,13 @@ func TestScheduler_Claims(t *testing.T) {
 			t.Fatalf("opening traced claim pool: %v", err)
 		}
 		t.Cleanup(claimPool.Close)
+		var isolation string
+		if err := claimPool.QueryRow(t.Context(), "SHOW default_transaction_isolation").Scan(&isolation); err != nil {
+			t.Fatalf("reading traced pool isolation: %v", err)
+		}
+		if isolation != "repeatable read" {
+			t.Fatalf("traced pool isolation = %q, want repeatable read", isolation)
+		}
 		sessionScheduler := newTestScheduler(claimPool, 0, 50)
 
 		type claimResult struct {
@@ -288,16 +322,62 @@ func TestScheduler_Queue(t *testing.T) {
 		}
 	})
 
-	t.Run("committed fast-path claim wins over short queue deadline", func(t *testing.T) {
+	t.Run("committed queued claim wins over queue deadline", func(t *testing.T) {
 		truncate(t, pool)
 		insertWorker(t, pool, queries, workerSpec{maxSlots: 1})
-		sessionScheduler := newTestScheduler(pool, 1, 50)
-		sessionScheduler.queueWaitTimeout = time.Microsecond
-		session, err := sessionScheduler.Admit(t.Context(), ClaimRequest{Browser: "chromium"})
+		first, err := newTestScheduler(pool, 0, 50).Claim(
+			t.Context(),
+			ClaimRequest{Browser: "chromium"},
+		)
 		if err != nil {
-			t.Fatalf("Admit() returned an error: %v", err)
+			t.Fatalf("first Claim() returned an error: %v", err)
 		}
-		if session.ID == uuid.Nil {
+
+		commitEnded := make(chan struct{})
+		resumeCommit := make(chan struct{})
+		config, err := pgxpool.ParseConfig(pool.Config().ConnString())
+		if err != nil {
+			t.Fatalf("parsing commit-traced pool config: %v", err)
+		}
+		config.ConnConfig.Tracer = &pauseAfterCommitTracer{
+			commitEnded: commitEnded,
+			resume:      resumeCommit,
+		}
+		claimPool, err := pgxpool.NewWithConfig(t.Context(), config)
+		if err != nil {
+			t.Fatalf("opening commit-traced pool: %v", err)
+		}
+		t.Cleanup(claimPool.Close)
+		sessionScheduler := newTestScheduler(claimPool, 1, 50)
+		sessionScheduler.queueWaitTimeout = 50 * time.Millisecond
+
+		type admitResult struct {
+			session data.Session
+			err     error
+		}
+		result := make(chan admitResult, 1)
+		go func() {
+			session, err := sessionScheduler.Admit(t.Context(), ClaimRequest{Browser: "chromium"})
+			result <- admitResult{session: session, err: err}
+		}()
+		waitForQueueDepth(t, sessionScheduler, 1)
+		if _, err := queries.FailSession(t.Context(), first.ID); err != nil {
+			t.Fatalf("FailSession() returned an error: %v", err)
+		}
+		sessionScheduler.Waker().Wake()
+		select {
+		case <-commitEnded:
+		case <-time.After(time.Second):
+			t.Fatal("queued claim did not reach its commit boundary")
+		}
+		time.Sleep(2 * sessionScheduler.queueWaitTimeout)
+		close(resumeCommit)
+
+		admitted := <-result
+		if admitted.err != nil {
+			t.Fatalf("Admit() returned an error after commit: %v", admitted.err)
+		}
+		if admitted.session.ID == uuid.Nil {
 			t.Fatal("Admit() returned an empty session")
 		}
 	})
@@ -363,6 +443,106 @@ func TestScheduler_Queue(t *testing.T) {
 			t.Fatal("queued Admit() did not return after lifecycle cancellation")
 		}
 		waitForQueueDepth(t, sessionScheduler, 0)
+	})
+
+	t.Run("lifecycle cancellation reaches queued claim blocked on pool", func(t *testing.T) {
+		truncate(t, pool)
+		insertWorker(t, pool, queries, workerSpec{maxSlots: 1})
+		if _, err := newTestScheduler(pool, 0, 50).Claim(
+			t.Context(),
+			ClaimRequest{Browser: "chromium"},
+		); err != nil {
+			t.Fatalf("first Claim() returned an error: %v", err)
+		}
+
+		rollbackEnded := make(chan struct{})
+		resumeRollback := make(chan struct{})
+		config, err := pgxpool.ParseConfig(pool.Config().ConnString())
+		if err != nil {
+			t.Fatalf("parsing rollback-traced pool config: %v", err)
+		}
+		config.MaxConns = 2
+		config.ConnConfig.Tracer = &pauseAfterRollbackTracer{
+			rollbackEnded: rollbackEnded,
+			resume:        resumeRollback,
+			remaining:     maxClaimAttempts,
+		}
+		claimPool, err := pgxpool.NewWithConfig(t.Context(), config)
+		if err != nil {
+			t.Fatalf("opening rollback-traced pool: %v", err)
+		}
+		t.Cleanup(claimPool.Close)
+		firstConnection, err := claimPool.Acquire(t.Context())
+		if err != nil {
+			t.Fatalf("acquiring first held connection: %v", err)
+		}
+		defer firstConnection.Release()
+
+		lifecycleCtx, cancelLifecycle := context.WithCancel(t.Context())
+		sessionScheduler := New(
+			lifecycleCtx,
+			claimPool,
+			slog.New(slog.NewTextHandler(io.Discard, nil)),
+			Options{
+				WorkerTTL:           time.Hour,
+				PendingSessionTTL:   time.Hour,
+				MaxLifetimeSessions: 50,
+				MaxQueueSize:        1,
+				QueueWaitTimeout:    30 * time.Second,
+				PollingInterval:     time.Second,
+			},
+		)
+		result := make(chan error, 1)
+		go func() {
+			_, err := sessionScheduler.Admit(t.Context(), ClaimRequest{Browser: "chromium"})
+			result <- err
+		}()
+		select {
+		case <-rollbackEnded:
+		case <-time.After(time.Second):
+			t.Fatal("fast-path claim did not reach rollback boundary")
+		}
+
+		type acquireResult struct {
+			connection *pgxpool.Conn
+			err        error
+		}
+		secondConnectionResult := make(chan acquireResult, 1)
+		go func() {
+			connection, err := claimPool.Acquire(t.Context())
+			secondConnectionResult <- acquireResult{connection: connection, err: err}
+		}()
+		select {
+		case acquired := <-secondConnectionResult:
+			if acquired.connection != nil {
+				acquired.connection.Release()
+			}
+			t.Fatalf("second pool acquisition completed before rollback resumed: %v", acquired.err)
+		case <-time.After(20 * time.Millisecond):
+		}
+		close(resumeRollback)
+		var acquired acquireResult
+		select {
+		case acquired = <-secondConnectionResult:
+		case <-time.After(time.Second):
+			t.Fatal("waiting pool acquisition did not receive the released connection")
+		}
+		if acquired.err != nil {
+			t.Fatalf("acquiring second held connection: %v", acquired.err)
+		}
+		secondConnection := acquired.connection
+		defer secondConnection.Release()
+		waitForQueueDepth(t, sessionScheduler, 1)
+
+		cancelLifecycle()
+		select {
+		case err := <-result:
+			if !errors.Is(err, ErrDraining) {
+				t.Fatalf("drained blocked Admit() error = %v, want %v", err, ErrDraining)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("queued Admit() stayed blocked in the pool after lifecycle cancellation")
+		}
 	})
 
 	t.Run("polling works without listener", func(t *testing.T) {
@@ -446,11 +626,17 @@ func TestScheduler_HeartbeatReconciliationAndRecycling(t *testing.T) {
 		truncate(t, pool)
 		workerID := insertWorker(t, pool, queries, workerSpec{maxSlots: 6})
 		otherWorkerID := insertWorker(t, pool, queries, workerSpec{maxSlots: 1})
-		oldLost := insertSession(t, queries, workerID, data.SessionStatusRunning)
-		young := insertSession(t, queries, workerID, data.SessionStatusRunning)
-		malformed := insertSession(t, queries, workerID, data.SessionStatusRunning)
-		pending := insertSession(t, queries, workerID, data.SessionStatusPending)
-		otherSession := insertSession(t, queries, otherWorkerID, data.SessionStatusRunning)
+		oldLost := insertSession(t, pool, queries, workerID, data.SessionStatusRunning)
+		young := insertSession(t, pool, queries, workerID, data.SessionStatusRunning)
+		youngSession, err := queries.GetSession(t.Context(), young)
+		if err != nil {
+			t.Fatalf("GetSession(young) returned an error: %v", err)
+		}
+		if youngSession.StartedAt == nil {
+			t.Fatal("young running session has a nil started_at")
+		}
+		pending := insertSession(t, pool, queries, workerID, data.SessionStatusPending)
+		otherSession := insertSession(t, pool, queries, otherWorkerID, data.SessionStatusRunning)
 		if _, err := pool.Exec(
 			t.Context(),
 			"UPDATE sessions SET started_at = now() - interval '20 seconds' WHERE id = $1",
@@ -479,7 +665,6 @@ func TestScheduler_HeartbeatReconciliationAndRecycling(t *testing.T) {
 		}
 		assertSessionStatus(t, queries, oldLost, data.SessionStatusFailed)
 		assertSessionStatus(t, queries, young, data.SessionStatusRunning)
-		assertSessionStatus(t, queries, malformed, data.SessionStatusRunning)
 		assertSessionStatus(t, queries, pending, data.SessionStatusPending)
 		assertSessionStatus(t, queries, otherSession, data.SessionStatusRunning)
 	})
@@ -616,6 +801,8 @@ func TestScheduler_HeartbeatReconciliationAndRecycling(t *testing.T) {
 }
 
 type pauseAfterWorkerSelectionKey struct{}
+type pauseAfterCommitKey struct{}
+type pauseAfterRollbackKey struct{}
 
 type pauseAfterWorkerSelectionTracer struct {
 	selected chan<- struct{}
@@ -645,6 +832,75 @@ func (t *pauseAfterWorkerSelectionTracer) TraceQueryEnd(
 	}
 	t.once.Do(func() {
 		close(t.selected)
+		<-t.resume
+	})
+}
+
+type pauseAfterCommitTracer struct {
+	commitEnded chan<- struct{}
+	resume      <-chan struct{}
+	once        sync.Once
+}
+
+func (t *pauseAfterCommitTracer) TraceQueryStart(
+	ctx context.Context,
+	_ *pgx.Conn,
+	data pgx.TraceQueryStartData,
+) context.Context {
+	if strings.EqualFold(strings.TrimSpace(data.SQL), "commit") {
+		return context.WithValue(ctx, pauseAfterCommitKey{}, true)
+	}
+	return ctx
+}
+
+func (t *pauseAfterCommitTracer) TraceQueryEnd(
+	ctx context.Context,
+	_ *pgx.Conn,
+	_ pgx.TraceQueryEndData,
+) {
+	isCommit, _ := ctx.Value(pauseAfterCommitKey{}).(bool)
+	if !isCommit {
+		return
+	}
+	t.once.Do(func() {
+		close(t.commitEnded)
+		<-t.resume
+	})
+}
+
+type pauseAfterRollbackTracer struct {
+	rollbackEnded chan<- struct{}
+	resume        <-chan struct{}
+	remaining     int
+	once          sync.Once
+}
+
+func (t *pauseAfterRollbackTracer) TraceQueryStart(
+	ctx context.Context,
+	_ *pgx.Conn,
+	data pgx.TraceQueryStartData,
+) context.Context {
+	if strings.EqualFold(strings.TrimSpace(data.SQL), "rollback") {
+		return context.WithValue(ctx, pauseAfterRollbackKey{}, true)
+	}
+	return ctx
+}
+
+func (t *pauseAfterRollbackTracer) TraceQueryEnd(
+	ctx context.Context,
+	_ *pgx.Conn,
+	_ pgx.TraceQueryEndData,
+) {
+	isRollback, _ := ctx.Value(pauseAfterRollbackKey{}).(bool)
+	if !isRollback {
+		return
+	}
+	t.remaining--
+	if t.remaining > 0 {
+		return
+	}
+	t.once.Do(func() {
+		close(t.rollbackEnded)
 		<-t.resume
 	})
 }
@@ -714,6 +970,7 @@ WHERE id = $1`,
 
 func insertSession(
 	t *testing.T,
+	pool *pgxpool.Pool,
 	queries *data.Queries,
 	workerID uuid.UUID,
 	status data.SessionStatus,
@@ -724,17 +981,25 @@ func insertSession(
 		t.Fatalf("GetWorker() returned an error: %v", err)
 	}
 	id := uuid.New()
-	_, err = queries.InsertSession(t.Context(), data.InsertSessionParams{
-		ID:                id,
-		WorkerID:          workerID,
-		Browser:           worker.Browser,
-		PlaywrightVersion: worker.PlaywrightVersion,
-		WorkerAddress:     worker.Address,
-		Mode:              data.SessionModeDefault,
-		Status:            status,
-	})
+	_, err = pool.Exec(
+		t.Context(),
+		`INSERT INTO sessions (
+    id, worker_id, browser, playwright_version, worker_address,
+    mode, status, started_at, last_heartbeat
+) VALUES (
+    $1, $2, $3, $4, $5, 'default', $6,
+    CASE WHEN $6::session_status = 'running' THEN now() END,
+    now()
+)`,
+		id,
+		workerID,
+		worker.Browser,
+		worker.PlaywrightVersion,
+		worker.Address,
+		status,
+	)
 	if err != nil {
-		t.Fatalf("InsertSession() returned an error: %v", err)
+		t.Fatalf("inserting test session: %v", err)
 	}
 	return id
 }
@@ -759,6 +1024,18 @@ func waitForQueueDepth(t *testing.T, scheduler *Scheduler, want int) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+}
+
+func withDSNOption(t *testing.T, dsn, key, value string) string {
+	t.Helper()
+	parsed, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("parsing test database DSN: %v", err)
+	}
+	query := parsed.Query()
+	query.Set(key, value)
+	parsed.RawQuery = query.Encode()
+	return parsed.String()
 }
 
 func waitForListenerBackend(t *testing.T, pool *pgxpool.Pool) int32 {

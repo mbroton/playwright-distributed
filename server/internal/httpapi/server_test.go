@@ -250,19 +250,14 @@ func TestServer_WorkerAndSessionRoutes(t *testing.T) {
 		)
 	}
 
-	sessionID := uuid.New()
-	_, err = queries.InsertSession(t.Context(), data.InsertSessionParams{
-		ID:                sessionID,
-		WorkerID:          worker.ID,
-		Browser:           worker.Browser,
-		PlaywrightVersion: worker.PlaywrightVersion,
-		WorkerAddress:     worker.Address,
-		Mode:              data.SessionModeDefault,
-		Status:            data.SessionStatusRunning,
-		ConnectMetadata:   []byte(`{"source":"test"}`),
-	})
+	sessionID := insertTestSession(t, pool, queries, worker.ID, data.SessionStatusRunning)
+	_, err = pool.Exec(
+		t.Context(),
+		`UPDATE sessions SET connect_metadata = '{"source":"test"}'::jsonb WHERE id = $1`,
+		sessionID,
+	)
 	if err != nil {
-		t.Fatalf("InsertSession() returned an error: %v", err)
+		t.Fatalf("updating test session metadata: %v", err)
 	}
 	getSession := requestJSON(t, server.Handler, http.MethodGet, "/v1/sessions/"+sessionID.String(), nil, "")
 	if getSession.Code != http.StatusOK {
@@ -561,7 +556,7 @@ func TestServer_HeartbeatReconcilesAndSignalsDrain(t *testing.T) {
 	); err != nil {
 		t.Fatalf("setting worker lifetime: %v", err)
 	}
-	lostSession := insertTestSession(t, queries, workerID, data.SessionStatusRunning)
+	lostSession := insertTestSession(t, pool, queries, workerID, data.SessionStatusRunning)
 	if _, err := pool.Exec(
 		t.Context(),
 		"UPDATE sessions SET started_at = now() - interval '20 seconds' WHERE id = $1",
@@ -625,10 +620,10 @@ func TestServer_Capacity(t *testing.T) {
 	full := insertTestWorker(t, queries, data.WorkerStatusAvailable, 2)
 	free := insertTestWorker(t, queries, data.WorkerStatusAvailable, 3)
 	draining := insertTestWorker(t, queries, data.WorkerStatusDraining, 10)
-	insertTestSession(t, queries, full, data.SessionStatusPending)
-	insertTestSession(t, queries, full, data.SessionStatusRunning)
-	insertTestSession(t, queries, free, data.SessionStatusRunning)
-	insertTestSession(t, queries, draining, data.SessionStatusRunning)
+	insertTestSession(t, pool, queries, full, data.SessionStatusPending)
+	insertTestSession(t, pool, queries, full, data.SessionStatusRunning)
+	insertTestSession(t, pool, queries, free, data.SessionStatusRunning)
+	insertTestSession(t, pool, queries, draining, data.SessionStatusRunning)
 	server := New(
 		pool,
 		queries,
@@ -1046,6 +1041,7 @@ func insertTestWorker(
 
 func insertTestSession(
 	t *testing.T,
+	pool *pgxpool.Pool,
 	queries *data.Queries,
 	workerID uuid.UUID,
 	status data.SessionStatus,
@@ -1056,17 +1052,25 @@ func insertTestSession(
 		t.Fatalf("GetWorker() returned an error: %v", err)
 	}
 	id := uuid.New()
-	_, err = queries.InsertSession(t.Context(), data.InsertSessionParams{
-		ID:                id,
-		WorkerID:          workerID,
-		Browser:           worker.Browser,
-		PlaywrightVersion: worker.PlaywrightVersion,
-		WorkerAddress:     worker.Address,
-		Mode:              data.SessionModeDefault,
-		Status:            status,
-	})
+	_, err = pool.Exec(
+		t.Context(),
+		`INSERT INTO sessions (
+    id, worker_id, browser, playwright_version, worker_address,
+    mode, status, started_at, last_heartbeat
+) VALUES (
+    $1, $2, $3, $4, $5, 'default', $6,
+    CASE WHEN $6::session_status = 'running' THEN now() END,
+    now()
+)`,
+		id,
+		workerID,
+		worker.Browser,
+		worker.PlaywrightVersion,
+		worker.Address,
+		status,
+	)
 	if err != nil {
-		t.Fatalf("InsertSession() returned an error: %v", err)
+		t.Fatalf("inserting test session: %v", err)
 	}
 	return id
 }

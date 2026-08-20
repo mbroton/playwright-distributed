@@ -85,11 +85,18 @@ func (q *Queries) CountRunningSessionsByWorker(ctx context.Context, workerID uui
 const expireDeadSessions = `-- name: ExpireDeadSessions :many
 UPDATE sessions
 SET status = 'expired'
-WHERE status IN ('pending', 'running')
-  AND (
-      last_heartbeat < now() - $1::bigint * interval '1 microsecond'
-      OR (expires_at IS NOT NULL AND expires_at < now())
-  )
+WHERE id IN (
+    -- All bulk session updates lock rows in id order to prevent deadlocks.
+    SELECT id
+    FROM sessions
+    WHERE status IN ('pending', 'running')
+      AND (
+          last_heartbeat < now() - $1::bigint * interval '1 microsecond'
+          OR (expires_at IS NOT NULL AND expires_at < now())
+      )
+    ORDER BY id
+    FOR UPDATE
+)
 RETURNING id, worker_id
 `
 
@@ -176,11 +183,17 @@ func (q *Queries) FailSession(ctx context.Context, id uuid.UUID) (FailSessionRow
 const failUnreportedWorkerSessions = `-- name: FailUnreportedWorkerSessions :many
 UPDATE sessions
 SET status = 'failed'
-WHERE worker_id = $1
-  AND status = 'running'
-  AND started_at IS NOT NULL
-  AND started_at < now() - $2::bigint * interval '1 microsecond'
-  AND id != ALL($3::uuid[])
+WHERE id IN (
+    SELECT candidate.id
+    FROM sessions AS candidate
+    WHERE candidate.worker_id = $1
+      AND candidate.status = 'running'
+      AND candidate.started_at IS NOT NULL
+      AND candidate.started_at < now() - $2::bigint * interval '1 microsecond'
+      AND candidate.id != ALL($3::uuid[])
+    ORDER BY candidate.id
+    FOR UPDATE
+)
 RETURNING id
 `
 
@@ -287,87 +300,6 @@ func (q *Queries) InsertClaimedSession(ctx context.Context, arg InsertClaimedSes
 		arg.WorkerAddress,
 		arg.CreatedByKey,
 		arg.PendingTtlMicroseconds,
-		arg.ConnectMetadata,
-	)
-	var i Session
-	err := row.Scan(
-		&i.ID,
-		&i.WorkerID,
-		&i.Browser,
-		&i.PlaywrightVersion,
-		&i.WorkerAddress,
-		&i.Mode,
-		&i.Status,
-		&i.CreatedByKey,
-		&i.CreatedAt,
-		&i.StartedAt,
-		&i.ExpiresAt,
-		&i.LastHeartbeat,
-		&i.KeepAliveMs,
-		&i.ConnectMetadata,
-	)
-	return i, err
-}
-
-const insertSession = `-- name: InsertSession :one
-INSERT INTO sessions (
-    id,
-    worker_id,
-    browser,
-    playwright_version,
-    worker_address,
-    mode,
-    status,
-    created_by_key,
-    expires_at,
-    last_heartbeat,
-    keep_alive_ms,
-    connect_metadata
-) VALUES (
-    $1,
-    $2,
-    $3,
-    $4,
-    $5,
-    $6,
-    $7,
-    $8,
-    $9,
-    now(),
-    $10,
-    COALESCE($11::jsonb, '{}'::jsonb)
-)
-RETURNING id, worker_id, browser, playwright_version, worker_address, mode, status, created_by_key, created_at, started_at, expires_at, last_heartbeat, keep_alive_ms, connect_metadata
-`
-
-type InsertSessionParams struct {
-	ID                uuid.UUID
-	WorkerID          uuid.UUID
-	Browser           string
-	PlaywrightVersion string
-	WorkerAddress     string
-	Mode              SessionMode
-	Status            SessionStatus
-	CreatedByKey      *uuid.UUID
-	ExpiresAt         *time.Time
-	KeepAliveMs       pgtype.Int4
-	ConnectMetadata   []byte
-}
-
-// TEST ONLY: this bypasses the worker lock and capacity invariant. Production
-// session inserts must use InsertClaimedSession while holding the worker row lock.
-func (q *Queries) InsertSession(ctx context.Context, arg InsertSessionParams) (Session, error) {
-	row := q.db.QueryRow(ctx, insertSession,
-		arg.ID,
-		arg.WorkerID,
-		arg.Browser,
-		arg.PlaywrightVersion,
-		arg.WorkerAddress,
-		arg.Mode,
-		arg.Status,
-		arg.CreatedByKey,
-		arg.ExpiresAt,
-		arg.KeepAliveMs,
 		arg.ConnectMetadata,
 	)
 	var i Session

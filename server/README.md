@@ -3,6 +3,8 @@
 The server uses these environment variables:
 
 - `DATABASE_URL` is required. It is the PostgreSQL connection string.
+  Budget `pool_max_conns + 1` PostgreSQL backends per replica for the hijacked
+  capacity-listener connection.
 - `LISTEN_ADDR` is optional. Its default value is `:8080`.
 - `WORKER_HEARTBEAT_TTL` controls when an available worker becomes stalled.
   Its default is `30s`.

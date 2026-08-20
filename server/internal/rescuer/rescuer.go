@@ -58,7 +58,13 @@ func (r *Rescuer) Run(ctx context.Context) {
 		summary, err := r.Sweep(tickCtx)
 		cancel()
 		if err != nil {
-			r.logger.Error("rescuer sweep failed", "error", err)
+			r.logger.Error(
+				"rescuer sweep failed",
+				"error", err,
+				"stalled_workers", summary.StalledWorkers,
+				"expired_sessions", summary.ExpiredSessions,
+				"removed_workers", summary.RemovedWorkers,
+			)
 			continue
 		}
 		if summary.StalledWorkers == 0 && summary.ExpiredSessions == 0 && summary.RemovedWorkers == 0 {
@@ -74,24 +80,24 @@ func (r *Rescuer) Run(ctx context.Context) {
 }
 
 func (r *Rescuer) Sweep(ctx context.Context) (Summary, error) {
+	summary := Summary{}
 	stalledWorkers, err := r.stallSilentWorkers(ctx)
 	if err != nil {
-		return Summary{}, err
+		return summary, err
 	}
+	summary.StalledWorkers = stalledWorkers
 	expiredSessions, err := r.expireDeadSessions(ctx)
 	if err != nil {
-		return Summary{}, err
+		return summary, err
 	}
+	summary.ExpiredSessions = len(expiredSessions)
 	removedWorkers, err := r.deleteDeadWorkers(ctx)
 	if err != nil {
-		return Summary{}, err
+		return summary, err
 	}
+	summary.RemovedWorkers = len(removedWorkers)
 
-	return Summary{
-		StalledWorkers:  stalledWorkers,
-		ExpiredSessions: len(expiredSessions),
-		RemovedWorkers:  len(removedWorkers),
-	}, nil
+	return summary, nil
 }
 
 func (r *Rescuer) stallSilentWorkers(ctx context.Context) (_ int64, err error) {

@@ -44,14 +44,14 @@ type BrowserCapacity struct {
 	Workers        int64  `json:"workers"`
 	MaxSlots       int64  `json:"max_slots"`
 	ActiveSessions int64  `json:"active_sessions" doc:"Fleet-wide active sessions, including sessions on ineligible workers."`
-	AvailableSlots int64  `json:"available_slots"`
+	AvailableSlots int64  `json:"available_slots" doc:"Free slots on eligible workers; can exceed max_slots - active_sessions, which is fleet-wide."`
 }
 
 type CapacityTotals struct {
 	Workers        int64 `json:"workers"`
 	MaxSlots       int64 `json:"max_slots"`
 	ActiveSessions int64 `json:"active_sessions" doc:"Fleet-wide active sessions, including sessions on ineligible workers."`
-	AvailableSlots int64 `json:"available_slots"`
+	AvailableSlots int64 `json:"available_slots" doc:"Free slots on eligible workers; can exceed max_slots - active_sessions, which is fleet-wide."`
 }
 
 type Capacity struct {

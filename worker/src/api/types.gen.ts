@@ -9,6 +9,9 @@ export type BrowserCapacity = {
      * Fleet-wide active sessions, including sessions on ineligible workers.
      */
     active_sessions: number;
+    /**
+     * Free slots on eligible workers; can exceed max_slots - active_sessions, which is fleet-wide.
+     */
     available_slots: number;
     browser: string;
     max_slots: number;
@@ -30,6 +33,9 @@ export type CapacityTotals = {
      * Fleet-wide active sessions, including sessions on ineligible workers.
      */
     active_sessions: number;
+    /**
+     * Free slots on eligible workers; can exceed max_slots - active_sessions, which is fleet-wide.
+     */
     available_slots: number;
     max_slots: number;
     workers: number;

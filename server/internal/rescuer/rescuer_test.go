@@ -1,9 +1,12 @@
 package rescuer
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -29,14 +32,14 @@ func TestRescuer_Sweep(t *testing.T) {
 	staleDraining := insertWorker(t, pool, queries, data.WorkerStatusDraining, 20*time.Minute, 1)
 	youngDraining := insertWorker(t, pool, queries, data.WorkerStatusDraining, time.Minute, 1)
 	busyDraining := insertWorker(t, pool, queries, data.WorkerStatusDraining, 20*time.Minute, 1)
-	busyDrainingSession := insertSession(t, queries, busyDraining, data.SessionStatusRunning)
+	busyDrainingSession := insertSession(t, pool, queries, busyDraining, data.SessionStatusRunning)
 	shuttingDown := insertWorker(t, pool, queries, data.WorkerStatusShuttingDown, time.Minute, 1)
 	deadStalled := insertWorker(t, pool, queries, data.WorkerStatusStalled, 20*time.Minute, 1)
 	busyStalled := insertWorker(t, pool, queries, data.WorkerStatusStalled, 20*time.Minute, 1)
-	busySession := insertSession(t, queries, busyStalled, data.SessionStatusRunning)
+	busySession := insertSession(t, pool, queries, busyStalled, data.SessionStatusRunning)
 
 	activeWorker := insertWorker(t, pool, queries, data.WorkerStatusAvailable, 0, 1)
-	staleRunning := insertSession(t, queries, activeWorker, data.SessionStatusRunning)
+	staleRunning := insertSession(t, pool, queries, activeWorker, data.SessionStatusRunning)
 	if _, err := pool.Exec(
 		t.Context(),
 		"UPDATE sessions SET last_heartbeat = now() - interval '2 hours' WHERE id = $1",
@@ -45,7 +48,7 @@ func TestRescuer_Sweep(t *testing.T) {
 		t.Fatalf("aging running session: %v", err)
 	}
 	pendingWorker := insertWorker(t, pool, queries, data.WorkerStatusAvailable, 0, 1)
-	expiredPending := insertSession(t, queries, pendingWorker, data.SessionStatusPending)
+	expiredPending := insertSession(t, pool, queries, pendingWorker, data.SessionStatusPending)
 	if _, err := pool.Exec(
 		t.Context(),
 		"UPDATE sessions SET expires_at = now() - interval '1 second' WHERE id = $1",
@@ -94,6 +97,33 @@ func TestRescuer_Sweep(t *testing.T) {
 	}
 }
 
+func TestRescuer_SweepReturnsCommittedPartialProgress(t *testing.T) {
+	pool := newMigratedTestPool(t)
+	queries := data.New(pool)
+	workerID := insertWorker(t, pool, queries, data.WorkerStatusAvailable, time.Minute, 1)
+
+	sweepCtx, cancelSweep := context.WithCancel(t.Context())
+	config, err := pgxpool.ParseConfig(pool.Config().ConnString())
+	if err != nil {
+		t.Fatalf("parsing traced pool config: %v", err)
+	}
+	config.ConnConfig.Tracer = &cancelAfterCommitTracer{cancel: cancelSweep}
+	sweepPool, err := pgxpool.NewWithConfig(t.Context(), config)
+	if err != nil {
+		t.Fatalf("opening traced sweep pool: %v", err)
+	}
+	t.Cleanup(sweepPool.Close)
+
+	summary, err := newTestRescuer(sweepPool).Sweep(sweepCtx)
+	if err == nil {
+		t.Fatal("Sweep() error = nil, want cancellation after the stall step")
+	}
+	if summary.StalledWorkers != 1 || summary.ExpiredSessions != 0 || summary.RemovedWorkers != 0 {
+		t.Fatalf("Sweep() partial summary = %+v, want one stalled worker", summary)
+	}
+	assertWorkerStatus(t, queries, workerID, data.WorkerStatusStalled)
+}
+
 func TestRescuer_FullCrashRecoveryLoop(t *testing.T) {
 	pool := newMigratedTestPool(t)
 	queries := data.New(pool)
@@ -136,6 +166,29 @@ func TestRescuer_FullCrashRecoveryLoop(t *testing.T) {
 		t.Fatalf("blocked Admit() after rescue returned an error: %v", err)
 	}
 	assertSessionStatus(t, queries, first.ID, data.SessionStatusExpired)
+}
+
+type cancelAfterCommitTracer struct {
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (t *cancelAfterCommitTracer) TraceQueryStart(
+	ctx context.Context,
+	_ *pgx.Conn,
+	_ pgx.TraceQueryStartData,
+) context.Context {
+	return ctx
+}
+
+func (t *cancelAfterCommitTracer) TraceQueryEnd(
+	_ context.Context,
+	_ *pgx.Conn,
+	data pgx.TraceQueryEndData,
+) {
+	if data.Err == nil && strings.EqualFold(strings.TrimSpace(data.CommandTag.String()), "commit") {
+		t.once.Do(t.cancel)
+	}
 }
 
 func newTestRescuer(pool *pgxpool.Pool) *Rescuer {
@@ -185,6 +238,7 @@ func insertWorker(
 
 func insertSession(
 	t *testing.T,
+	pool *pgxpool.Pool,
 	queries *data.Queries,
 	workerID uuid.UUID,
 	status data.SessionStatus,
@@ -195,17 +249,25 @@ func insertSession(
 		t.Fatalf("GetWorker() returned an error: %v", err)
 	}
 	id := uuid.New()
-	_, err = queries.InsertSession(t.Context(), data.InsertSessionParams{
-		ID:                id,
-		WorkerID:          workerID,
-		Browser:           worker.Browser,
-		PlaywrightVersion: worker.PlaywrightVersion,
-		WorkerAddress:     worker.Address,
-		Mode:              data.SessionModeDefault,
-		Status:            status,
-	})
+	_, err = pool.Exec(
+		t.Context(),
+		`INSERT INTO sessions (
+    id, worker_id, browser, playwright_version, worker_address,
+    mode, status, started_at, last_heartbeat
+) VALUES (
+    $1, $2, $3, $4, $5, 'default', $6,
+    CASE WHEN $6::session_status = 'running' THEN now() END,
+    now()
+)`,
+		id,
+		workerID,
+		worker.Browser,
+		worker.PlaywrightVersion,
+		worker.Address,
+		status,
+	)
 	if err != nil {
-		t.Fatalf("InsertSession() returned an error: %v", err)
+		t.Fatalf("inserting test session: %v", err)
 	}
 	return id
 }

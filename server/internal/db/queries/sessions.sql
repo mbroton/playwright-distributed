@@ -1,35 +1,3 @@
--- TEST ONLY: this bypasses the worker lock and capacity invariant. Production
--- session inserts must use InsertClaimedSession while holding the worker row lock.
--- name: InsertSession :one
-INSERT INTO sessions (
-    id,
-    worker_id,
-    browser,
-    playwright_version,
-    worker_address,
-    mode,
-    status,
-    created_by_key,
-    expires_at,
-    last_heartbeat,
-    keep_alive_ms,
-    connect_metadata
-) VALUES (
-    $1,
-    $2,
-    $3,
-    $4,
-    $5,
-    $6,
-    $7,
-    $8,
-    $9,
-    now(),
-    $10,
-    COALESCE(sqlc.narg(connect_metadata)::jsonb, '{}'::jsonb)
-)
-RETURNING *;
-
 -- name: GetSession :one
 SELECT *
 FROM sessions
@@ -120,21 +88,34 @@ RETURNING *;
 -- name: ExpireDeadSessions :many
 UPDATE sessions
 SET status = 'expired'
-WHERE status IN ('pending', 'running')
-  AND (
-      last_heartbeat < now() - sqlc.arg(session_ttl_microseconds)::bigint * interval '1 microsecond'
-      OR (expires_at IS NOT NULL AND expires_at < now())
-  )
+WHERE id IN (
+    -- All bulk session updates lock rows in id order to prevent deadlocks.
+    SELECT id
+    FROM sessions
+    WHERE status IN ('pending', 'running')
+      AND (
+          last_heartbeat < now() - sqlc.arg(session_ttl_microseconds)::bigint * interval '1 microsecond'
+          OR (expires_at IS NOT NULL AND expires_at < now())
+      )
+    ORDER BY id
+    FOR UPDATE
+)
 RETURNING id, worker_id;
 
 -- name: FailUnreportedWorkerSessions :many
 UPDATE sessions
 SET status = 'failed'
-WHERE worker_id = sqlc.arg(worker_id)
-  AND status = 'running'
-  AND started_at IS NOT NULL
-  AND started_at < now() - sqlc.arg(grace_microseconds)::bigint * interval '1 microsecond'
-  AND id != ALL(sqlc.arg(active_session_ids)::uuid[])
+WHERE id IN (
+    SELECT candidate.id
+    FROM sessions AS candidate
+    WHERE candidate.worker_id = sqlc.arg(worker_id)
+      AND candidate.status = 'running'
+      AND candidate.started_at IS NOT NULL
+      AND candidate.started_at < now() - sqlc.arg(grace_microseconds)::bigint * interval '1 microsecond'
+      AND candidate.id != ALL(sqlc.arg(active_session_ids)::uuid[])
+    ORDER BY candidate.id
+    FOR UPDATE
+)
 RETURNING id;
 
 -- name: ListStaleWorkerSessionIDs :many

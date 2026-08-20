@@ -59,7 +59,9 @@ CREATE TABLE sessions (
     expires_at timestamptz,
     last_heartbeat timestamptz NOT NULL,
     keep_alive_ms integer CHECK (keep_alive_ms IS NULL OR keep_alive_ms > 0),
-    connect_metadata jsonb NOT NULL DEFAULT '{}'::jsonb
+    connect_metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    CONSTRAINT sessions_running_started_at_check
+        CHECK (status <> 'running' OR started_at IS NOT NULL)
 );
 
 CREATE INDEX sessions_worker_id_idx ON sessions (worker_id);
