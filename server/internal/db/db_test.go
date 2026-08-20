@@ -355,6 +355,25 @@ func TestQueries(t *testing.T) {
 	if _, err := queries.CompleteSession(t.Context(), expiredSessionID); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("CompleteSession() for expired session error = %v, want %v", err, pgx.ErrNoRows)
 	}
+	pendingSessionID := testUUID(5)
+	mustInsertTestSession(t, pool, testSessionSpec{
+		id:       pendingSessionID,
+		workerID: workerID,
+		status:   data.SessionStatusPending,
+	})
+	terminated, err := queries.TerminateSession(t.Context(), pendingSessionID)
+	if err != nil {
+		t.Fatalf("TerminateSession() returned an error: %v", err)
+	}
+	if terminated.Status != data.SessionStatusCompleted {
+		t.Fatalf("TerminateSession().Status = %q, want %q", terminated.Status, data.SessionStatusCompleted)
+	}
+	if _, err := queries.TerminateSession(t.Context(), pendingSessionID); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("second TerminateSession() error = %v, want %v", err, pgx.ErrNoRows)
+	}
+	if _, err := pool.Exec(t.Context(), "DELETE FROM sessions WHERE id = $1", pendingSessionID); err != nil {
+		t.Fatalf("deleting terminated transition test session: %v", err)
+	}
 	if _, err := pool.Exec(t.Context(), "DELETE FROM sessions WHERE id = $1", expiredSessionID); err != nil {
 		t.Fatalf("deleting expired transition test session: %v", err)
 	}

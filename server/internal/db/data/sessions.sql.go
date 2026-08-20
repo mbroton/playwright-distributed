@@ -470,3 +470,58 @@ func (q *Queries) StartSession(ctx context.Context, id uuid.UUID) (Session, erro
 	)
 	return i, err
 }
+
+const terminateSession = `-- name: TerminateSession :one
+WITH updated AS (
+    UPDATE sessions
+    SET status = 'completed'
+    WHERE id = $1
+      AND status IN ('pending', 'running')
+    RETURNING sessions.id, sessions.worker_id, sessions.browser, sessions.playwright_version, sessions.worker_address, sessions.mode, sessions.status, sessions.created_by_key, sessions.created_at, sessions.started_at, sessions.expires_at, sessions.last_heartbeat, sessions.keep_alive_ms, sessions.connect_metadata
+), notified AS (
+    SELECT pg_notify('capacity_changed', '')
+    FROM updated
+)
+SELECT updated.id, updated.worker_id, updated.browser, updated.playwright_version, updated.worker_address, updated.mode, updated.status, updated.created_by_key, updated.created_at, updated.started_at, updated.expires_at, updated.last_heartbeat, updated.keep_alive_ms, updated.connect_metadata
+FROM updated
+CROSS JOIN notified
+`
+
+type TerminateSessionRow struct {
+	ID                uuid.UUID
+	WorkerID          uuid.UUID
+	Browser           string
+	PlaywrightVersion string
+	WorkerAddress     string
+	Mode              SessionMode
+	Status            SessionStatus
+	CreatedByKey      *uuid.UUID
+	CreatedAt         time.Time
+	StartedAt         *time.Time
+	ExpiresAt         *time.Time
+	LastHeartbeat     time.Time
+	KeepAliveMs       pgtype.Int4
+	ConnectMetadata   []byte
+}
+
+func (q *Queries) TerminateSession(ctx context.Context, id uuid.UUID) (TerminateSessionRow, error) {
+	row := q.db.QueryRow(ctx, terminateSession, id)
+	var i TerminateSessionRow
+	err := row.Scan(
+		&i.ID,
+		&i.WorkerID,
+		&i.Browser,
+		&i.PlaywrightVersion,
+		&i.WorkerAddress,
+		&i.Mode,
+		&i.Status,
+		&i.CreatedByKey,
+		&i.CreatedAt,
+		&i.StartedAt,
+		&i.ExpiresAt,
+		&i.LastHeartbeat,
+		&i.KeepAliveMs,
+		&i.ConnectMetadata,
+	)
+	return i, err
+}

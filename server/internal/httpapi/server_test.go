@@ -272,6 +272,25 @@ func TestServer_WorkerAndSessionRoutes(t *testing.T) {
 	if missingSession.Code != http.StatusNotFound {
 		t.Fatalf("missing session status = %d, want %d", missingSession.Code, http.StatusNotFound)
 	}
+	terminate := requestJSON(t, server.Handler, http.MethodDelete, "/v1/sessions/"+sessionID.String(), nil, "")
+	if terminate.Code != http.StatusNoContent {
+		t.Fatalf("terminate session status = %d, want %d: %s", terminate.Code, http.StatusNoContent, terminate.Body.String())
+	}
+	terminateAgain := requestJSON(t, server.Handler, http.MethodDelete, "/v1/sessions/"+sessionID.String(), nil, "")
+	if terminateAgain.Code != http.StatusNoContent {
+		t.Fatalf("second terminate status = %d, want %d", terminateAgain.Code, http.StatusNoContent)
+	}
+	terminated, err := queries.GetSession(t.Context(), sessionID)
+	if err != nil {
+		t.Fatalf("GetSession() after termination returned an error: %v", err)
+	}
+	if terminated.Status != data.SessionStatusCompleted {
+		t.Fatalf("terminated session status = %q, want %q", terminated.Status, data.SessionStatusCompleted)
+	}
+	missingTerminate := requestJSON(t, server.Handler, http.MethodDelete, "/v1/sessions/"+uuid.NewString(), nil, "")
+	if missingTerminate.Code != http.StatusNotFound {
+		t.Fatalf("missing terminate status = %d, want %d", missingTerminate.Code, http.StatusNotFound)
+	}
 }
 
 func TestServer_Authentication(t *testing.T) {
@@ -724,6 +743,11 @@ func TestServer_SecuredRoutesRequireAuthentication(t *testing.T) {
 		{
 			name:   "get session",
 			method: http.MethodGet,
+			path:   "/v1/sessions/" + uuid.NewString(),
+		},
+		{
+			name:   "delete session",
+			method: http.MethodDelete,
 			path:   "/v1/sessions/" + uuid.NewString(),
 		},
 		{

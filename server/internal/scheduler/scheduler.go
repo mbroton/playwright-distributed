@@ -44,6 +44,7 @@ type Options struct {
 
 type ClaimRequest struct {
 	Browser         string
+	VersionPrefix   string
 	CreatedByKey    *uuid.UUID
 	ConnectMetadata json.RawMessage
 }
@@ -313,6 +314,7 @@ func (s *Scheduler) claimOnce(
 
 	worker, err := queries.SelectClaimableWorker(ctx, data.SelectClaimableWorkerParams{
 		Browser:               request.Browser,
+		VersionPrefix:         request.VersionPrefix,
 		WorkerTtlMicroseconds: s.workerTTL.Microseconds(),
 		MaxLifetimeSessions:   s.maxLifetimeSessions,
 		ExcludedIds:           excluded,

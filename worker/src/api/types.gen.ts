@@ -47,6 +47,7 @@ export type CreateSessionInputBody = {
         [key: string]: unknown;
     };
     mode?: 'default' | 'dedicated';
+    playwright_version?: string;
 };
 
 export type ErrorDetail = {
@@ -407,6 +408,52 @@ export type CreateSessionResponses = {
 };
 
 export type CreateSessionResponse = CreateSessionResponses[keyof CreateSessionResponses];
+
+export type DeleteSessionData = {
+    body?: never;
+    path: {
+        /**
+         * Session ID
+         */
+        id: string;
+    };
+    query?: never;
+    url: '/v1/sessions/{id}';
+};
+
+export type DeleteSessionErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ErrorModel;
+    /**
+     * Not Found
+     */
+    404: ErrorModel;
+    /**
+     * Unprocessable Entity
+     */
+    422: ErrorModel;
+    /**
+     * Internal Server Error
+     */
+    500: ErrorModel;
+    /**
+     * Service Unavailable
+     */
+    503: ErrorModel;
+};
+
+export type DeleteSessionError = DeleteSessionErrors[keyof DeleteSessionErrors];
+
+export type DeleteSessionResponses = {
+    /**
+     * No Content
+     */
+    204: void;
+};
+
+export type DeleteSessionResponse = DeleteSessionResponses[keyof DeleteSessionResponses];
 
 export type GetSessionData = {
     body?: never;

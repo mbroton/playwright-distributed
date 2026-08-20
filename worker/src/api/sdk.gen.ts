@@ -2,7 +2,7 @@
 
 import { client } from './client.gen.js';
 import type { Client, Options as Options2, TDataShape } from './client/index.js';
-import type { CreateSessionData, CreateSessionErrors, CreateSessionResponses, GetCapacityData, GetCapacityErrors, GetCapacityResponses, GetSessionData, GetSessionErrors, GetSessionResponses, HealthData, HealthErrors, HealthResponses, HeartbeatWorkerData, HeartbeatWorkerErrors, HeartbeatWorkerResponses, ListWorkersData, ListWorkersErrors, ListWorkersResponses, ReadinessData, ReadinessErrors, ReadinessResponses, RegisterWorkerData, RegisterWorkerErrors, RegisterWorkerResponses, SetWorkerStatusData, SetWorkerStatusErrors, SetWorkerStatusResponses } from './types.gen.js';
+import type { CreateSessionData, CreateSessionErrors, CreateSessionResponses, DeleteSessionData, DeleteSessionErrors, DeleteSessionResponses, GetCapacityData, GetCapacityErrors, GetCapacityResponses, GetSessionData, GetSessionErrors, GetSessionResponses, HealthData, HealthErrors, HealthResponses, HeartbeatWorkerData, HeartbeatWorkerErrors, HeartbeatWorkerResponses, ListWorkersData, ListWorkersErrors, ListWorkersResponses, ReadinessData, ReadinessErrors, ReadinessResponses, RegisterWorkerData, RegisterWorkerErrors, RegisterWorkerResponses, SetWorkerStatusData, SetWorkerStatusErrors, SetWorkerStatusResponses } from './types.gen.js';
 
 export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends boolean = boolean, TResponse = unknown> = Options2<TData, ThrowOnError, TResponse> & {
     /**
@@ -87,6 +87,17 @@ export const createSession = <ThrowOnError extends boolean = false>(options: Opt
         'Content-Type': 'application/json',
         ...options.headers
     }
+});
+
+/**
+ * Terminate a session
+ *
+ * The relay closes within one session heartbeat interval.
+ */
+export const deleteSession = <ThrowOnError extends boolean = false>(options: Options<DeleteSessionData, ThrowOnError>) => (options.client ?? client).delete<DeleteSessionResponses, DeleteSessionErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
+    url: '/v1/sessions/{id}',
+    ...options
 });
 
 /**

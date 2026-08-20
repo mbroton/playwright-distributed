@@ -89,6 +89,9 @@ components:
             - default
             - dedicated
           type: string
+        playwright_version:
+          pattern: ^[0-9]+\.[0-9]+(\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?)?$
+          type: string
       required:
         - browser
       type: object
@@ -643,6 +646,56 @@ paths:
       tags:
         - Sessions
   /v1/sessions/{id}:
+    delete:
+      description: The relay closes within one session heartbeat interval.
+      operationId: delete-session
+      parameters:
+        - description: Session ID
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Session ID
+            format: uuid
+            type: string
+      responses:
+        "204":
+          description: No Content
+        "401":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Unauthorized
+        "404":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Not Found
+        "422":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Unprocessable Entity
+        "500":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Internal Server Error
+        "503":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Service Unavailable
+      security:
+        - bearer: []
+      summary: Terminate a session
+      tags:
+        - Sessions
     get:
       operationId: get-session
       parameters:

@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"server/internal/db/data"
+	"server/internal/relay"
 	"server/internal/scheduler"
 )
 
@@ -32,7 +33,10 @@ type Server struct {
 }
 
 type serverOptions struct {
-	scheduler *scheduler.Scheduler
+	scheduler      *scheduler.Scheduler
+	relayManager   *relay.Manager
+	defaultBrowser string
+	dialTimeout    time.Duration
 }
 
 type Option func(*serverOptions)
@@ -43,6 +47,14 @@ func WithScheduler(value *scheduler.Scheduler) Option {
 	}
 }
 
+func WithRelayManager(value *relay.Manager, defaultBrowser string, dialTimeout time.Duration) Option {
+	return func(options *serverOptions) {
+		options.relayManager = value
+		options.defaultBrowser = defaultBrowser
+		options.dialTimeout = dialTimeout
+	}
+}
+
 func New(
 	pool *pgxpool.Pool,
 	queries *data.Queries,
@@ -50,7 +62,7 @@ func New(
 	logger *slog.Logger,
 	options ...Option,
 ) *Server {
-	settings := serverOptions{}
+	settings := serverOptions{defaultBrowser: "chromium", dialTimeout: 10 * time.Second}
 	for _, option := range options {
 		option(&settings)
 	}
@@ -82,6 +94,18 @@ func New(
 	registerPublicRoutes(secured("/v1"), queries, settings.scheduler, logger)
 	registerWorkerRoutes(secured("/internal"), pool, queries, settings.scheduler, logger)
 	registerInfrastructureRoutes(humaAPI, pool, logger)
+	if settings.relayManager != nil {
+		registerRelayRoutes(
+			mux,
+			queries,
+			authenticator,
+			settings.scheduler,
+			settings.relayManager,
+			settings.defaultBrowser,
+			settings.dialTimeout,
+			logger,
+		)
+	}
 
 	return &Server{
 		Handler: requestLogger(mux, logger),
@@ -107,9 +131,10 @@ func registerPublicRoutes(
 ) {
 	type createSessionInput struct {
 		Body struct {
-			Browser         string           `json:"browser" enum:"chromium,firefox,webkit"`
-			Mode            data.SessionMode `json:"mode,omitempty" default:"default" enum:"default,dedicated"`
-			ConnectMetadata map[string]any   `json:"connect_metadata,omitempty" nullable:"false"`
+			Browser           string           `json:"browser" enum:"chromium,firefox,webkit"`
+			Mode              data.SessionMode `json:"mode,omitempty" default:"default" enum:"default,dedicated"`
+			PlaywrightVersion string           `json:"playwright_version,omitempty" pattern:"^[0-9]+\\.[0-9]+(\\.[0-9]+(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?)?$"`
+			ConnectMetadata   map[string]any   `json:"connect_metadata,omitempty" nullable:"false"`
 		}
 	}
 	type createSessionOutput struct {
@@ -147,8 +172,17 @@ func registerPublicRoutes(
 			return nil, internalError(logger, "create session", errors.New("scheduler is not configured"))
 		}
 
+		versionPrefix := ""
+		if input.Body.PlaywrightVersion != "" {
+			var ok bool
+			versionPrefix, ok = relay.VersionPrefix(input.Body.PlaywrightVersion)
+			if !ok {
+				return nil, huma.Error422UnprocessableEntity("playwright_version must be semver or major.minor")
+			}
+		}
 		session, err := sessionScheduler.Admit(ctx, scheduler.ClaimRequest{
 			Browser:         input.Body.Browser,
+			VersionPrefix:   versionPrefix,
 			CreatedByKey:    PrincipalFromContext(ctx).KeyID,
 			ConnectMetadata: encodedMetadata,
 		})
@@ -208,6 +242,36 @@ func registerPublicRoutes(
 			return nil, internalError(logger, "map session response", err)
 		}
 		return &getSessionOutput{Body: response}, nil
+	})
+
+	type deleteSessionOutput struct{}
+	huma.Register(api, huma.Operation{
+		OperationID:   "delete-session",
+		Method:        http.MethodDelete,
+		Path:          "/sessions/{id}",
+		Summary:       "Terminate a session",
+		Description:   "The relay closes within one session heartbeat interval.",
+		Tags:          []string{"Sessions"},
+		DefaultStatus: http.StatusNoContent,
+		Errors: []int{
+			http.StatusNotFound,
+			http.StatusUnauthorized,
+			http.StatusServiceUnavailable,
+		},
+	}, func(ctx context.Context, input *getSessionInput) (*deleteSessionOutput, error) {
+		_, err := queries.TerminateSession(ctx, input.ID)
+		if err == nil {
+			return &deleteSessionOutput{}, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return nil, internalError(logger, "terminate session", err)
+		}
+		if _, err := queries.GetSession(ctx, input.ID); errors.Is(err, pgx.ErrNoRows) {
+			return nil, huma.Error404NotFound("session not found")
+		} else if err != nil {
+			return nil, internalError(logger, "get session after termination", err)
+		}
+		return &deleteSessionOutput{}, nil
 	})
 
 	type listWorkersOutput struct {
