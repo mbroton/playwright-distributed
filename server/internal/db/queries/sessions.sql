@@ -44,6 +44,21 @@ SELECT updated.*
 FROM updated
 CROSS JOIN notified;
 
+-- name: TerminateSession :one
+WITH updated AS (
+    UPDATE sessions
+    SET status = 'completed'
+    WHERE id = $1
+      AND status IN ('pending', 'running')
+    RETURNING sessions.*
+), notified AS (
+    SELECT pg_notify('capacity_changed', '')
+    FROM updated
+)
+SELECT updated.*
+FROM updated
+CROSS JOIN notified;
+
 -- name: RenewSessionHeartbeat :one
 UPDATE sessions
 SET last_heartbeat = now()

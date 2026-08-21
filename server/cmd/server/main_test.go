@@ -6,6 +6,10 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
+
+	"server/internal/config"
+	"server/internal/scheduler"
 )
 
 func TestRun_RejectsInvalidCommandsBeforeOpeningDatabase(t *testing.T) {
@@ -55,5 +59,36 @@ func TestRun_APIKeyHelpBeforeOpeningDatabase(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), "Usage of apikey create") {
 		t.Fatalf("help output = %q, want apikey create usage", output.String())
+	}
+}
+
+func TestValidateRuntimeConfig_WorkerDialTimeoutPrecedesReconciliation(t *testing.T) {
+	tests := []struct {
+		name    string
+		timeout time.Duration
+		wantErr bool
+	}{
+		{
+			name:    "below reconciliation grace",
+			timeout: scheduler.DefaultReconciliationGrace - time.Millisecond,
+		},
+		{
+			name:    "equal to reconciliation grace",
+			timeout: scheduler.DefaultReconciliationGrace,
+			wantErr: true,
+		},
+		{
+			name:    "above reconciliation grace",
+			timeout: scheduler.DefaultReconciliationGrace + time.Millisecond,
+			wantErr: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateRuntimeConfig(config.Config{WorkerDialTimeout: test.timeout})
+			if (err != nil) != test.wantErr {
+				t.Fatalf("validateRuntimeConfig() error = %v, want error %t", err, test.wantErr)
+			}
+		})
 	}
 }

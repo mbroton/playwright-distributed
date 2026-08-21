@@ -272,6 +272,25 @@ func TestServer_WorkerAndSessionRoutes(t *testing.T) {
 	if missingSession.Code != http.StatusNotFound {
 		t.Fatalf("missing session status = %d, want %d", missingSession.Code, http.StatusNotFound)
 	}
+	terminate := requestJSON(t, server.Handler, http.MethodDelete, "/v1/sessions/"+sessionID.String(), nil, "")
+	if terminate.Code != http.StatusNoContent {
+		t.Fatalf("terminate session status = %d, want %d: %s", terminate.Code, http.StatusNoContent, terminate.Body.String())
+	}
+	terminateAgain := requestJSON(t, server.Handler, http.MethodDelete, "/v1/sessions/"+sessionID.String(), nil, "")
+	if terminateAgain.Code != http.StatusNoContent {
+		t.Fatalf("second terminate status = %d, want %d", terminateAgain.Code, http.StatusNoContent)
+	}
+	terminated, err := queries.GetSession(t.Context(), sessionID)
+	if err != nil {
+		t.Fatalf("GetSession() after termination returned an error: %v", err)
+	}
+	if terminated.Status != data.SessionStatusCompleted {
+		t.Fatalf("terminated session status = %q, want %q", terminated.Status, data.SessionStatusCompleted)
+	}
+	missingTerminate := requestJSON(t, server.Handler, http.MethodDelete, "/v1/sessions/"+uuid.NewString(), nil, "")
+	if missingTerminate.Code != http.StatusNotFound {
+		t.Fatalf("missing terminate status = %d, want %d", missingTerminate.Code, http.StatusNotFound)
+	}
 }
 
 func TestServer_Authentication(t *testing.T) {
@@ -702,6 +721,24 @@ func TestServer_RejectsHostlessWorkerAddress(t *testing.T) {
 	}
 }
 
+func TestServer_RejectsNonSemverWorkerVersion(t *testing.T) {
+	server := New(nil, nil, NoAuthAuthenticator{}, testLogger(io.Discard))
+	response := requestJSON(t, server.Handler, http.MethodPost, "/internal/workers", map[string]any{
+		"address":            "ws://worker:3000",
+		"browser":            "chromium",
+		"playwright_version": "latest",
+		"max_slots":          1,
+	}, "")
+	if response.Code != http.StatusUnprocessableEntity {
+		t.Fatalf(
+			"non-semver worker version status = %d, want %d: %s",
+			response.Code,
+			http.StatusUnprocessableEntity,
+			response.Body.String(),
+		)
+	}
+}
+
 func TestServer_SecuredRoutesRequireAuthentication(t *testing.T) {
 	pool := newMigratedTestPool(t)
 	queries := data.New(pool)
@@ -724,6 +761,11 @@ func TestServer_SecuredRoutesRequireAuthentication(t *testing.T) {
 		{
 			name:   "get session",
 			method: http.MethodGet,
+			path:   "/v1/sessions/" + uuid.NewString(),
+		},
+		{
+			name:   "delete session",
+			method: http.MethodDelete,
 			path:   "/v1/sessions/" + uuid.NewString(),
 		},
 		{
@@ -902,12 +944,30 @@ func TestLoggingResponseWriter_Hijack(t *testing.T) {
 		ResponseWriter: httptest.NewRecorder(),
 		err:            errHijack,
 	}
-	response := &loggingResponseWriter{ResponseWriter: underlying}
+	response := &loggingResponseWriter{ResponseWriter: underlying, status: http.StatusOK}
 	if _, _, err := response.Hijack(); !errors.Is(err, errHijack) {
 		t.Fatalf("Hijack() error = %v, want %v", err, errHijack)
 	}
 	if !underlying.called {
 		t.Fatal("Hijack() did not delegate to the underlying response writer")
+	}
+	if response.status != http.StatusOK || response.wroteHeader {
+		t.Fatalf("failed Hijack() status = %d, wroteHeader = %t; want 200, false", response.status, response.wroteHeader)
+	}
+
+	success := &loggingResponseWriter{
+		ResponseWriter: &hijackingResponseWriter{ResponseWriter: httptest.NewRecorder()},
+		status:         http.StatusOK,
+	}
+	if _, _, err := success.Hijack(); err != nil {
+		t.Fatalf("successful Hijack() returned an error: %v", err)
+	}
+	if success.status != http.StatusSwitchingProtocols || !success.wroteHeader {
+		t.Fatalf(
+			"successful Hijack() status = %d, wroteHeader = %t; want 101, true",
+			success.status,
+			success.wroteHeader,
+		)
 	}
 
 	unsupported := &loggingResponseWriter{ResponseWriter: httptest.NewRecorder()}

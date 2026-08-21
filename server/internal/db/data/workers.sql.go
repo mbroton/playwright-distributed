@@ -320,13 +320,14 @@ CROSS JOIN LATERAL (
 ) AS active
 WHERE w.status = 'available'
   AND w.browser = $1
-  AND w.last_heartbeat > now() - $2::bigint * interval '1 microsecond'
+  AND starts_with(w.playwright_version, $2::text)
+  AND w.last_heartbeat > now() - $3::bigint * interval '1 microsecond'
   AND (
-      $3::bigint = 0
-      OR w.lifetime_sessions < $3::bigint
+      $4::bigint = 0
+      OR w.lifetime_sessions < $4::bigint
   )
   AND active.active_count < w.max_slots
-  AND w.id != ALL($4::uuid[])
+  AND w.id != ALL($5::uuid[])
 ORDER BY w.lifetime_sessions DESC, active.active_count ASC, w.id
 FOR UPDATE OF w SKIP LOCKED
 LIMIT 1
@@ -334,6 +335,7 @@ LIMIT 1
 
 type SelectClaimableWorkerParams struct {
 	Browser               string
+	VersionPrefix         string
 	WorkerTtlMicroseconds int64
 	MaxLifetimeSessions   int64
 	ExcludedIds           []uuid.UUID
@@ -344,6 +346,7 @@ type SelectClaimableWorkerParams struct {
 func (q *Queries) SelectClaimableWorker(ctx context.Context, arg SelectClaimableWorkerParams) (Worker, error) {
 	row := q.db.QueryRow(ctx, selectClaimableWorker,
 		arg.Browser,
+		arg.VersionPrefix,
 		arg.WorkerTtlMicroseconds,
 		arg.MaxLifetimeSessions,
 		arg.ExcludedIds,

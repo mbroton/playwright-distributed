@@ -62,6 +62,7 @@ CROSS JOIN LATERAL (
 ) AS active
 WHERE w.status = 'available'
   AND w.browser = sqlc.arg(browser)
+  AND starts_with(w.playwright_version, sqlc.arg(version_prefix)::text)
   AND w.last_heartbeat > now() - sqlc.arg(worker_ttl_microseconds)::bigint * interval '1 microsecond'
   AND (
       sqlc.arg(max_lifetime_sessions)::bigint = 0

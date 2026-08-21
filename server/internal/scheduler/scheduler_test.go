@@ -33,11 +33,11 @@ func TestNew_DefaultsNonPositiveReconciliationGrace(t *testing.T) {
 				slog.New(slog.NewTextHandler(io.Discard, nil)),
 				Options{ReconciliationGrace: grace},
 			)
-			if sessionScheduler.reconciliationGrace != defaultReconciliationGrace {
+			if sessionScheduler.reconciliationGrace != DefaultReconciliationGrace {
 				t.Fatalf(
 					"reconciliation grace = %s, want default %s",
 					sessionScheduler.reconciliationGrace,
-					defaultReconciliationGrace,
+					DefaultReconciliationGrace,
 				)
 			}
 		})
@@ -82,6 +82,41 @@ func TestScheduler_Claims(t *testing.T) {
 		}
 		if session.WorkerID != aged {
 			t.Fatalf("Claim().WorkerID = %s, want aged worker %s", session.WorkerID, aged)
+		}
+	})
+
+	t.Run("filters workers by Playwright major and minor version", func(t *testing.T) {
+		truncate(t, pool)
+		matching := insertWorker(t, pool, queries, workerSpec{
+			playwrightVersion: "1.62.1",
+			maxSlots:          1,
+		})
+		insertWorker(t, pool, queries, workerSpec{
+			playwrightVersion: "1.63.0",
+			lifetimeSessions:  20,
+			maxSlots:          1,
+		})
+		session, err := newTestScheduler(pool, 0, 50).Claim(
+			t.Context(),
+			ClaimRequest{Browser: "chromium", VersionPrefix: "1.62."},
+		)
+		if err != nil {
+			t.Fatalf("Claim() returned an error: %v", err)
+		}
+		if session.WorkerID != matching {
+			t.Fatalf("Claim().WorkerID = %s, want matching worker %s", session.WorkerID, matching)
+		}
+	})
+
+	t.Run("version prefix does not match a longer minor version", func(t *testing.T) {
+		truncate(t, pool)
+		insertWorker(t, pool, queries, workerSpec{playwrightVersion: "1.620.0"})
+		_, err := newTestScheduler(pool, 0, 50).Claim(
+			t.Context(),
+			ClaimRequest{Browser: "chromium", VersionPrefix: "1.62."},
+		)
+		if !errors.Is(err, ErrNoCapacity) {
+			t.Fatalf("Claim() error = %v, want %v", err, ErrNoCapacity)
 		}
 	})
 
@@ -906,11 +941,12 @@ func (t *pauseAfterRollbackTracer) TraceQueryEnd(
 }
 
 type workerSpec struct {
-	browser          string
-	status           data.WorkerStatus
-	maxSlots         int32
-	lifetimeSessions int64
-	heartbeatAge     time.Duration
+	browser           string
+	playwrightVersion string
+	status            data.WorkerStatus
+	maxSlots          int32
+	lifetimeSessions  int64
+	heartbeatAge      time.Duration
 }
 
 func newTestScheduler(pool *pgxpool.Pool, maxQueueSize int, maxLifetime int64) *Scheduler {
@@ -940,12 +976,15 @@ func insertWorker(
 	if spec.maxSlots == 0 {
 		spec.maxSlots = 1
 	}
+	if spec.playwrightVersion == "" {
+		spec.playwrightVersion = "1.62.1"
+	}
 	id := uuid.New()
 	_, err := queries.RegisterWorker(t.Context(), data.RegisterWorkerParams{
 		ID:                id,
 		Address:           "ws://worker-" + id.String() + ":3000",
 		Browser:           spec.browser,
-		PlaywrightVersion: "1.62.1",
+		PlaywrightVersion: spec.playwrightVersion,
 		MaxSlots:          spec.maxSlots,
 		Status:            spec.status,
 	})

@@ -18,13 +18,14 @@ import (
 	"server/internal/db"
 	"server/internal/db/data"
 	"server/internal/httpapi"
+	"server/internal/relay"
 	"server/internal/rescuer"
 	"server/internal/scheduler"
 )
 
 const (
 	defaultListenAddress = ":8080"
-	shutdownTimeout      = 10 * time.Second
+	shutdownBuffer       = 5 * time.Second
 )
 
 func main() {
@@ -78,6 +79,9 @@ func run(ctx context.Context, args []string, stdout io.Writer, logger *slog.Logg
 	if err != nil {
 		return fmt.Errorf("loading server configuration: %w", err)
 	}
+	if err := validateRuntimeConfig(runtimeConfig); err != nil {
+		return err
+	}
 	if err := db.Migrate(ctx, pool); err != nil {
 		return err
 	}
@@ -95,12 +99,24 @@ func run(ctx context.Context, args []string, stdout io.Writer, logger *slog.Logg
 		MaxQueueSize:        runtimeConfig.MaxQueueSize,
 		QueueWaitTimeout:    runtimeConfig.QueueWaitTimeout,
 	})
+	relayManager := relay.NewManager(queries, logger, relay.Options{
+		WriteTimeout:      runtimeConfig.RelayWriteTimeout,
+		PingInterval:      runtimeConfig.RelayPingInterval,
+		PongTimeout:       runtimeConfig.RelayPongTimeout,
+		HeartbeatInterval: runtimeConfig.SessionHeartbeatInterval,
+		ShutdownGrace:     runtimeConfig.ShutdownGracePeriod,
+	})
 	controlPlane := httpapi.New(
 		pool,
 		queries,
 		authenticator,
 		logger,
 		httpapi.WithScheduler(sessionScheduler),
+		httpapi.WithRelayManager(
+			relayManager,
+			runtimeConfig.DefaultBrowserType,
+			runtimeConfig.WorkerDialTimeout,
+		),
 	)
 	go scheduler.RunListener(servicesCtx, pool, sessionScheduler.Waker(), logger)
 	go rescuer.New(pool, logger, rescuer.Options{
@@ -113,9 +129,27 @@ func run(ctx context.Context, args []string, stdout io.Writer, logger *slog.Logg
 		ctx,
 		address,
 		controlPlane.Handler,
-		runtimeConfig.QueueWaitTimeout+5*time.Second,
+		runtimeConfig.QueueWaitTimeout+runtimeConfig.WorkerDialTimeout+shutdownBuffer,
+		runtimeConfig.ShutdownGracePeriod+
+			runtimeConfig.WorkerDialTimeout+
+			relay.ShutdownCleanupBudget+
+			shutdownBuffer,
+		relayManager,
 		logger,
 	)
+}
+
+func validateRuntimeConfig(runtimeConfig config.Config) error {
+	// scheduler.New in run() leaves Options.ReconciliationGrace unset, so the
+	// default IS the active grace. If a config knob for it ever appears, this
+	// check must compare against the configured value instead.
+	if runtimeConfig.WorkerDialTimeout >= scheduler.DefaultReconciliationGrace {
+		return fmt.Errorf(
+			"WORKER_DIAL_TIMEOUT must be less than the session reconciliation grace (%s)",
+			scheduler.DefaultReconciliationGrace,
+		)
+	}
+	return nil
 }
 
 func serve(
@@ -123,6 +157,8 @@ func serve(
 	address string,
 	handler http.Handler,
 	writeTimeout time.Duration,
+	shutdownTimeout time.Duration,
+	relayManager *relay.Manager,
 	logger *slog.Logger,
 ) error {
 	server := &http.Server{
@@ -154,8 +190,14 @@ func serve(
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			return fmt.Errorf("shutting down http server: %w", err)
+		relayErrCh := make(chan error, 1)
+		go func() {
+			relayErrCh <- relayManager.Shutdown(shutdownCtx)
+		}()
+		httpErr := server.Shutdown(shutdownCtx)
+		relayErr := <-relayErrCh
+		if err := errors.Join(httpErr, relayErr); err != nil {
+			return fmt.Errorf("shutting down server: %w", err)
 		}
 		if err := <-errCh; !errors.Is(err, http.ErrServerClosed) {
 			return fmt.Errorf("serving http: %w", err)
