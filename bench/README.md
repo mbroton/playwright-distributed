@@ -1,18 +1,17 @@
 # Benchmarks
 
-Two reproducible benchmarks measure what the project optimizes for:
+Reproducible benchmarks for the grid:
 
-1. **Time-to-first-page** (`time-to-first-page.js`) — how long a client waits
-   between asking for a browser and having a page ready. Three baselines:
+1. **Time-to-first-page** (`time-to-first-page.js`) — time from requesting a
+   browser to a page being ready for use. Three variants:
    - `grid connect()` — a fresh isolated session from the grid;
    - `local launch()` — a browser launched per task on the same machine;
-   - `local reused browser` — a context on an already-running local browser,
-     the way `@playwright/test` reuses a worker's browser.
+   - `local reused browser` — a new context on an already-running local
+     browser, the way `@playwright/test` reuses a worker's browser.
 
-   The honest reading: a warm local browser is the latency floor, and the
-   grid does not try to beat it. What the numbers show is the price of the
-   grid — a few milliseconds of relay overhead for isolation, one shared
-   endpoint, and fleet capacity.
+   The two local variants bound the comparison: `local reused browser` is
+   the latency floor on the same machine, and the difference between it and
+   `grid connect()` is the grid's relay and scheduling overhead.
 2. **Throughput** (`throughput.js`) — complete sessions per second at a fixed
    client concurrency. A session is connect → context → page → goto → close,
    timed end to end. Two modes:
@@ -22,9 +21,8 @@ Two reproducible benchmarks measure what the project optimizes for:
      so adding a worker simulates adding a fixed-size node. Run against 1, 2,
      and 3 workers to show the throughput curve.
 
-Both use a `data:` URL page, so no external network time pollutes the numbers.
-There is deliberately no memory benchmark: the project optimizes connect
-latency and scale-out, not browser memory use.
+Both use a `data:` URL page, so no external network time pollutes the
+numbers.
 
 ## Setup
 
@@ -125,37 +123,3 @@ concurrency), `--expect-workers`, `--label` for throughput.
   than inflating them: a client on a separate host will only look better.
 - Report the hardware next to any published numbers: CPU count, RAM, and
   whether other load was present.
-
-## Results (2026-08-21)
-
-Machine: AMD Ryzen 5 5600 (6 cores / 12 threads), 30 GB RAM, Linux. Client,
-server, postgres, and all workers colocated; desktop background load present.
-Playwright 1.62.1. Throughput numbers are the median of three runs.
-
-Time-to-first-page (30 iterations):
-
-|                      | min | p50 | p95 | max |
-|----------------------|-----|-----|-----|-----|
-| grid `connect()`     | 31ms | 35ms | 37ms | 40ms |
-| local `launch()`     | 76ms | 86ms | 91ms | 91ms |
-| local reused browser | 23ms | 25ms | 27ms | 28ms |
-
-Reading: a fresh isolated grid session costs ~10ms more than a context on an
-already-warm local browser, and ~50ms less than launching a browser per task.
-
-Throughput, saturation mode (3 unlimited workers, concurrency 15):
-**98 sessions/s** (5,881 sessions/min; runs: 95.2 / 98.0 / 98.9, 4500/4500
-completed). Per-container CPU mid-run: each worker ~320%, server 33%,
-postgres 33% — the browsers consume the machine; the coordination layer uses
-well under one core.
-
-Throughput, scaling mode (`WORKER_CPUS=2`, concurrency = 5 per worker):
-
-| workers | sessions/s | vs 1 worker | session p50 |
-|---------|-----------|-------------|-------------|
-| 1 | 25.0 | 1.0x | 200ms |
-| 2 | 47.2 | 1.9x | 204ms |
-| 3 | 74.4 | 3.0x | 200ms |
-
-Throughput grows linearly with workers and per-session latency stays flat.
-(Per-run spread was under 4% at every point.)

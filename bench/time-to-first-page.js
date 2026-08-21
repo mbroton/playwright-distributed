@@ -16,10 +16,18 @@
 
 import { parseArgs } from 'node:util';
 import { chromium } from 'playwright';
-import { summarize, formatRow, formatHeader, parsePositiveInt, waitForWorkers } from './lib.js';
+import {
+  summarize,
+  formatRow,
+  formatHeader,
+  parsePositiveInt,
+  waitForWorkers,
+  withDeadline,
+} from './lib.js';
 
 const PAGE_URL = 'data:text/html,<h1>bench</h1>';
 const connectTimeoutMs = 30_000;
+const closeTimeoutMs = 15_000;
 const MODES = ['all', 'grid', 'local', 'local-reused'];
 
 const { values: options } = parseArgs({
@@ -69,7 +77,7 @@ async function run(label, getBrowser, cleanup) {
   return { label, stats: summarize(samples) };
 }
 
-const closeBrowser = (browser) => browser.close();
+const closeBrowser = (browser) => withDeadline(browser.close(), closeTimeoutMs, 'browser.close()');
 const results = [];
 
 if (enabled('grid')) {
@@ -96,13 +104,13 @@ if (enabled('local-reused')) {
         () => shared,
         async (browser) => {
           for (const context of browser.contexts()) {
-            await context.close();
+            await withDeadline(context.close(), closeTimeoutMs, 'context.close()');
           }
         }
       )
     );
   } finally {
-    await shared.close();
+    await withDeadline(shared.close(), closeTimeoutMs, 'browser.close()');
   }
 }
 

@@ -74,22 +74,26 @@ export async function withDeadline(promise, ms, label) {
   }
 }
 
-// Polls /v1/capacity (derived from the ws endpoint) until the expected worker
-// count has registered, then verifies the grid has enough slots for the run.
-export async function waitForWorkers(wsEndpoint, expectedWorkers, requiredSlots) {
+// Polls /v1/capacity (derived from the ws endpoint) until exactly the
+// expected number of workers for the benchmarked browser has registered and
+// is idle, then verifies they have enough slots for the run. Exact count,
+// per browser: leftover workers from a previous stack, or workers of another
+// browser type, would silently change what the run measures.
+export async function waitForWorkers(wsEndpoint, expectedWorkers, requiredSlots, browser = 'chromium') {
   const url = new URL(wsEndpoint);
   url.protocol = url.protocol === 'wss:' ? 'https:' : 'http:';
   url.pathname = '/v1/capacity';
   url.search = '';
 
   const deadline = Date.now() + 120_000;
-  let totals;
+  let entry;
   for (;;) {
     try {
       const response = await fetch(url, { signal: AbortSignal.timeout(5_000) });
       if (response.ok) {
-        totals = (await response.json()).totals;
-        if (totals.workers >= expectedWorkers && totals.active_sessions === 0) {
+        const capacity = await response.json();
+        entry = capacity.browsers.find((candidate) => candidate.browser === browser);
+        if (entry && entry.workers === expectedWorkers && entry.active_sessions === 0) {
           break;
         }
       }
@@ -98,16 +102,16 @@ export async function waitForWorkers(wsEndpoint, expectedWorkers, requiredSlots)
     }
     if (Date.now() > deadline) {
       console.error(
-        `Timed out waiting for ${expectedWorkers} workers` +
-          (totals ? ` (last capacity: ${JSON.stringify(totals)})` : '')
+        `Timed out waiting for exactly ${expectedWorkers} idle ${browser} workers` +
+          (entry ? ` (last capacity: ${JSON.stringify(entry)})` : '')
       );
       process.exit(1);
     }
     await new Promise((resolve) => setTimeout(resolve, 1_000));
   }
-  if (totals.available_slots < requiredSlots) {
+  if (entry.available_slots < requiredSlots) {
     console.error(
-      `Grid has ${totals.available_slots} slots but the run needs ${requiredSlots}; ` +
+      `${browser} workers have ${entry.available_slots} slots but the run needs ${requiredSlots}; ` +
         'lower --concurrency or add workers so the result measures service rate, not queueing'
     );
     process.exit(1);
