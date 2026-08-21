@@ -20,6 +20,9 @@ services:
       - DATABASE_URL=postgres://pwd:pwd@postgres:5432/pwd?sslmode=disable
     ports:
       - "127.0.0.1:8080:8080"
+    # Shutdown budget: 20s relay grace + 10s worker dial + 9s relay cleanup
+    # + 5s buffer = 44s.
+    stop_grace_period: 60s
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/healthz"]
       interval: 2s

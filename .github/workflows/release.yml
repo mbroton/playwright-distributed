@@ -73,15 +73,15 @@ jobs:
 
       # Both images are built for both platforms before anything is pushed, so
       # a build failure cannot leave one image published without the other.
-      - name: Build proxy for all release platforms
+      - name: Build server for all release platforms
         uses: docker/build-push-action@v6
         with:
-          context: ./proxy
-          file: ./proxy/Dockerfile
+          context: ./server
+          file: ./server/Dockerfile
           push: false
           platforms: linux/amd64,linux/arm64
-          cache-to: type=gha,mode=max,scope=proxy
-          cache-from: type=gha,scope=proxy
+          cache-to: type=gha,mode=max,scope=server
+          cache-from: type=gha,scope=server
 
       - name: Build worker for all release platforms
         uses: docker/build-push-action@v6
@@ -95,16 +95,18 @@ jobs:
 
       # docker-compose.yaml is the documented deployment path and pins the
       # `latest` tags, so the smoke test loads the built images under those
-      # names and runs that file unchanged.
+      # names and runs that file unchanged. The compose file hardcodes the
+      # upstream image names, so in a fork these tags diverge from
+      # `github.repository` and this smoke test fails until both match.
       - name: Load the amd64 images under their deployment tags
         uses: docker/build-push-action@v6
         with:
-          context: ./proxy
-          file: ./proxy/Dockerfile
+          context: ./server
+          file: ./server/Dockerfile
           load: true
           platforms: linux/amd64
-          cache-from: type=gha,scope=proxy
-          tags: ghcr.io/${{ github.repository }}/proxy:latest
+          cache-from: type=gha,scope=server
+          tags: ghcr.io/${{ github.repository }}/server:latest
 
       - name: Load the amd64 worker image under its deployment tag
         uses: docker/build-push-action@v6
@@ -121,7 +123,7 @@ jobs:
       # third-party images, which a fresh runner does not have, so pull
       # those explicitly first.
       - name: Pull images not built from this repository
-        run: docker compose -f docker-compose.yaml pull redis
+        run: docker compose -f docker-compose.yaml pull postgres
 
       - name: Start the documented deployment
         run: docker compose -f docker-compose.yaml up -d --pull never
@@ -162,11 +164,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Docker meta (proxy)
-        id: meta-proxy
+      - name: Docker meta (server)
+        id: meta-server
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}/proxy
+          images: ghcr.io/${{ github.repository }}/server
           # `latest=auto` keeps a pre-release tag from moving `latest`.
           flavor: latest=auto
           tags: |
@@ -187,16 +189,16 @@ jobs:
 
       # Both builds are cache hits from the build job, so these steps only push
       # the layers. The two images therefore reach the registry seconds apart.
-      - name: Push proxy
+      - name: Push server
         uses: docker/build-push-action@v6
         with:
-          context: ./proxy
-          file: ./proxy/Dockerfile
+          context: ./server
+          file: ./server/Dockerfile
           push: true
           platforms: linux/amd64,linux/arm64
-          cache-from: type=gha,scope=proxy
-          tags: ${{ steps.meta-proxy.outputs.tags }}
-          labels: ${{ steps.meta-proxy.outputs.labels }}
+          cache-from: type=gha,scope=server
+          tags: ${{ steps.meta-server.outputs.tags }}
+          labels: ${{ steps.meta-server.outputs.labels }}
 
       - name: Push worker
         uses: docker/build-push-action@v6

@@ -18,8 +18,9 @@
 ## Why use playwright-distributed?
 - Single WebSocket endpoint routes each session through a smart selector that balances load *and* staggers worker restarts.
 - Warm browser instances (Chrome, Firefox, WebKit) - no waiting for browser startup.
-- Each connection gets a fresh, isolated browser context.
-- Stateless design: add or remove workers at any time; Redis is the only shared component.
+- Each connection gets a fresh, isolated browser session.
+- PostgreSQL stores sessions and workers as rows; a rescuer reclaims capacity after crashes.
+- Optional API-key authentication and a small REST API expose sessions and capacity at `/v1/sessions` and `/v1/capacity`.
 - Works with any Playwright client.
 
 ### Motivation
@@ -44,7 +45,7 @@ Modern teams often need **many concurrent browsers**: scraping pipelines, AI age
 git clone https://github.com/mbroton/playwright-distributed.git
 cd playwright-distributed
 
-# 2. Fire it up (proxy + 1 Chrome worker + Redis)
+# 2. Fire it up (server + 1 Chrome worker + Postgres)
 docker compose up -d
 ```
 
@@ -61,7 +62,8 @@ console.log(await page.title());
 await browser.close();
 ```
 
-> Want Firefox or WebKit? Append `/?browser=firefox` or `/?browser=webkit` to the WebSocket URL and use the matching Playwright client (`p.firefox.connect`, `p.webkit.connect`, etc.).
+> Want Firefox or WebKit? The quick-start stack runs one Chromium worker. Add a worker service with `BROWSER_TYPE=firefox` or `BROWSER_TYPE=webkit` (see `docker-compose.local.yaml` for a three-browser example), then append `/?browser=firefox` or `/?browser=webkit` to the WebSocket URL and use the matching Playwright client (`p.firefox.connect`, `p.webkit.connect`, etc.). Your client's Playwright major.minor version must match a registered worker's version.
+
 That's it! The same `ws://localhost:8080` endpoint works with any Playwright client (Node.js, Python, Java, .NET, etc.).
 
 
@@ -78,21 +80,23 @@ That's it! The same `ws://localhost:8080` endpoint works with any Playwright cli
 
 ## ⚙️ Production Deployment
 
-Run each component (proxy, Redis, workers) as independent services (Docker/K8s). Checklist:
+Run the server, PostgreSQL, and workers as independent services (Docker/K8s). Checklist:
 
 - **Worker runtime** – workers are intended to run in the official Playwright Docker image. If you run `worker/` directly on a host instead, install matching Playwright browser binaries separately.
 - **Networking**
-  - Workers ➜ Redis (register, heartbeats)
-  - Proxy ➜ Redis (worker discovery)
-  - Proxy ➜ Workers (WebSocket forward)
-- **Exposure** – keep Redis and workers private. The proxy has no built-in authentication; keep it private or place it behind an authenticated TLS endpoint.
-- **Scaling** – add or remove workers freely; the proxy always chooses the next worker according to the staggered-restart algorithm.
+  - Workers ➜ Server (register and heartbeat over HTTP)
+  - Server ➜ Workers (WebSocket dial)
+  - Server ➜ PostgreSQL (session, worker, and API-key records)
+- **Exposure** – keep PostgreSQL and workers private. The server supports bearer-token authentication with API keys. Zero keys means unauthenticated bootstrap mode; create the first key to lock it, and give that key to every worker (`WORKER_API_KEY`) and client in the same step. A locked server accepts clients with a query token: `chromium.connect('ws://host:8080/?token=pwd_...')`.
+- **Scaling** – add or remove workers freely; the server chooses the next worker according to the staggered-restart algorithm.
+
+See [`server/README.md`](server/README.md) for the full server environment, configuration, and authentication reference.
 
 ### Security boundary
 
-The supported deployment model trusts every client that can reach the proxy, while allowing browsers to visit untrusted pages. The Compose files bind the proxy to `127.0.0.1`, keep Redis and workers on the internal network, and run workers as a non-root user with Playwright's Chromium sandbox profile.
+The supported deployment model trusts every authenticated client that can reach the server, while allowing browsers to visit untrusted pages. In bootstrap mode, it trusts every client. The Compose files bind the server to `127.0.0.1`, keep PostgreSQL and workers on the internal network, and run workers as a non-root user with Playwright's Chromium sandbox profile.
 
-The proxy grants full browser control and provides neither authentication nor TLS. Never publish it directly to an untrusted network; use an authenticated TLS reverse proxy, VPN, or private service network. Container hardening reduces risk but is not a strong isolation boundary for hostile tenants or browser exploits. Use dedicated VMs or another stronger sandbox when that boundary is required. See [Playwright's Docker security guidance](https://playwright.dev/docs/docker).
+An API key grants full browser and control-plane access. Authentication does not encrypt plain `http://` or `ws://` traffic. Never publish the server directly to an untrusted network; use a TLS reverse proxy, VPN, or private service network. Container hardening reduces risk but is not a strong isolation boundary for hostile tenants or browser exploits. Use dedicated VMs or another stronger sandbox when that boundary is required. See [Playwright's Docker security guidance](https://playwright.dev/docs/docker).
 
 
 ## 📚 Usage Examples
@@ -153,13 +157,14 @@ asyncio.run(main())
 
 ```mermaid
 flowchart TD
-    Client[(Your Playwright code)] -->|WebSocket| Proxy
+    Client[(Your Playwright code)] -->|WebSocket| Server
 
     subgraph playwright-distributed
         direction LR
 
-        Proxy -->|select worker| Redis[(Redis)]
-        Proxy <--> workerGroup
+        Server -->|sessions, workers, API keys| PostgreSQL[(PostgreSQL)]
+        Server <-->|WebSocket relay| workerGroup
+        workerGroup -->|register / heartbeat, HTTP| Server
 
         subgraph workerGroup [Workers]
             direction LR
@@ -167,19 +172,16 @@ flowchart TD
             Worker2(Worker)
             WorkerN(...)
         end
-
-        Worker1 --> Redis
-        Worker2 --> Redis
-        WorkerN --> Redis
     end
 ```
 
 ### Session Handling
 
-1. **One connection → One context** – every websocket maps to a unique browser context.
-2. **Concurrent sessions** – each worker serves several contexts in parallel.
-3. **Recycling** – after serving a configurable number of sessions the worker shuts down; Docker/K8s restarts it, guaranteeing a fresh browser.
-4. **Smart worker selection** – the proxy's algorithm keeps workers from hitting their restart threshold at the same time and still favours the busiest eligible worker.
+1. **One connection → One session** – every websocket is an isolated Playwright session; your client creates as many browser contexts inside it as it needs.
+2. **Session records** – every connection is a session record with an ID that you can inspect or delete through the REST API.
+3. **Concurrent sessions** – each worker serves several sessions in parallel.
+4. **Recycling** – the server counts lifetime sessions and returns a drain command in the worker's heartbeat response; the worker then restarts with a fresh browser.
+5. **Smart worker selection** – selection is staggered by lifetime-session count, then balanced toward the least loaded eligible worker.
 
 
 ## 🗺️ Roadmap

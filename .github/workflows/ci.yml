@@ -52,32 +52,6 @@ jobs:
         working-directory: ./worker
         run: npm test
 
-  proxy-tests:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.26.6'
-          cache-dependency-path: proxy/go.sum
-
-      - name: Vet proxy
-        working-directory: ./proxy
-        run: go vet ./...
-
-      - name: Run proxy unit tests with race detection
-        working-directory: ./proxy
-        run: go test -race -v ./...
-
-      - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
-
-      - name: Scan proxy for reachable vulnerabilities
-        working-directory: ./proxy
-        run: govulncheck ./...
-
   server-tests:
     runs-on: ubuntu-latest
     steps:
@@ -128,14 +102,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
-
-      - name: Build proxy (no push)
-        uses: docker/build-push-action@v6
-        with:
-          context: ./proxy
-          file: ./proxy/Dockerfile
-          push: false
-          platforms: linux/amd64
 
       - name: Build server (no push)
         uses: docker/build-push-action@v6
