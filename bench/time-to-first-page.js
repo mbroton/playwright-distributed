@@ -6,13 +6,14 @@
 //   local-reused: newContext -> newPage -> goto on one browser launched
 //                 upfront (how @playwright/test reuses a worker's browser)
 //
-// The three baselines answer different questions: "local" is the cost of a
-// browser per task; "local-reused" is the floor a warm local browser sets —
-// the grid does not try to beat it, it trades a few milliseconds of relay
-// overhead for isolation and fleet capacity. The page is a data: URL, so no
-// network time pollutes the numbers. Iterations run sequentially; warmup runs
-// are discarded (they pay one-time costs such as module loading and disk
-// cache).
+// The three variants bound the comparison: "local" is the cost of a browser
+// per task; "local-reused" is the floor a warm local browser sets, and the
+// gap between it and "grid" is the grid's relay and scheduling overhead.
+// Isolation is context-level in every variant — a worker multiplexes its
+// sessions as contexts on one browser process, like a local reused browser
+// does. The page is a data: URL, so no network time pollutes the numbers.
+// Iterations run sequentially; warmup runs are discarded (they pay one-time
+// costs such as module loading and disk cache).
 
 import { parseArgs } from 'node:util';
 import { chromium } from 'playwright';
@@ -27,6 +28,7 @@ import {
 
 const PAGE_URL = 'data:text/html,<h1>bench</h1>';
 const connectTimeoutMs = 30_000;
+const pageOpsTimeoutMs = 60_000;
 const closeTimeoutMs = 15_000;
 const MODES = ['all', 'grid', 'local', 'local-reused'];
 
@@ -43,8 +45,7 @@ const { values: options } = parseArgs({
 const iterations = parsePositiveInt('--iterations', options.iterations);
 const warmup = parsePositiveInt('--warmup', options.warmup, { min: 0 });
 if (!MODES.includes(options.mode)) {
-  console.error(`--mode must be one of: ${MODES.join(', ')}`);
-  process.exit(1);
+  throw new Error(`--mode must be one of: ${MODES.join(', ')}`);
 }
 const enabled = (mode) => options.mode === 'all' || options.mode === mode;
 
@@ -57,9 +58,16 @@ async function timeToFirstPage(getBrowser, cleanup) {
   const start = performance.now();
   const browser = await getBrowser();
   try {
-    const context = await browser.newContext();
-    const page = await context.newPage();
-    await page.goto(PAGE_URL);
+    // A wedged browser could stall any of these without a deadline.
+    await withDeadline(
+      (async () => {
+        const context = await browser.newContext();
+        const page = await context.newPage();
+        await page.goto(PAGE_URL);
+      })(),
+      pageOpsTimeoutMs,
+      'page setup'
+    );
     return performance.now() - start;
   } finally {
     await cleanup(browser);

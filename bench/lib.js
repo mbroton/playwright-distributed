@@ -51,11 +51,14 @@ export function formatHeader() {
   );
 }
 
+// Thrown errors, not process.exit(): an exit() call can truncate output that
+// is still buffered in a pipe (node script | tee), losing the very message
+// that explains the failure. An uncaught throw is written synchronously and
+// still exits 1.
 export function parsePositiveInt(name, raw, { min = 1 } = {}) {
   const value = Number(raw);
   if (!Number.isInteger(value) || value < min) {
-    console.error(`${name} must be an integer >= ${min} (got "${raw}")`);
-    process.exit(1);
+    throw new Error(`${name} must be an integer >= ${min} (got "${raw}")`);
   }
   return value;
 }
@@ -83,13 +86,23 @@ export async function waitForWorkers(wsEndpoint, expectedWorkers, requiredSlots,
   const url = new URL(wsEndpoint);
   url.protocol = url.protocol === 'wss:' ? 'https:' : 'http:';
   url.pathname = '/v1/capacity';
+  // An authenticated grid is benched by putting ?token=... in --endpoint;
+  // connect() sends it as-is and the capacity poll turns it into a bearer.
+  const token = url.searchParams.get('token');
   url.search = '';
+  const headers = token ? { Authorization: `Bearer ${token}` } : {};
 
   const deadline = Date.now() + 120_000;
   let entry;
   for (;;) {
     try {
-      const response = await fetch(url, { signal: AbortSignal.timeout(5_000) });
+      const response = await fetch(url, { headers, signal: AbortSignal.timeout(5_000) });
+      if (response.status === 401 || response.status === 403) {
+        throw new Error(
+          `Capacity check got HTTP ${response.status}: the server requires an API key. ` +
+            "Pass it in the endpoint: --endpoint 'ws://host:8080/?token=pwd_...'"
+        );
+      }
       if (response.ok) {
         const capacity = await response.json();
         entry = capacity.browsers.find((candidate) => candidate.browser === browser);
@@ -97,23 +110,24 @@ export async function waitForWorkers(wsEndpoint, expectedWorkers, requiredSlots,
           break;
         }
       }
-    } catch {
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith('Capacity check got HTTP')) {
+        throw error;
+      }
       // Server may still be starting; keep polling until the deadline.
     }
     if (Date.now() > deadline) {
-      console.error(
+      throw new Error(
         `Timed out waiting for exactly ${expectedWorkers} idle ${browser} workers` +
           (entry ? ` (last capacity: ${JSON.stringify(entry)})` : '')
       );
-      process.exit(1);
     }
     await new Promise((resolve) => setTimeout(resolve, 1_000));
   }
   if (entry.available_slots < requiredSlots) {
-    console.error(
+    throw new Error(
       `${browser} workers have ${entry.available_slots} slots but the run needs ${requiredSlots}; ` +
         'lower --concurrency or add workers so the result measures service rate, not queueing'
     );
-    process.exit(1);
   }
 }

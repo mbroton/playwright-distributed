@@ -22,6 +22,7 @@ import {
 
 const PAGE_URL = 'data:text/html,<h1>bench</h1>';
 const connectTimeoutMs = 30_000;
+const sessionOpsTimeoutMs = 60_000;
 const closeTimeoutMs = 15_000;
 
 const { values: options } = parseArgs({
@@ -50,9 +51,16 @@ async function runSession() {
   const start = performance.now();
   const browser = await chromium.connect(options.endpoint, { timeout: connectTimeoutMs });
   try {
-    const context = await browser.newContext();
-    const page = await context.newPage();
-    await page.goto(PAGE_URL);
+    // A wedged worker browser could stall any of these without a deadline.
+    await withDeadline(
+      (async () => {
+        const context = await browser.newContext();
+        const page = await context.newPage();
+        await page.goto(PAGE_URL);
+      })(),
+      sessionOpsTimeoutMs,
+      'session body'
+    );
   } finally {
     await withDeadline(browser.close(), closeTimeoutMs, 'browser.close()');
   }
@@ -88,8 +96,10 @@ async function runPhase(sessions, { record }) {
 if (warmupSessions > 0) {
   const warmup = await runPhase(warmupSessions, { record: false });
   if (warmup.errors.length > 0) {
-    console.error(`${warmup.errors.length}/${warmupSessions} warmup sessions failed; not measuring a broken grid`);
-    process.exit(1);
+    throw new Error(
+      `${warmup.errors.length}/${warmupSessions} warmup sessions failed; not measuring a broken grid ` +
+        `(first error: ${warmup.errors[0]})`
+    );
   }
 }
 
@@ -119,5 +129,6 @@ if (errors.length > 0) {
   for (const [message, count] of counts) {
     console.error(`  ${count}x ${message}`);
   }
-  process.exit(1);
+  // exitCode, not exit(): exit() can truncate output still buffered in a pipe.
+  process.exitCode = 1;
 }
