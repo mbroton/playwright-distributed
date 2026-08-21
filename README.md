@@ -102,7 +102,6 @@ Self-hosted, Playwright-native options:
 | Native Playwright protocol | ✅ | ✅ | ✅ |
 | Chromium + Firefox + WebKit | ✅ | ✅ | ✅ |
 | Session records and control (REST) | ✅ with history | live only | live UI |
-| Stealth / unblocking features | ❌ | ✅ | ❌ |
 
 Warm sharing is a trade, not a free win: sessions are isolated as browser
 contexts rather than processes (see [Security boundary](#security-boundary)),
