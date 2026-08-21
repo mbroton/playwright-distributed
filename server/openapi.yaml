@@ -169,10 +169,6 @@ components:
     HeartbeatOutputBody:
       additionalProperties: false
       properties:
-        commands:
-          items:
-            type: string
-          type: array
         stale_session_ids:
           items:
             format: uuid
@@ -187,7 +183,6 @@ components:
           type: string
       required:
         - status
-        - commands
         - stale_session_ids
       type: object
     RegisterWorkerInputBody:

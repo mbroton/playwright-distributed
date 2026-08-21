@@ -12,4 +12,4 @@ COPY ./src/ ./src/
 
 USER pwuser
 
-CMD ["npm", "run", "start"]
+CMD ["node_modules/.bin/tsx", "src/index.ts"]

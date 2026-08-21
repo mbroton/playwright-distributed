@@ -137,6 +137,14 @@ jobs:
           push: false
           platforms: linux/amd64
 
+      - name: Build server (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./server
+          file: ./server/Dockerfile
+          push: false
+          platforms: linux/amd64
+
       - name: Build worker (no push)
         uses: docker/build-push-action@v6
         with:
@@ -161,21 +169,8 @@ jobs:
         working-directory: ./worker
         run: npm ci
 
-      - name: Start Redis
-        run: docker compose -f docker-compose.local.yaml up -d redis
-
-      - name: Wait for Redis
-        run: |
-          for attempt in {1..30}; do
-            if docker compose -f docker-compose.local.yaml exec -T redis redis-cli ping | grep -q PONG; then
-              exit 0
-            fi
-            sleep 1
-          done
-          exit 1
-
-      - name: Start proxy and browser workers
-        run: docker compose -f docker-compose.local.yaml up -d --build proxy worker worker-firefox worker-webkit
+      - name: Start server and browser workers
+        run: docker compose -f docker-compose.local.yaml up -d --build
 
       - name: Verify workers run as non-root
         run: |
@@ -192,10 +187,7 @@ jobs:
             exit 1
           fi
 
-      - name: Verify Redis key TTL controls worker liveness
-        run: scripts/test/selector-worker-liveness.sh
-
-      - name: Run Redis-backed browser smoke tests
+      - name: Run browser smoke tests
         working-directory: ./worker
         run: |
           for browser in chromium firefox webkit; do
@@ -219,8 +211,25 @@ jobs:
             fi
           done
 
-      - name: Test worker Redis resilience
-        run: scripts/test/worker-redis-resilience.sh
+      - name: Verify worker drains on stop
+        run: |
+          docker compose -f docker-compose.local.yaml stop -t 55 worker
+          container_id="$(docker compose -f docker-compose.local.yaml ps -aq worker)"
+          test "$(docker inspect --format '{{.State.ExitCode}}' "$container_id")" -eq 0
+          docker compose -f docker-compose.local.yaml logs worker | grep -q 'Worker is draining'
+
+      - name: Verify worker scaling
+        run: |
+          docker compose -f docker-compose.local.yaml up -d --scale worker=3
+          for attempt in {1..30}; do
+            workers="$(curl -fsS http://127.0.0.1:8080/v1/capacity | jq '[.browsers[] | select(.browser == "chromium")][0].workers // 0')"
+            if [[ "$workers" -eq 3 ]]; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "expected 3 chromium workers, got $workers" >&2
+          exit 1
 
       - name: Show service logs on failure
         if: failure()

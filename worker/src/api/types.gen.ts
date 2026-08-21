@@ -101,7 +101,6 @@ export type HeartbeatInputBody = {
 };
 
 export type HeartbeatOutputBody = {
-    commands: Array<string>;
     stale_session_ids: Array<string>;
     status: 'available' | 'draining' | 'stalled' | 'shutting_down';
 };

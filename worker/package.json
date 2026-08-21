@@ -12,6 +12,7 @@
   "devDependencies": {
     "@hey-api/openapi-ts": "0.95.0",
     "@types/node": "^24.13.3",
+    "@types/ws": "^8.18.1",
     "undici-types": "8.10.0"
   },
   "peerDependencies": {
@@ -20,8 +21,8 @@
   "dependencies": {
     "dotenv": "^17.4.2",
     "playwright-core": "1.62.1",
-    "redis": "^6.2.1",
     "tsx": "^4.23.12",
+    "ws": "^8.21.3",
     "zod": "^4.4.3"
   }
 }

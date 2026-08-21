@@ -1,24 +1,29 @@
+import os from 'node:os';
+import { config as loadDotenv } from 'dotenv';
 import { z } from 'zod';
-import { config } from 'dotenv';
 
-config();
+loadDotenv({ quiet: true });
 
 const logLevels = ['debug', 'info', 'warn', 'error'] as const;
 export type LogLevel = typeof logLevels[number];
 
 export interface WorkerConfig {
-    redis: {
-        url: string;
-        keyTtl: number; // in seconds
-        retryAttempts: number;
-        retryDelay: number; // in milliseconds
+    controlPlane: {
+        serverUrl: string;
+        apiKey?: string;
     };
-    server: {
-        port: number;
-        privateHostname?: string | null;
+    browser: {
+        type: 'chromium' | 'firefox' | 'webkit';
         headless: boolean;
-        heartbeatInterval: number; // in milliseconds
-        browserType: 'chromium' | 'firefox' | 'webkit';
+    };
+    gateway: {
+        port: number;
+        privateHostname: string;
+        maxSlots: number;
+    };
+    lifecycle: {
+        heartbeatIntervalMs: number;
+        drainTimeoutMs: number;
     };
     logging: {
         level: LogLevel;
@@ -27,46 +32,42 @@ export interface WorkerConfig {
 }
 
 const schema = z.object({
-    REDIS_URL: z.url({ message: "Invalid Redis URL" }),
-    
-    // Time values from env are in seconds
-    REDIS_KEY_TTL: z.coerce.number().int().positive().default(60),
-    REDIS_RETRY_ATTEMPTS: z.coerce.number().int().positive().default(5),
-    REDIS_RETRY_DELAY: z.coerce.number().int().positive().default(3),
-
+    SERVER_URL: z.url({ protocol: /^https?$/, message: 'SERVER_URL must be an http(s) URL' }),
+    WORKER_API_KEY: z.string().transform(value => value || undefined).optional(),
     BROWSER_TYPE: z.enum(['chromium', 'firefox', 'webkit']).default('chromium'),
-    PORT: z.coerce.number().int().positive(),
-    PRIVATE_HOSTNAME: z.string().nullish(),
-    HEADLESS: z.enum(['true', 'false']).default('true').transform(v => v === 'true'),
-    HEARTBEAT_INTERVAL: z.coerce.number().int().positive().default(5),
-
+    PORT: z.coerce.number().int().min(1).max(65535).default(3131),
+    PRIVATE_HOSTNAME: z.string().min(1).optional(),
+    MAX_SLOTS: z.coerce.number().int().min(1).max(1024).default(5),
+    HEADLESS: z.enum(['true', 'false']).default('true').transform(value => value === 'true'),
+    HEARTBEAT_INTERVAL: z.coerce.number().int().min(1).default(5),
+    DRAIN_TIMEOUT: z.coerce.number().int().min(0).default(300),
     LOG_LEVEL: z.enum(logLevels).default('info'),
     LOG_FORMAT: z.enum(['json', 'text']).default('json'),
-}).refine(
-    values => values.REDIS_KEY_TTL >= values.HEARTBEAT_INTERVAL * 3,
-    {
-        message: 'REDIS_KEY_TTL must be at least three times HEARTBEAT_INTERVAL',
-        path: ['REDIS_KEY_TTL'],
-    }
-);
+});
 
 let loadedConfig: WorkerConfig | null = null;
 
 export function parseConfig(environment: NodeJS.ProcessEnv): WorkerConfig {
     const parsed = schema.parse(environment);
     return {
-        redis: {
-            url: parsed.REDIS_URL,
-            keyTtl: parsed.REDIS_KEY_TTL,
-            retryAttempts: parsed.REDIS_RETRY_ATTEMPTS,
-            retryDelay: parsed.REDIS_RETRY_DELAY * 1000, // Converted to MS for setTimeout
+        controlPlane: {
+            serverUrl: parsed.SERVER_URL,
+            ...(parsed.WORKER_API_KEY && { apiKey: parsed.WORKER_API_KEY }),
         },
-        server: {
-            browserType: parsed.BROWSER_TYPE,
-            port: parsed.PORT,
-            privateHostname: parsed.PRIVATE_HOSTNAME,
+        browser: {
+            type: parsed.BROWSER_TYPE,
             headless: parsed.HEADLESS,
-            heartbeatInterval: parsed.HEARTBEAT_INTERVAL * 1000, // Converted to MS for setInterval
+        },
+        gateway: {
+            port: parsed.PORT,
+            // A container hostname is its unique, routable container ID. This
+            // lets Docker Compose scale workers without fixed hostnames.
+            privateHostname: parsed.PRIVATE_HOSTNAME ?? os.hostname(),
+            maxSlots: parsed.MAX_SLOTS,
+        },
+        lifecycle: {
+            heartbeatIntervalMs: parsed.HEARTBEAT_INTERVAL * 1000,
+            drainTimeoutMs: parsed.DRAIN_TIMEOUT * 1000,
         },
         logging: {
             level: parsed.LOG_LEVEL,
@@ -85,7 +86,10 @@ export function loadConfig(): WorkerConfig {
         return loadedConfig;
     } catch (error) {
         if (error instanceof z.ZodError) {
-            console.error('Configuration validation failed:', error.issues);
+            console.error('Configuration validation failed:');
+            for (const issue of error.issues) {
+                console.error(`- ${issue.path.join('.') || 'environment'}: ${issue.message}`);
+            }
             process.exit(1);
         }
         throw error;
