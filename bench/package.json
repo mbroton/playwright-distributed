@@ -1,0 +1,16 @@
+{
+  "name": "playwright-distributed-bench",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "description": "Reproducible benchmarks for playwright-distributed",
+  "scripts": {
+    "latency": "node time-to-first-page.js",
+    "throughput": "node throughput.js"
+  },
+  "dependencies": {
+    "playwright": "1.62.1"
+  }
+}

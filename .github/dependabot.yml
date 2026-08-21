@@ -7,7 +7,7 @@ multi-ecosystem-groups:
     # Shared options must live on the group, not on its member updates;
     # Dependabot rejects the whole config otherwise.
     open-pull-requests-limit: 10
-    labels: ["dependencies", "worker"]
+    labels: ["dependencies"]
     assignees: ["mbroton"]
     commit-message:
       prefix: "chore"
@@ -21,6 +21,10 @@ updates:
     multi-ecosystem-group: playwright
   - package-ecosystem: docker
     directory: "/worker"
+    patterns: ["playwright"]
+    multi-ecosystem-group: playwright
+  - package-ecosystem: npm
+    directory: "/bench"
     patterns: ["playwright"]
     multi-ecosystem-group: playwright
   - package-ecosystem: gomod
