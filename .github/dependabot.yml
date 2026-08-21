@@ -23,3 +23,13 @@ updates:
     directory: "/worker"
     patterns: ["playwright"]
     multi-ecosystem-group: playwright
+  - package-ecosystem: gomod
+    directory: "/server"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    labels: ["dependencies", "server"]
+    assignees: ["mbroton"]
+    commit-message:
+      prefix: "chore"
+      include: "scope"

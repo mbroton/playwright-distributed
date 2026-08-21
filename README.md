@@ -18,7 +18,7 @@
 ## Why use playwright-distributed?
 - Single WebSocket endpoint routes each session through a smart selector that balances load *and* staggers worker restarts.
 - Warm browser instances (Chrome, Firefox, WebKit) - no waiting for browser startup.
-- Each connection gets a fresh, isolated browser context.
+- Each connection gets a fresh, isolated browser session.
 - PostgreSQL stores sessions and workers as rows; a rescuer reclaims capacity after crashes.
 - Optional API-key authentication and a small REST API expose sessions and capacity at `/v1/sessions` and `/v1/capacity`.
 - Works with any Playwright client.
@@ -62,7 +62,8 @@ console.log(await page.title());
 await browser.close();
 ```
 
-> Want Firefox or WebKit? Append `/?browser=firefox` or `/?browser=webkit` to the WebSocket URL and use the matching Playwright client (`p.firefox.connect`, `p.webkit.connect`, etc.).
+> Want Firefox or WebKit? The quick-start stack runs one Chromium worker. Add a worker service with `BROWSER_TYPE=firefox` or `BROWSER_TYPE=webkit` (see `docker-compose.local.yaml` for a three-browser example), then append `/?browser=firefox` or `/?browser=webkit` to the WebSocket URL and use the matching Playwright client (`p.firefox.connect`, `p.webkit.connect`, etc.). Your client's Playwright major.minor version must match a registered worker's version.
+
 That's it! The same `ws://localhost:8080` endpoint works with any Playwright client (Node.js, Python, Java, .NET, etc.).
 
 
@@ -86,10 +87,10 @@ Run the server, PostgreSQL, and workers as independent services (Docker/K8s). Ch
   - Workers ➜ Server (register and heartbeat over HTTP)
   - Server ➜ Workers (WebSocket dial)
   - Server ➜ PostgreSQL (session, worker, and API-key records)
-- **Exposure** – keep PostgreSQL and workers private. The server supports bearer-token authentication with API keys. Zero keys means unauthenticated bootstrap mode; create the first key to lock it. Terminate TLS in front of the server on untrusted networks.
+- **Exposure** – keep PostgreSQL and workers private. The server supports bearer-token authentication with API keys. Zero keys means unauthenticated bootstrap mode; create the first key to lock it, and give that key to every worker (`WORKER_API_KEY`) and client in the same step. A locked server accepts clients with a query token: `chromium.connect('ws://host:8080/?token=pwd_...')`.
 - **Scaling** – add or remove workers freely; the server chooses the next worker according to the staggered-restart algorithm.
 
-See [`server/README.md`](server/README.md) for the full server environment and configuration reference.
+See [`server/README.md`](server/README.md) for the full server environment, configuration, and authentication reference.
 
 ### Security boundary
 
@@ -176,11 +177,11 @@ flowchart TD
 
 ### Session Handling
 
-1. **One connection → One context** – every websocket maps to a unique browser context.
+1. **One connection → One session** – every websocket is an isolated Playwright session; your client creates as many browser contexts inside it as it needs.
 2. **Session records** – every connection is a session record with an ID that you can inspect or delete through the REST API.
-3. **Concurrent sessions** – each worker serves several contexts in parallel.
+3. **Concurrent sessions** – each worker serves several sessions in parallel.
 4. **Recycling** – the server counts lifetime sessions and returns a drain command in the worker's heartbeat response; the worker then restarts with a fresh browser.
-5. **Smart worker selection** – selection is staggered by lifetime-session count and prefers filling busy eligible workers.
+5. **Smart worker selection** – selection is staggered by lifetime-session count, then balanced toward the least loaded eligible worker.
 
 
 ## 🗺️ Roadmap

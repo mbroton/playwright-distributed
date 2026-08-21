@@ -95,7 +95,9 @@ jobs:
 
       # docker-compose.yaml is the documented deployment path and pins the
       # `latest` tags, so the smoke test loads the built images under those
-      # names and runs that file unchanged.
+      # names and runs that file unchanged. The compose file hardcodes the
+      # upstream image names, so in a fork these tags diverge from
+      # `github.repository` and this smoke test fails until both match.
       - name: Load the amd64 images under their deployment tags
         uses: docker/build-push-action@v6
         with:

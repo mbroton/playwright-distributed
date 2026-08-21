@@ -14,7 +14,8 @@ API) and a TypeScript Playwright worker.
 
 ## Verification
 
-- Server changes: run `cd server && go test ./...`.
+- Server changes: run `cd server && go test ./...` (needs a running Docker
+  daemon for testcontainers).
 - Worker code changes: run `cd worker && npm test && npm run typecheck`.
 - Playwright version changes: run `node scripts/check-playwright-version.js`.
 - Worker runtime changes: smoke-test with

@@ -2,8 +2,12 @@ services:
   postgres:
     image: postgres:18-alpine
     environment:
+      # Set POSTGRES_PASSWORD in a .env file before any real deployment.
+      # PostgreSQL reads it only when the postgres-data volume is first
+      # created; changing it later requires resetting the volume.
+      # The database stores sessions, workers, and API-key hashes.
       - POSTGRES_USER=pwd
-      - POSTGRES_PASSWORD=pwd
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-pwd}
       - POSTGRES_DB=pwd
     volumes:
       - postgres-data:/var/lib/postgresql
@@ -12,15 +16,22 @@ services:
       interval: 2s
       timeout: 2s
       retries: 30
+    restart: unless-stopped
 
   server:
     image: ghcr.io/mbroton/playwright-distributed/server:latest
     environment:
       # A server with zero API keys runs in unauthenticated bootstrap mode.
       # Create the first key: docker compose exec server server apikey create --name <name>
-      - DATABASE_URL=postgres://pwd:pwd@postgres:5432/pwd?sslmode=disable
+      # Creating a key locks the whole API, so hand the key to every worker
+      # (WORKER_API_KEY below) and client in the same step.
+      - DATABASE_URL=postgres://pwd:${POSTGRES_PASSWORD:-pwd}@postgres:5432/pwd?sslmode=disable
     ports:
       - "127.0.0.1:8080:8080"
+    # Shutdown budget: 20s relay grace + 10s worker dial + 9s relay cleanup
+    # + 5s buffer = 44s. Raise together with SHUTDOWN_GRACE_PERIOD and
+    # WORKER_DIAL_TIMEOUT.
+    stop_grace_period: 60s
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/healthz"]
       interval: 2s
@@ -29,6 +40,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    restart: unless-stopped
 
   # Stop budget: each cleanup step is bounded by the worker's 2.5s cleanup
   # timeout, not its inner deadline. Worst case: 2.5s drain status + 30s drain
@@ -51,6 +63,8 @@ services:
       # Max seconds to wait for open sessions on SIGTERM. Raise together with
       # stop_grace_period: grace must stay above DRAIN_TIMEOUT + 20s cleanup.
       - DRAIN_TIMEOUT=30
+      # Required as soon as the server has an API key (see the server comment).
+      - WORKER_API_KEY=${WORKER_API_KEY:-}
     depends_on:
       server:
         condition: service_healthy
