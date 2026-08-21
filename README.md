@@ -46,10 +46,7 @@ browser gets recycled for a fresh one.
 
 ## Quick start
 
-No clone needed — the compose file pulls the released images:
-
 ```bash
-mkdir playwright-grid && cd playwright-grid
 curl -LO https://raw.githubusercontent.com/mbroton/playwright-distributed/main/docker-compose.yaml
 docker compose up -d
 ```
@@ -94,8 +91,7 @@ connect with `firefox.connect('ws://host:8080/?browser=firefox')`.
 
 ## How it compares
 
-The self-hosted, Playwright-native options first — the tools that solve the
-same problem on your machines:
+Self-hosted, Playwright-native options:
 
 | | playwright-distributed | Browserless | Aerokube Moon |
 |---|---|---|---|
@@ -105,25 +101,25 @@ same problem on your machines:
 | Browsers stay warm between sessions | ✅ | ❌ launched per session | ❌ pod launched per session |
 | Native Playwright protocol | ✅ | ✅ | ✅ |
 | Chromium + Firefox + WebKit | ✅ | ✅ | ✅ |
-| Sessions and workers as database records | ✅ | partial | ❌ |
+| Session records and control (REST) | ✅ with history | live only | live UI |
 | Stealth / unblocking features | ❌ | ✅ | ❌ |
 
-Pick Browserless if you need per-session features like stealth and a live
-debugger on a single beefy machine. Pick Moon if you live in Kubernetes and
-per-browser licensing is fine. Pick playwright-distributed if you want an
-Apache-licensed fleet on plain Docker with nobody metering your sessions.
+Warm sharing is a trade, not a free win: sessions are isolated as browser
+contexts rather than processes (see [Security boundary](#security-boundary)),
+and launch flags cannot vary per session; worker recycling caps how long any
+browser lives.
 
-Two categories deliberately not in the table:
+Related tools outside the table:
 
 - **Hosted browser platforms** (Browserbase, Steel, Cloudflare Browser Run,
-  Browserless cloud, …) remove the ops burden entirely — and move the
-  browsers off your network. You trade data locality and per-session pricing
-  for zero infrastructure, and most connect Playwright over CDP
-  (`connectOverCDP`) rather than its native protocol.
-- **Selenium Grid** is the WebDriver-era grid: mature and multi-node, but a
-  different protocol and ecosystem. Playwright reaches it only through an
-  experimental Chrome/Edge bridge, so for Playwright workloads it is not a
-  real option — if your tests are Selenium, it remains the default choice.
+  Browserless cloud, …): no infrastructure to run; the browsers live outside
+  your network, pricing is per session or usage, and Playwright mostly
+  connects to them over CDP (`connectOverCDP`) rather than its native
+  protocol.
+- **Selenium Grid**: multi-node and mature, but WebDriver-based; Playwright
+  connects to it only through an experimental Chrome/Edge bridge.
+- **AI agent frameworks** (Stagehand, browser-use, …): clients, not grids —
+  they drive a browser endpoint rather than provide one.
 
 ## Architecture
 
