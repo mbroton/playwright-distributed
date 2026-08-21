@@ -4,6 +4,9 @@ multi-ecosystem-groups:
   playwright:
     schedule:
       interval: weekly
+    # Shared options must live on the group, not on its member updates;
+    # Dependabot rejects the whole config otherwise.
+    open-pull-requests-limit: 10
     labels: ["dependencies", "worker"]
     assignees: ["mbroton"]
     commit-message:
@@ -16,9 +19,6 @@ updates:
     directory: "/worker"
     patterns: ["playwright-core"]
     multi-ecosystem-group: playwright
-    open-pull-requests-limit: 10
-    labels: ["dependencies", "worker"]
-    assignees: ["mbroton"]
   - package-ecosystem: docker
     directory: "/worker"
     patterns: ["playwright"]
