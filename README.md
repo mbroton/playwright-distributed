@@ -46,9 +46,11 @@ browser gets recycled for a fresh one.
 
 ## Quick start
 
+No clone needed — the compose file pulls the released images:
+
 ```bash
-git clone https://github.com/mbroton/playwright-distributed.git
-cd playwright-distributed
+mkdir playwright-grid && cd playwright-grid
+curl -LO https://raw.githubusercontent.com/mbroton/playwright-distributed/main/docker-compose.yaml
 docker compose up -d
 ```
 
@@ -66,15 +68,19 @@ await browser.close();
 
 > Your client's Playwright `major.minor` version must match a registered
 > worker's version — the server routes each client to a version-matched
-> worker. For Firefox or WebKit, add a worker with `BROWSER_TYPE=firefox` or
-> `BROWSER_TYPE=webkit` (see `docker-compose.local.yaml` for a three-browser
-> stack) and connect with `firefox.connect('ws://host:8080/?browser=firefox')`.
+> worker.
 
-More workers:
+Grow the grid by adding workers — each serves up to `MAX_SLOTS` (default 5)
+concurrent sessions:
 
 ```bash
-docker compose up -d --scale worker=5
+docker compose up -d --scale worker=5    # 25 session slots
 ```
+
+For Firefox or WebKit, add a worker service with `BROWSER_TYPE=firefox` or
+`BROWSER_TYPE=webkit` (copy the `worker` service in the compose file; see
+`docker-compose.local.yaml` in the repository for a three-browser stack) and
+connect with `firefox.connect('ws://host:8080/?browser=firefox')`.
 
 ## Who it's for
 
@@ -88,25 +94,36 @@ docker compose up -d --scale worker=5
 
 ## How it compares
 
-Honest version: these tools solve different problems, and each is better at
-its own.
+The self-hosted, Playwright-native options first — the tools that solve the
+same problem on your machines:
 
-| | playwright-distributed | Selenium Grid | Browserless | Hosted (Browserbase, Cloudflare, …) |
-|---|---|---|---|---|
-| Self-hosted | ✅ | ✅ | ✅ (source-available) | ❌ |
-| Multi-node fleet built in | ✅ | ✅ | ❌ one instance per node, bring your own load balancer | n/a |
-| Browsers stay warm between sessions | ✅ | ❌ launched per session | ❌ launched per session | varies |
-| Native Playwright protocol | ✅ | ❌ WebDriver | ✅ | ❌ CDP (`connectOverCDP`) |
-| Chromium + Firefox + WebKit | ✅ | ✅ | ✅ | mostly Chromium |
-| Sessions and workers as database records | ✅ | live state only | partial | ✅ |
-| Stealth / unblocking features | ❌ | ❌ | ✅ | varies |
-| Ops burden | yours | yours | yours | none |
+| | playwright-distributed | Browserless | Aerokube Moon |
+|---|---|---|---|
+| License | Apache-2.0 | source-available, paid tiers | commercial, free up to 4 parallel browsers |
+| Runs on | any Docker host | any Docker host | Kubernetes / OpenShift only |
+| Multi-node fleet built in | ✅ | ❌ one instance per node, bring your own load balancer | ✅ |
+| Browsers stay warm between sessions | ✅ | ❌ launched per session | ❌ pod launched per session |
+| Native Playwright protocol | ✅ | ✅ | ✅ |
+| Chromium + Firefox + WebKit | ✅ | ✅ | ✅ |
+| Sessions and workers as database records | ✅ | partial | ❌ |
+| Stealth / unblocking features | ❌ | ✅ | ❌ |
 
-Pick Selenium Grid if your stack is WebDriver. Pick Browserless if you need
-per-session features like stealth and a live debugger on a single beefy
-machine. Pick a hosted service if you don't want to run infrastructure at
-all. Pick playwright-distributed if you want a Playwright-native fleet on
-your own machines with nobody metering your sessions.
+Pick Browserless if you need per-session features like stealth and a live
+debugger on a single beefy machine. Pick Moon if you live in Kubernetes and
+per-browser licensing is fine. Pick playwright-distributed if you want an
+Apache-licensed fleet on plain Docker with nobody metering your sessions.
+
+Two categories deliberately not in the table:
+
+- **Hosted browser platforms** (Browserbase, Steel, Cloudflare Browser Run,
+  Browserless cloud, …) remove the ops burden entirely — and move the
+  browsers off your network. You trade data locality and per-session pricing
+  for zero infrastructure, and most connect Playwright over CDP
+  (`connectOverCDP`) rather than its native protocol.
+- **Selenium Grid** is the WebDriver-era grid: mature and multi-node, but a
+  different protocol and ecosystem. Playwright reaches it only through an
+  experimental Chrome/Edge bridge, so for Playwright workloads it is not a
+  real option — if your tests are Selenium, it remains the default choice.
 
 ## Architecture
 
