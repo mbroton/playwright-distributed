@@ -28,6 +28,14 @@ jobs:
       - name: Verify Playwright versions stay in sync
         run: node scripts/check-playwright-version.js
 
+      - name: Verify bench lockfile and scripts
+        working-directory: bench
+        run: |
+          npm ci
+          node --check lib.js
+          node --check time-to-first-page.js
+          node --check throughput.js
+
   worker-checks:
     runs-on: ubuntu-latest
     steps:

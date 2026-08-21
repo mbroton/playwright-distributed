@@ -1,6 +1,8 @@
 # Benchmark stack: postgres + server + N identical chromium workers.
-# Scale the worker count per run:
-#   docker compose -f bench/docker-compose.yaml up -d --build --scale worker=3
+# Scale the worker count per run (from bench/):
+#   docker compose up -d --build --scale worker=3
+# The server runs in unauthenticated bootstrap mode (zero API keys), like
+# docker-compose.local.yaml. Do not use it on a public network.
 services:
   postgres:
     image: postgres:18-alpine
@@ -58,5 +60,6 @@ services:
     depends_on:
       server:
         condition: service_healthy
-    # Recycled workers exit cleanly by design and must come back.
+    # Workers exit on fatal errors by design and rely on the restart policy
+    # to come back.
     restart: unless-stopped

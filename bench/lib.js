@@ -12,6 +12,9 @@ export function quantile(sortedValues, q) {
 }
 
 export function summarize(samples) {
+  if (samples.length === 0) {
+    throw new Error('summarize() needs at least one sample');
+  }
   const sorted = [...samples].sort((a, b) => a - b);
   const sum = sorted.reduce((total, value) => total + value, 0);
   return {
@@ -46,4 +49,67 @@ export function formatHeader() {
     cell('max') +
     cell('mean')
   );
+}
+
+export function parsePositiveInt(name, raw, { min = 1 } = {}) {
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < min) {
+    console.error(`${name} must be an integer >= ${min} (got "${raw}")`);
+    process.exit(1);
+  }
+  return value;
+}
+
+export async function withDeadline(promise, ms, label) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} exceeded ${ms}ms`)), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Polls /v1/capacity (derived from the ws endpoint) until the expected worker
+// count has registered, then verifies the grid has enough slots for the run.
+export async function waitForWorkers(wsEndpoint, expectedWorkers, requiredSlots) {
+  const url = new URL(wsEndpoint);
+  url.protocol = url.protocol === 'wss:' ? 'https:' : 'http:';
+  url.pathname = '/v1/capacity';
+  url.search = '';
+
+  const deadline = Date.now() + 120_000;
+  let totals;
+  for (;;) {
+    try {
+      const response = await fetch(url, { signal: AbortSignal.timeout(5_000) });
+      if (response.ok) {
+        totals = (await response.json()).totals;
+        if (totals.workers >= expectedWorkers && totals.active_sessions === 0) {
+          break;
+        }
+      }
+    } catch {
+      // Server may still be starting; keep polling until the deadline.
+    }
+    if (Date.now() > deadline) {
+      console.error(
+        `Timed out waiting for ${expectedWorkers} workers` +
+          (totals ? ` (last capacity: ${JSON.stringify(totals)})` : '')
+      );
+      process.exit(1);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+  }
+  if (totals.available_slots < requiredSlots) {
+    console.error(
+      `Grid has ${totals.available_slots} slots but the run needs ${requiredSlots}; ` +
+        'lower --concurrency or add workers so the result measures service rate, not queueing'
+    );
+    process.exit(1);
+  }
 }
