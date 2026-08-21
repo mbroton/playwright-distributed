@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
 /**
- * Ensures the Playwright package version declared in worker/package.json
- * matches the Playwright image tag used in worker/Dockerfile.
+ * Ensures the Playwright package versions declared in worker/package.json and
+ * bench/package.json match the Playwright image tag used in worker/Dockerfile.
  */
 
 const { readFileSync } = require('node:fs');
@@ -12,7 +12,10 @@ const rootDir = resolve(__dirname, '..');
 const workerDir = resolve(rootDir, 'worker');
 
 const dockerfilePath = resolve(workerDir, 'Dockerfile');
-const packageJsonPath = resolve(workerDir, 'package.json');
+const packageJsonPaths = [
+  resolve(workerDir, 'package.json'),
+  resolve(rootDir, 'bench', 'package.json'),
+];
 
 function getDockerfileVersion() {
   const dockerfileContent = readFileSync(dockerfilePath, 'utf-8');
@@ -25,7 +28,7 @@ function getDockerfileVersion() {
   return match[1];
 }
 
-function getPackageJsonVersion() {
+function getPackageJsonVersion(packageJsonPath) {
   const pkg = JSON.parse(readFileSync(packageJsonPath, 'utf-8'));
   const version =
     pkg.dependencies?.['playwright-core'] ??
@@ -50,13 +53,16 @@ function getPackageJsonVersion() {
 
 try {
   const dockerfileVersion = getDockerfileVersion();
-  const packageJsonVersion = getPackageJsonVersion();
 
-  if (dockerfileVersion !== packageJsonVersion) {
-    console.error(
-      `Playwright version mismatch: Dockerfile uses ${dockerfileVersion}, package.json declares ${packageJsonVersion}`
-    );
-    process.exit(1);
+  for (const packageJsonPath of packageJsonPaths) {
+    const packageJsonVersion = getPackageJsonVersion(packageJsonPath);
+
+    if (dockerfileVersion !== packageJsonVersion) {
+      console.error(
+        `Playwright version mismatch: Dockerfile uses ${dockerfileVersion}, ${packageJsonPath} declares ${packageJsonVersion}`
+      );
+      process.exit(1);
+    }
   }
 
   console.log(`Playwright versions match (${dockerfileVersion}).`);

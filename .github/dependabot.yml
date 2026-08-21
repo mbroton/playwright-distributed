@@ -23,6 +23,10 @@ updates:
     directory: "/worker"
     patterns: ["playwright"]
     multi-ecosystem-group: playwright
+  - package-ecosystem: npm
+    directory: "/bench"
+    patterns: ["playwright"]
+    multi-ecosystem-group: playwright
   - package-ecosystem: gomod
     directory: "/server"
     schedule:

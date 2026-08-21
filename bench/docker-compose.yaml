@@ -1,0 +1,62 @@
+# Benchmark stack: postgres + server + N identical chromium workers.
+# Scale the worker count per run:
+#   docker compose -f bench/docker-compose.yaml up -d --build --scale worker=3
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      - POSTGRES_USER=pwd
+      - POSTGRES_PASSWORD=pwd
+      - POSTGRES_DB=pwd
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pwd -d pwd"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  server:
+    build:
+      context: ../server
+      dockerfile: Dockerfile
+    environment:
+      - DATABASE_URL=postgres://pwd:pwd@postgres:5432/pwd?sslmode=disable
+      # Worker recycling (default: drain after 50 lifetime sessions) is
+      # disabled so throughput measures the grid's service rate, not the
+      # container runtime's restart latency. See README.md before changing.
+      - MAX_LIFETIME_SESSIONS=0
+    ports:
+      - "127.0.0.1:8080:8080"
+    stop_grace_period: 60s
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ../worker
+      dockerfile: Dockerfile
+    init: true
+    # Scaling runs pin each worker to a fixed CPU budget so that adding
+    # workers simulates adding fixed-size nodes (see README.md). 0 = no limit.
+    cpus: ${WORKER_CPUS:-0}
+    security_opt:
+      - seccomp=../worker/seccomp_profile.json
+    shm_size: "1gb"
+    stop_grace_period: 60s
+    environment:
+      - SERVER_URL=http://server:8080
+      - BROWSER_TYPE=chromium
+      - PORT=3131
+      - LOG_FORMAT=text
+      - DRAIN_TIMEOUT=30
+      - MAX_SLOTS=5
+    depends_on:
+      server:
+        condition: service_healthy
+    # Recycled workers exit cleanly by design and must come back.
+    restart: unless-stopped
