@@ -125,7 +125,7 @@ test('does not drop a frame sent as soon as the client opens', async t => {
     client.once('open', () => client.send('first frame'));
     t.after(() => client.terminate());
 
-    assert.deepEqual(await upstreamMessage, {
+    assert.deepEqual(await bounded(upstreamMessage, 2_000), {
         data: Buffer.from('first frame'),
         isBinary: false,
     });
@@ -373,10 +373,10 @@ function delay(delayMs: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, delayMs));
 }
 
-async function bounded(operation: Promise<void>, timeoutMs: number): Promise<void> {
-    await Promise.race([
+async function bounded<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
+    return Promise.race([
         operation,
-        delay(timeoutMs).then(() => {
+        delay(timeoutMs).then((): never => {
             throw new Error(`operation did not finish within ${timeoutMs}ms`);
         }),
     ]);

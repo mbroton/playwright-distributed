@@ -19,7 +19,10 @@ interface ShimEvents {
 
 const sessionHeader = 'x-pwd-session-id';
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const upstreamHandshakeTimeoutMs = 10_000;
+// Must stay below the server's WORKER_DIAL_TIMEOUT (default 10s): the relay's
+// dial now spans this browser handshake, and the inner deadline must lose the
+// race so the failure surfaces as the shim's 502, not a relay dial timeout.
+const upstreamHandshakeTimeoutMs = 7_000;
 const shutdownTimeoutMs = 1_000;
 const backpressureHighWaterMark = 1024 * 1024;
 
@@ -54,10 +57,7 @@ export class WebSocketShim extends EventEmitter<ShimEvents> {
         return this.sessions.size;
     }
 
-    get listeningPort(): number {
-        if (this.listenPort === null) {
-            throw new Error('WebSocket shim is not listening');
-        }
+    get listeningPort(): number | null {
         return this.listenPort;
     }
 
@@ -150,10 +150,19 @@ export class WebSocketShim extends EventEmitter<ShimEvents> {
         }
 
         this.pendingSessionIds.add(sessionId);
-        const upstream = new WebSocket(this.browserEndpoint, {
-            headers: forwardedHeaders(request.headers),
-            handshakeTimeout: upstreamHandshakeTimeoutMs,
-        });
+        let upstream: WebSocket;
+        try {
+            // Node validates forwarded header values synchronously inside the
+            // WebSocket constructor; a throw here must not reach uncaughtException.
+            upstream = new WebSocket(this.browserEndpoint, {
+                headers: forwardedHeaders(request.headers),
+                handshakeTimeout: upstreamHandshakeTimeoutMs,
+            });
+        } catch {
+            this.pendingSessionIds.delete(sessionId);
+            rejectUpgrade(socket, 502, 'Browser connection failed');
+            return;
+        }
         let acceptedSession: SessionSockets | undefined;
         upstream.on('error', () => {
             if (this.pendingSessions.get(sessionId)?.upstream === upstream) {
@@ -332,17 +341,20 @@ async function waitWithDeadline(
     onTimeout: () => void,
 ): Promise<void> {
     let timer: NodeJS.Timeout | null = null;
-    await Promise.race([
-        operation,
-        new Promise<void>(resolve => {
-            timer = setTimeout(() => {
-                onTimeout();
-                resolve();
-            }, timeoutMs);
-        }),
-    ]);
-    if (timer) {
-        clearTimeout(timer);
+    try {
+        await Promise.race([
+            operation,
+            new Promise<void>(resolve => {
+                timer = setTimeout(() => {
+                    onTimeout();
+                    resolve();
+                }, timeoutMs);
+            }),
+        ]);
+    } finally {
+        if (timer) {
+            clearTimeout(timer);
+        }
     }
 }
 

@@ -19,7 +19,7 @@ export interface BrowserServerLike {
 export interface ShimLike {
     readonly activeSessionIds: string[];
     readonly activeConnectionCount: number;
-    readonly listeningPort: number;
+    readonly listeningPort: number | null;
     start(): Promise<void>;
     closeSession(sessionId: string, code?: number, reason?: string): void;
     shutdown(): Promise<void>;

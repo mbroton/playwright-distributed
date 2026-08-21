@@ -29,7 +29,9 @@ services:
       postgres:
         condition: service_healthy
 
-  # Stop budget: 2s drain status + 30s drain + 2s shutdown status + 1s shim + 10s browser + 2.5s kill.
+  # Stop budget: each cleanup step is bounded by the worker's 2.5s cleanup
+  # timeout, not its inner deadline. Worst case: 2.5s drain status + 30s drain
+  # + 2.5s shutdown status + 2.5s shim + 10s browser close + 2.5s kill = 50s.
   worker:
     build:
       context: ./worker

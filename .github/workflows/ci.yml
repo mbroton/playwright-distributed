@@ -221,9 +221,15 @@ jobs:
       - name: Verify worker scaling
         run: |
           docker compose -f docker-compose.local.yaml up -d --scale worker=3
-          sleep 10
-          workers="$(curl -fsS http://127.0.0.1:8080/v1/capacity | jq '[.browsers[] | select(.browser == "chromium")][0].workers // 0')"
-          test "$workers" -eq 3
+          for attempt in {1..30}; do
+            workers="$(curl -fsS http://127.0.0.1:8080/v1/capacity | jq '[.browsers[] | select(.browser == "chromium")][0].workers // 0')"
+            if [[ "$workers" -eq 3 ]]; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "expected 3 chromium workers, got $workers" >&2
+          exit 1
 
       - name: Show service logs on failure
         if: failure()
