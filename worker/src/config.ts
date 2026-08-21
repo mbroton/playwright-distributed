@@ -16,7 +16,7 @@ export interface WorkerConfig {
         type: 'chromium' | 'firefox' | 'webkit';
         headless: boolean;
     };
-    shim: {
+    gateway: {
         port: number;
         privateHostname: string;
         maxSlots: number;
@@ -58,7 +58,7 @@ export function parseConfig(environment: NodeJS.ProcessEnv): WorkerConfig {
             type: parsed.BROWSER_TYPE,
             headless: parsed.HEADLESS,
         },
-        shim: {
+        gateway: {
             port: parsed.PORT,
             // A container hostname is its unique, routable container ID. This
             // lets Docker Compose scale workers without fixed hostnames.

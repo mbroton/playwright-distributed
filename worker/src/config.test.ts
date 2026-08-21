@@ -14,7 +14,7 @@ test('uses worker defaults', () => {
     assert.deepEqual(config, {
         controlPlane: { serverUrl: 'http://localhost:8080' },
         browser: { type: 'chromium', headless: true },
-        shim: {
+        gateway: {
             port: 3131,
             privateHostname: os.hostname(),
             maxSlots: 5,
@@ -51,11 +51,11 @@ test('uses PRIVATE_HOSTNAME when set', () => {
         PRIVATE_HOSTNAME: 'worker-1',
     });
 
-    assert.equal(config.shim.privateHostname, 'worker-1');
+    assert.equal(config.gateway.privateHostname, 'worker-1');
 });
 
 test('accepts the server MAX_SLOTS limit and rejects larger values', () => {
-    assert.equal(parseConfig({ ...requiredEnvironment, MAX_SLOTS: '1024' }).shim.maxSlots, 1024);
+    assert.equal(parseConfig({ ...requiredEnvironment, MAX_SLOTS: '1024' }).gateway.maxSlots, 1024);
     assert.throws(() => parseConfig({ ...requiredEnvironment, MAX_SLOTS: '1025' }), ZodError);
 });
 

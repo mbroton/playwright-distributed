@@ -4,7 +4,7 @@ import net from 'node:net';
 import { Duplex } from 'node:stream';
 import test from 'node:test';
 import WebSocket, { WebSocketServer } from 'ws';
-import { WebSocketShim } from './shim.js';
+import { SessionGateway } from './gateway.js';
 
 const sessionId = '11111111-1111-4111-8111-111111111111';
 
@@ -12,10 +12,10 @@ test('relays text and binary frames and tracks the session map', async t => {
     const fixture = await createFixture();
     t.after(() => fixture.close());
 
-    const client = await connect(fixture.shimUrl, sessionId);
-    await waitFor(() => fixture.shim.activeConnectionCount === 1);
-    assert.deepEqual(fixture.shim.activeSessionIds, [sessionId]);
-    assert.equal(fixture.shim.activeConnectionCount, 1);
+    const client = await connect(fixture.gatewayUrl, sessionId);
+    await waitFor(() => fixture.gateway.activeConnectionCount === 1);
+    assert.deepEqual(fixture.gateway.activeSessionIds, [sessionId]);
+    assert.equal(fixture.gateway.activeConnectionCount, 1);
 
     const textMessage = nextMessage(client);
     client.send('hello');
@@ -30,19 +30,19 @@ test('relays text and binary frames and tracks the session map', async t => {
 
     client.close(1000, 'done');
     await waitForClose(client);
-    await waitFor(() => fixture.shim.activeConnectionCount === 0);
-    assert.deepEqual(fixture.shim.activeSessionIds, []);
+    await waitFor(() => fixture.gateway.activeConnectionCount === 0);
+    assert.deepEqual(fixture.gateway.activeSessionIds, []);
 });
 
 test('rejects missing, invalid, and duplicate session IDs', async t => {
     const fixture = await createFixture();
     t.after(() => fixture.close());
 
-    assert.equal(await refusedStatus(fixture.shimUrl), 400);
-    assert.equal(await refusedStatus(fixture.shimUrl, 'not-a-uuid'), 400);
+    assert.equal(await refusedStatus(fixture.gatewayUrl), 400);
+    assert.equal(await refusedStatus(fixture.gatewayUrl, 'not-a-uuid'), 400);
 
-    const first = await connect(fixture.shimUrl, sessionId);
-    assert.equal(await refusedStatus(fixture.shimUrl, sessionId), 409);
+    const first = await connect(fixture.gatewayUrl, sessionId);
+    assert.equal(await refusedStatus(fixture.gatewayUrl, sessionId), 409);
     first.close();
     await waitForClose(first);
 });
@@ -51,7 +51,7 @@ test('forwards only Playwright headers and User-Agent', async t => {
     const fixture = await createFixture();
     t.after(() => fixture.close());
 
-    const client = await connect(fixture.shimUrl, sessionId, {
+    const client = await connect(fixture.gatewayUrl, sessionId, {
         Authorization: 'Bearer secret',
         Cookie: 'secret=cookie',
         'User-Agent': 'Playwright/1.62.1',
@@ -74,7 +74,7 @@ test('a client close closes the browser-side socket', async t => {
     const fixture = await createFixture();
     t.after(() => fixture.close());
 
-    const client = await connect(fixture.shimUrl, sessionId);
+    const client = await connect(fixture.gatewayUrl, sessionId);
     const upstream = await fixture.nextUpstreamSocket();
     const upstreamClosed = waitForClose(upstream);
 
@@ -83,14 +83,14 @@ test('a client close closes the browser-side socket', async t => {
     const close = await upstreamClosed;
     assert.equal(close.code, 1000);
     assert.equal(close.reason.toString(), 'client done');
-    assert.equal(fixture.shim.activeConnectionCount, 0);
+    assert.equal(fixture.gateway.activeConnectionCount, 0);
 });
 
 test('a late close event cannot remove a replacement session with the same ID', async t => {
     const fixture = await createFixture();
     t.after(() => fixture.close());
-    const firstClient = await connect(fixture.shimUrl, sessionId);
-    const internals = fixture.shim as unknown as {
+    const firstClient = await connect(fixture.gatewayUrl, sessionId);
+    const internals = fixture.gateway as unknown as {
         sessions: Map<string, { client: WebSocket; upstream: WebSocket }>;
     };
     const firstSession = internals.sessions.get(sessionId);
@@ -98,9 +98,9 @@ test('a late close event cannot remove a replacement session with the same ID', 
     const delayedCloseListeners = firstSession.client.rawListeners('close');
     firstSession.client.removeAllListeners('close');
 
-    fixture.shim.closeSession(sessionId);
+    fixture.gateway.closeSession(sessionId);
     await waitForClose(firstClient);
-    const secondClient = await connect(fixture.shimUrl, sessionId);
+    const secondClient = await connect(fixture.gatewayUrl, sessionId);
     t.after(() => secondClient.terminate());
     const secondMessage = nextMessage(secondClient);
 
@@ -109,8 +109,8 @@ test('a late close event cannot remove a replacement session with the same ID', 
     }
     secondClient.send('still open');
 
-    assert.equal(fixture.shim.activeConnectionCount, 1);
-    assert.deepEqual(fixture.shim.activeSessionIds, [sessionId]);
+    assert.equal(fixture.gateway.activeConnectionCount, 1);
+    assert.deepEqual(fixture.gateway.activeSessionIds, [sessionId]);
     assert.deepEqual(await secondMessage, { data: Buffer.from('still open'), isBinary: false });
 });
 
@@ -119,7 +119,7 @@ test('does not drop a frame sent as soon as the client opens', async t => {
     t.after(() => fixture.close());
 
     const upstreamMessage = fixture.nextUpstreamMessage();
-    const client = new WebSocket(fixture.shimUrl, {
+    const client = new WebSocket(fixture.gatewayUrl, {
         headers: { 'x-pwd-session-id': sessionId },
     });
     client.once('open', () => client.send('first frame'));
@@ -134,10 +134,10 @@ test('does not drop a frame sent as soon as the client opens', async t => {
 test('shutdown resolves with a live session', async t => {
     const fixture = await createFixture();
     t.after(() => fixture.close());
-    const client = await connect(fixture.shimUrl, sessionId);
-    await waitFor(() => fixture.shim.activeConnectionCount === 1);
+    const client = await connect(fixture.gatewayUrl, sessionId);
+    await waitFor(() => fixture.gateway.activeConnectionCount === 1);
 
-    await bounded(fixture.shim.shutdown(), 500);
+    await bounded(fixture.gateway.shutdown(), 500);
     await waitForClose(client);
 });
 
@@ -150,7 +150,7 @@ test('resetting rejected upgrades does not emit an uncaught exception', async t 
     t.after(() => process.off('uncaughtException', onUncaught));
 
     for (let attempt = 0; attempt < 5; attempt += 1) {
-        await resetRejectedUpgrade(fixture.shimUrl);
+        await resetRejectedUpgrade(fixture.gatewayUrl);
     }
     await delay(30);
 
@@ -161,8 +161,8 @@ test('removes a pending session ID after a malformed handshake', async t => {
     const fixture = await createFixture();
     t.after(() => fixture.close());
 
-    await sendMalformedUpgrade(fixture.shimUrl, sessionId);
-    const client = await connect(fixture.shimUrl, sessionId);
+    await sendMalformedUpgrade(fixture.gatewayUrl, sessionId);
+    const client = await connect(fixture.gatewayUrl, sessionId);
     client.close();
     await waitForClose(client);
 });
@@ -170,7 +170,7 @@ test('removes a pending session ID after a malformed handshake', async t => {
 test('shutting down takes precedence over duplicate session rejection', async t => {
     const fixture = await createFixture();
     t.after(() => fixture.close());
-    const internals = fixture.shim as unknown as {
+    const internals = fixture.gateway as unknown as {
         shuttingDown: boolean;
         pendingSessionIds: Set<string>;
         handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void;
@@ -196,8 +196,8 @@ test('shutting down takes precedence over duplicate session rejection', async t 
 });
 
 async function createFixture(upstreamHandshakeDelayMs = 0): Promise<{
-    shim: WebSocketShim;
-    shimUrl: string;
+    gateway: SessionGateway;
+    gatewayUrl: string;
     nextUpstreamRequest: () => Promise<IncomingMessage>;
     nextUpstreamSocket: () => Promise<WebSocket>;
     nextUpstreamMessage: () => Promise<{ data: Buffer; isBinary: boolean }>;
@@ -247,13 +247,13 @@ async function createFixture(upstreamHandshakeDelayMs = 0): Promise<{
         });
     });
 
-    const shim = new WebSocketShim(`ws://127.0.0.1:${browserAddress.port}`, 0, '127.0.0.1');
-    await shim.start();
+    const gateway = new SessionGateway(`ws://127.0.0.1:${browserAddress.port}`, 0, '127.0.0.1');
+    await gateway.start();
 
     let closePromise: Promise<void> | null = null;
     return {
-        shim,
-        shimUrl: `ws://127.0.0.1:${shim.listeningPort}`,
+        gateway,
+        gatewayUrl: `ws://127.0.0.1:${gateway.listeningPort}`,
         nextUpstreamRequest: () => {
             const request = requests.shift();
             return request ? Promise.resolve(request) : new Promise(resolve => requestWaiters.push(resolve));
@@ -268,7 +268,7 @@ async function createFixture(upstreamHandshakeDelayMs = 0): Promise<{
         },
         close: () => {
             closePromise ??= (async () => {
-                await shim.shutdown();
+                await gateway.shutdown();
                 for (const socket of browser.clients) {
                     socket.terminate();
                 }

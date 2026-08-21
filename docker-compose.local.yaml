@@ -31,7 +31,7 @@ services:
 
   # Stop budget: each cleanup step is bounded by the worker's 2.5s cleanup
   # timeout, not its inner deadline. Worst case: 2.5s drain status + 30s drain
-  # + 2.5s shutdown status + 2.5s shim + 10s browser close + 2.5s kill = 50s.
+  # + 2.5s shutdown status + 2.5s gateway + 10s browser close + 2.5s kill = 50s.
   worker:
     build:
       context: ./worker

@@ -5,11 +5,11 @@ import test from 'node:test';
 import WebSocket, { WebSocketServer } from 'ws';
 import { ControlPlaneClient, ControlPlaneError } from './control-plane.js';
 import type { WorkerConfig } from './config.js';
-import { WebSocketShim } from './shim.js';
+import { SessionGateway } from './gateway.js';
 import type {
     BrowserServerLike,
     ControlPlaneLike,
-    ShimLike,
+    GatewayLike,
     WorkerRegistration,
 } from './worker.js';
 import { BrowserWorker } from './worker.js';
@@ -122,16 +122,16 @@ test('heartbeat is single-flight, reports sessions, and closes stale sessions', 
     });
     t.after(() => server.close());
 
-    const shim = new FakeShim([activeId]);
-    const worker = createWorker(server.url, shim);
+    const gateway = new FakeGateway([activeId]);
+    const worker = createWorker(server.url, gateway);
     await worker.start();
-    await waitFor(() => shim.closedSessions.length === 1);
+    await waitFor(() => gateway.closedSessions.length === 1);
     await delay(80);
     await worker.shutdown(0);
 
     assert.equal(maxConcurrentHeartbeats, 1);
     assert.deepEqual(heartbeatBodies[0], { active_session_ids: [activeId] });
-    assert.deepEqual(shim.closedSessions, [{ sessionId: activeId, code: 1001 }]);
+    assert.deepEqual(gateway.closedSessions, [{ sessionId: activeId, code: 1001 }]);
 });
 
 test('heartbeat requests time out and the loop keeps ticking', async t => {
@@ -149,7 +149,7 @@ test('heartbeat requests time out and the loop keeps ticking', async t => {
     });
     t.after(() => server.close());
 
-    const worker = createWorker(server.url, new FakeShim());
+    const worker = createWorker(server.url, new FakeGateway());
     await worker.start();
     await waitFor(() => heartbeatAttempts >= 3, 250);
     await worker.shutdown(0);
@@ -171,7 +171,7 @@ test('heartbeat draining status enters drain mode', async t => {
     });
     t.after(() => server.close());
 
-    const worker = createWorker(server.url, new FakeShim([activeId]));
+    const worker = createWorker(server.url, new FakeGateway([activeId]));
     await worker.start();
     await waitFor(() => worker.state === 'draining');
     await worker.shutdown(0);
@@ -181,8 +181,8 @@ test('heartbeat draining status enters drain mode', async t => {
 
 test('a draining worker re-asserts drain intent after an available heartbeat', async () => {
     const controlPlane = new FakeControlPlane();
-    const shim = new FakeShim([activeId]);
-    const worker = createInjectedWorker(controlPlane, shim, 5_000);
+    const gateway = new FakeGateway([activeId]);
+    const worker = createInjectedWorker(controlPlane, gateway, 5_000);
     await worker.start();
     await worker.requestDrain('SIGTERM');
 
@@ -212,7 +212,7 @@ test('heartbeat 404 registers a new worker ID', async t => {
     });
     t.after(() => server.close());
 
-    const worker = createWorker(server.url, new FakeShim());
+    const worker = createWorker(server.url, new FakeGateway());
     await worker.start();
     await waitFor(() => worker.workerId === 'worker-2');
     await worker.shutdown(0);
@@ -243,7 +243,7 @@ test('heartbeat 404 re-asserts drain status immediately after registration', asy
             events.push(`status:${workerId}:${status}`);
         },
     };
-    const worker = createInjectedWorker(controlPlane, new FakeShim([activeId]), 5_000);
+    const worker = createInjectedWorker(controlPlane, new FakeGateway([activeId]), 5_000);
     await worker.start();
     await worker.requestDrain('SIGTERM');
 
@@ -259,8 +259,8 @@ test('heartbeat 404 re-asserts drain status immediately after registration', asy
 
 test('drain with no connections shuts down promptly', async () => {
     const controlPlane = new FakeControlPlane();
-    const shim = new FakeShim();
-    const worker = createInjectedWorker(controlPlane, shim, 5_000);
+    const gateway = new FakeGateway();
+    const worker = createInjectedWorker(controlPlane, gateway, 5_000);
     await worker.start();
 
     const startedAt = Date.now();
@@ -269,24 +269,24 @@ test('drain with no connections shuts down promptly', async () => {
 
     assert.ok(Date.now() - startedAt < 200);
     assert.deepEqual(controlPlane.statuses, ['draining', 'shutting_down']);
-    assert.equal(shim.shutdownCalled, true);
+    assert.equal(gateway.shutdownCalled, true);
 });
 
 test('drain timeout forces shutdown with active connections', async () => {
     const controlPlane = new FakeControlPlane();
-    const shim = new FakeShim([activeId]);
-    const worker = createInjectedWorker(controlPlane, shim, 30);
+    const gateway = new FakeGateway([activeId]);
+    const worker = createInjectedWorker(controlPlane, gateway, 30);
     await worker.start();
 
     await worker.requestDrain('control plane');
     assert.equal(await worker.waitForExit(), 0);
 
-    assert.equal(shim.shutdownCalled, true);
+    assert.equal(gateway.shutdownCalled, true);
     assert.ok(controlPlane.statuses.includes('draining'));
     assert.equal(controlPlane.statuses.at(-1), 'shutting_down');
 });
 
-test('drain timeout exits with a live session on the real shim', async t => {
+test('drain timeout exits with a live session on the real gateway', async t => {
     const browser = new WebSocketServer({ host: '127.0.0.1', port: 0 });
     await waitForWebSocketServer(browser);
     const address = browser.address();
@@ -296,20 +296,20 @@ test('drain timeout exits with a live session on the real shim', async t => {
     browser.on('connection', socket => socket.on('message', data => socket.send(data)));
     const browserServer = new NetworkBrowser(browser, `ws://127.0.0.1:${address.port}`);
     const controlPlane = new FakeControlPlane();
-    let shim!: WebSocketShim;
+    let gateway!: SessionGateway;
     const worker = new BrowserWorker(testConfig(30, 0), {
         controlPlane,
-        createShim: (endpoint, port) => {
-            shim = new WebSocketShim(endpoint, port, '127.0.0.1');
-            return shim;
+        createGateway: (endpoint, port) => {
+            gateway = new SessionGateway(endpoint, port, '127.0.0.1');
+            return gateway;
         },
         launchBrowser: async () => browserServer,
         exit: () => undefined,
     });
     t.after(() => browserServer.kill());
     await worker.start();
-    const client = await connectWebSocket(`ws://127.0.0.1:${shim.listeningPort}`, activeId);
-    await waitFor(() => shim?.activeConnectionCount === 1);
+    const client = await connectWebSocket(`ws://127.0.0.1:${gateway.listeningPort}`, activeId);
+    await waitFor(() => gateway?.activeConnectionCount === 1);
 
     await worker.requestDrain('control plane');
     assert.equal(await bounded(worker.waitForExit(), 500), 0);
@@ -334,7 +334,7 @@ test('startup does not resume after shutdown wins a registration race', async ()
         },
         setStatus: async () => undefined,
     };
-    const worker = createInjectedWorker(controlPlane, new FakeShim(), 5_000);
+    const worker = createInjectedWorker(controlPlane, new FakeGateway(), 5_000);
     const start = worker.start();
     await waitFor(() => registrationStarted);
 
@@ -350,7 +350,7 @@ test('startup does not resume after shutdown wins a registration race', async ()
 test('a hanging cleanup step cannot block worker exit', async () => {
     const worker = new BrowserWorker(testConfig(5_000), {
         controlPlane: new FakeControlPlane(),
-        createShim: () => new HangingShutdownShim(),
+        createGateway: () => new HangingShutdownGateway(),
         launchBrowser: async () => new FakeBrowser(),
         exit: () => undefined,
         cleanupTimeoutMs: 20,
@@ -361,9 +361,9 @@ test('a hanging cleanup step cannot block worker exit', async () => {
     assert.equal(await bounded(worker.waitForExit(), 200), 0);
 });
 
-test('registration uses the port that the shim bound', async () => {
+test('registration uses the port that the gateway bound', async () => {
     const controlPlane = new FakeControlPlane();
-    const worker = createInjectedWorker(controlPlane, new FakeShim([], 4321), 5_000);
+    const worker = createInjectedWorker(controlPlane, new FakeGateway([], 4321), 5_000);
     await worker.start();
     await worker.shutdown(0);
 
@@ -372,11 +372,11 @@ test('registration uses the port that the shim bound', async () => {
 
 test('browser close timeout kills the browser before exit', async () => {
     const controlPlane = new FakeControlPlane();
-    const shim = new FakeShim();
+    const gateway = new FakeGateway();
     const browser = new FakeBrowser(true);
     const worker = new BrowserWorker(testConfig(5_000), {
         controlPlane,
-        createShim: () => shim,
+        createGateway: () => gateway,
         launchBrowser: async () => browser,
         exit: () => undefined,
         browserCloseTimeoutMs: 20,
@@ -396,7 +396,7 @@ const registration: WorkerRegistration = {
     playwright_version: '1.62.1',
 };
 
-class FakeShim extends EventEmitter implements ShimLike {
+class FakeGateway extends EventEmitter implements GatewayLike {
     readonly closedSessions: Array<{ sessionId: string; code: number }> = [];
     shutdownCalled = false;
     private readonly sessions: string[];
@@ -431,7 +431,7 @@ class FakeShim extends EventEmitter implements ShimLike {
     }
 }
 
-class HangingShutdownShim extends FakeShim {
+class HangingShutdownGateway extends FakeGateway {
     override async shutdown(): Promise<void> {
         await new Promise<void>(() => undefined);
     }
@@ -510,11 +510,11 @@ class FakeControlPlane implements ControlPlaneLike {
     }
 }
 
-function createWorker(serverUrl: string, shim: FakeShim): BrowserWorker {
+function createWorker(serverUrl: string, gateway: FakeGateway): BrowserWorker {
     const config = testConfig(1_000);
     return new BrowserWorker(config, {
         controlPlane: new ControlPlaneClient(serverUrl, undefined, config.lifecycle.heartbeatIntervalMs),
-        createShim: () => shim,
+        createGateway: () => gateway,
         launchBrowser: async () => new FakeBrowser(),
         exit: () => undefined,
     });
@@ -522,12 +522,12 @@ function createWorker(serverUrl: string, shim: FakeShim): BrowserWorker {
 
 function createInjectedWorker(
     controlPlane: ControlPlaneLike,
-    shim: FakeShim,
+    gateway: FakeGateway,
     drainTimeoutMs: number,
 ): BrowserWorker {
     return new BrowserWorker(testConfig(drainTimeoutMs), {
         controlPlane,
-        createShim: () => shim,
+        createGateway: () => gateway,
         launchBrowser: async () => new FakeBrowser(),
         exit: () => undefined,
     });
@@ -537,7 +537,7 @@ function testConfig(drainTimeoutMs: number, port = 3131): WorkerConfig {
     return {
         controlPlane: { serverUrl: 'http://127.0.0.1:1' },
         browser: { type: 'chromium', headless: true },
-        shim: { port, privateHostname: 'worker-test', maxSlots: 5 },
+        gateway: { port, privateHostname: 'worker-test', maxSlots: 5 },
         lifecycle: { heartbeatIntervalMs: 10, drainTimeoutMs },
         logging: { level: 'error', format: 'json' },
     };

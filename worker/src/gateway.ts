@@ -13,7 +13,7 @@ interface PendingSession {
     upstream: WebSocket;
 }
 
-interface ShimEvents {
+interface GatewayEvents {
     sessionClose: [sessionId: string];
 }
 
@@ -21,12 +21,12 @@ const sessionHeader = 'x-pwd-session-id';
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 // Must stay below the server's WORKER_DIAL_TIMEOUT (default 10s): the relay's
 // dial now spans this browser handshake, and the inner deadline must lose the
-// race so the failure surfaces as the shim's 502, not a relay dial timeout.
+// race so the failure surfaces as the gateway's 502, not a relay dial timeout.
 const upstreamHandshakeTimeoutMs = 7_000;
 const shutdownTimeoutMs = 1_000;
 const backpressureHighWaterMark = 1024 * 1024;
 
-export class WebSocketShim extends EventEmitter<ShimEvents> {
+export class SessionGateway extends EventEmitter<GatewayEvents> {
     private readonly server = http.createServer((_request, response) => {
         response.writeHead(426).end('WebSocket upgrade required');
     });
@@ -71,7 +71,7 @@ export class WebSocketShim extends EventEmitter<ShimEvents> {
                 this.server.off('error', onError);
                 const address = this.server.address();
                 if (!address || typeof address === 'string') {
-                    reject(new Error('WebSocket shim has no TCP address'));
+                    reject(new Error('WebSocket gateway has no TCP address'));
                     return;
                 }
                 this.listenPort = address.port;

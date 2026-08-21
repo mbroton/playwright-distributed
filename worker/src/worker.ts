@@ -4,7 +4,7 @@ import { chromium, firefox, webkit } from 'playwright-core';
 import type { WorkerConfig } from './config.js';
 import { ControlPlaneClient, ControlPlaneError } from './control-plane.js';
 import { Logger } from './logger.js';
-import { WebSocketShim } from './shim.js';
+import { SessionGateway } from './gateway.js';
 
 type WorkerState = 'starting' | 'running' | 'draining' | 'shutting_down';
 type WorkerStatus = 'available' | 'draining' | 'stalled' | 'shutting_down';
@@ -16,7 +16,7 @@ export interface BrowserServerLike {
     once(event: 'close', listener: () => void): this;
 }
 
-export interface ShimLike {
+export interface GatewayLike {
     readonly activeSessionIds: string[];
     readonly activeConnectionCount: number;
     readonly listeningPort: number | null;
@@ -50,7 +50,7 @@ export interface WorkerRegistration {
 interface WorkerDependencies {
     controlPlane?: ControlPlaneLike;
     launchBrowser?: (config: WorkerConfig) => Promise<BrowserServerLike>;
-    createShim?: (browserEndpoint: string, port: number) => ShimLike;
+    createGateway?: (browserEndpoint: string, port: number) => GatewayLike;
     logger?: Logger;
     exit?: (code: number) => void;
     browserCloseTimeoutMs?: number;
@@ -61,7 +61,7 @@ export class BrowserWorker {
     private currentState: WorkerState = 'starting';
     private workerIdValue: string | null = null;
     private browserServer: BrowserServerLike | null = null;
-    private shim: ShimLike | null = null;
+    private gateway: GatewayLike | null = null;
     private heartbeatTimer: NodeJS.Timeout | null = null;
     private heartbeatEnabled = false;
     private drainTimer: NodeJS.Timeout | null = null;
@@ -69,7 +69,7 @@ export class BrowserWorker {
     private readonly shutdownController = new AbortController();
     private readonly controlPlane: ControlPlaneLike;
     private readonly launchBrowser: (config: WorkerConfig) => Promise<BrowserServerLike>;
-    private readonly createShim: (browserEndpoint: string, port: number) => ShimLike;
+    private readonly createGateway: (browserEndpoint: string, port: number) => GatewayLike;
     private readonly logger: Logger;
     private readonly exit: (code: number) => void;
     private readonly browserCloseTimeoutMs: number;
@@ -84,9 +84,9 @@ export class BrowserWorker {
             Math.min(config.lifecycle.heartbeatIntervalMs, 5_000),
         );
         this.launchBrowser = dependencies.launchBrowser ?? launchPlaywrightServer;
-        this.createShim = dependencies.createShim ?? ((endpoint, port) => new WebSocketShim(endpoint, port));
+        this.createGateway = dependencies.createGateway ?? ((endpoint, port) => new SessionGateway(endpoint, port));
         this.logger = dependencies.logger ?? new Logger(
-            config.shim.privateHostname,
+            config.gateway.privateHostname,
             config.logging.level,
             config.logging.format,
         );
@@ -114,7 +114,7 @@ export class BrowserWorker {
         try {
             this.logger.info('Starting browser worker', {
                 browserType: this.config.browser.type,
-                port: this.config.shim.port,
+                port: this.config.gateway.port,
                 headless: this.config.browser.headless,
             });
             const browserServer = await this.launchBrowser(this.config);
@@ -130,13 +130,13 @@ export class BrowserWorker {
                 }
             });
 
-            this.shim = this.createShim(this.browserServer.wsEndpoint(), this.config.shim.port);
-            this.shim.on('sessionClose', () => {
-                if (this.currentState === 'draining' && this.shim?.activeConnectionCount === 0) {
+            this.gateway = this.createGateway(this.browserServer.wsEndpoint(), this.config.gateway.port);
+            this.gateway.on('sessionClose', () => {
+                if (this.currentState === 'draining' && this.gateway?.activeConnectionCount === 0) {
                     void this.shutdown(0);
                 }
             });
-            await this.shim.start();
+            await this.gateway.start();
             if (this.shutdownStarted) {
                 return;
             }
@@ -179,7 +179,7 @@ export class BrowserWorker {
         if (fromSignal && this.workerIdValue) {
             await this.bestEffortStatus('draining');
         }
-        if (!this.shim || this.shim.activeConnectionCount === 0) {
+        if (!this.gateway || this.gateway.activeConnectionCount === 0) {
             await this.shutdown(0);
             return;
         }
@@ -216,11 +216,11 @@ export class BrowserWorker {
     }
 
     private registration(): WorkerRegistration {
-        const port = this.shim?.listeningPort ?? this.config.shim.port;
+        const port = this.gateway?.listeningPort ?? this.config.gateway.port;
         return {
-            address: `ws://${this.config.shim.privateHostname}:${port}/`,
+            address: `ws://${this.config.gateway.privateHostname}:${port}/`,
             browser: this.config.browser.type,
-            max_slots: this.config.shim.maxSlots,
+            max_slots: this.config.gateway.maxSlots,
             playwright_version: playwrightVersion(),
         };
     }
@@ -234,20 +234,20 @@ export class BrowserWorker {
     }
 
     private async heartbeatTick(): Promise<void> {
-        if (!this.heartbeatEnabled || !this.workerIdValue || !this.shim) {
+        if (!this.heartbeatEnabled || !this.workerIdValue || !this.gateway) {
             this.armHeartbeat();
             return;
         }
         try {
             const response = await this.controlPlane.heartbeat(
                 this.workerIdValue,
-                this.shim.activeSessionIds,
+                this.gateway.activeSessionIds,
             );
             if (!this.heartbeatEnabled || this.currentState === 'shutting_down') {
                 return;
             }
             for (const sessionId of response.stale_session_ids) {
-                this.shim.closeSession(sessionId, 1001, 'session is stale');
+                this.gateway.closeSession(sessionId, 1001, 'session is stale');
             }
             if (response.status === 'shutting_down') {
                 await this.shutdown(0);
@@ -298,8 +298,8 @@ export class BrowserWorker {
             await this.bestEffortStatus('shutting_down');
         } finally {
             try {
-                if (this.shim) {
-                    await this.runCleanup('shut down WebSocket shim', () => this.shim!.shutdown());
+                if (this.gateway) {
+                    await this.runCleanup('shut down WebSocket gateway', () => this.gateway!.shutdown());
                 }
             } finally {
                 try {
