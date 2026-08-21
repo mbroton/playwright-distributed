@@ -20,7 +20,7 @@ export class ControlPlaneError extends Error {
 
 type Sleep = (delayMs: number, signal?: AbortSignal) => Promise<void>;
 
-const registrationTimeoutMs = 5_000;
+const defaultRegistrationTimeoutMs = 5_000;
 const statusTimeoutMs = 2_000;
 
 export class ControlPlaneClient {
@@ -31,6 +31,7 @@ export class ControlPlaneClient {
         apiKey?: string,
         private readonly heartbeatTimeoutMs = 5_000,
         private readonly sleep: Sleep = abortableDelay,
+        private readonly registrationTimeoutMs = defaultRegistrationTimeoutMs,
     ) {
         this.client = createClient(createConfig({
             baseUrl: serverUrl.replace(/\/$/, ''),
@@ -51,7 +52,7 @@ export class ControlPlaneClient {
                 const result = await registerWorker({
                     body: registration,
                     client: this.client,
-                    signal: requestSignal(registrationTimeoutMs, signal),
+                    signal: requestSignal(this.registrationTimeoutMs, signal),
                 });
                 if (result.data) {
                     return result.data;

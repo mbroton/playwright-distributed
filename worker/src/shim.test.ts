@@ -86,6 +86,34 @@ test('a client close closes the browser-side socket', async t => {
     assert.equal(fixture.shim.activeConnectionCount, 0);
 });
 
+test('a late close event cannot remove a replacement session with the same ID', async t => {
+    const fixture = await createFixture();
+    t.after(() => fixture.close());
+    const firstClient = await connect(fixture.shimUrl, sessionId);
+    const internals = fixture.shim as unknown as {
+        sessions: Map<string, { client: WebSocket; upstream: WebSocket }>;
+    };
+    const firstSession = internals.sessions.get(sessionId);
+    assert.ok(firstSession);
+    const delayedCloseListeners = firstSession.client.rawListeners('close');
+    firstSession.client.removeAllListeners('close');
+
+    fixture.shim.closeSession(sessionId);
+    await waitForClose(firstClient);
+    const secondClient = await connect(fixture.shimUrl, sessionId);
+    t.after(() => secondClient.terminate());
+    const secondMessage = nextMessage(secondClient);
+
+    for (const listener of delayedCloseListeners) {
+        listener.call(firstSession.client, 1000, Buffer.from('late close'));
+    }
+    secondClient.send('still open');
+
+    assert.equal(fixture.shim.activeConnectionCount, 1);
+    assert.deepEqual(fixture.shim.activeSessionIds, [sessionId]);
+    assert.deepEqual(await secondMessage, { data: Buffer.from('still open'), isBinary: false });
+});
+
 test('does not drop a frame sent as soon as the client opens', async t => {
     const fixture = await createFixture(200);
     t.after(() => fixture.close());

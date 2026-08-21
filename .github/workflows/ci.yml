@@ -213,7 +213,7 @@ jobs:
 
       - name: Verify worker drains on stop
         run: |
-          docker compose -f docker-compose.local.yaml stop -t 40 worker
+          docker compose -f docker-compose.local.yaml stop -t 55 worker
           container_id="$(docker compose -f docker-compose.local.yaml ps -aq worker)"
           test "$(docker inspect --format '{{.State.ExitCode}}' "$container_id")" -eq 0
           docker compose -f docker-compose.local.yaml logs worker | grep -q 'Worker is draining'

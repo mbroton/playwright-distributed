@@ -83,14 +83,18 @@ export class WebSocketShim extends EventEmitter<ShimEvents> {
         });
     }
 
-    closeSession(sessionId: string, code = 1001, reason = 'session closed'): void {
-        const session = this.sessions.get(sessionId);
-        if (!session) {
+    closeSession(
+        sessionId: string,
+        code = 1001,
+        reason = 'session closed',
+        expectedSession = this.sessions.get(sessionId),
+    ): void {
+        if (!expectedSession || this.sessions.get(sessionId) !== expectedSession) {
             return;
         }
-        closeSocket(session.client, code, reason);
-        closeSocket(session.upstream, code, reason);
-        this.removeSession(sessionId);
+        closeSocket(expectedSession.client, code, reason);
+        closeSocket(expectedSession.upstream, code, reason);
+        this.removeSession(sessionId, expectedSession);
     }
 
     shutdown(): Promise<void> {
@@ -150,8 +154,14 @@ export class WebSocketShim extends EventEmitter<ShimEvents> {
             headers: forwardedHeaders(request.headers),
             handshakeTimeout: upstreamHandshakeTimeoutMs,
         });
-        let onUpstreamError = () => undefined;
-        upstream.on('error', () => onUpstreamError());
+        let acceptedSession: SessionSockets | undefined;
+        upstream.on('error', () => {
+            if (this.pendingSessions.get(sessionId)?.upstream === upstream) {
+                rejectClient(502, 'Browser connection failed');
+            } else if (acceptedSession) {
+                this.closeSession(sessionId, 1011, 'browser connection failed', acceptedSession);
+            }
+        });
         this.pendingSessions.set(sessionId, { clientSocket: socket, upstream });
 
         const clearPending = (): boolean => {
@@ -189,9 +199,16 @@ export class WebSocketShim extends EventEmitter<ShimEvents> {
             }
             try {
                 this.webSocketServer.handleUpgrade(request, socket, head, client => {
-                    client.once('error', () => this.closeSession(sessionId, 1011, 'client connection failed'));
-                    this.sessions.set(sessionId, { client, upstream });
-                    this.pipeSession(sessionId, client, upstream);
+                    const session = { client, upstream };
+                    acceptedSession = session;
+                    client.once('error', () => this.closeSession(
+                        sessionId,
+                        1011,
+                        'client connection failed',
+                        session,
+                    ));
+                    this.sessions.set(sessionId, session);
+                    this.pipeSession(sessionId, session);
                     clearPending();
                 });
             } catch {
@@ -200,35 +217,40 @@ export class WebSocketShim extends EventEmitter<ShimEvents> {
         };
 
         socket.once('close', abortDial);
-        onUpstreamError = () => {
-            if (this.pendingSessions.has(sessionId)) {
-                rejectClient(502, 'Browser connection failed');
-            } else {
-                this.closeSession(sessionId, 1011, 'browser connection failed');
-            }
-        };
         upstream.once('open', acceptClient);
     }
 
-    private pipeSession(sessionId: string, client: WebSocket, upstream: WebSocket): void {
-        forwardMessages(client, upstream, () => this.closeSession(sessionId, 1011, 'relay write failed'));
-        forwardMessages(upstream, client, () => this.closeSession(sessionId, 1011, 'relay write failed'));
+    private pipeSession(sessionId: string, session: SessionSockets): void {
+        const { client, upstream } = session;
+        forwardMessages(client, upstream, () => this.closeSession(sessionId, 1011, 'relay write failed', session));
+        forwardMessages(upstream, client, () => this.closeSession(sessionId, 1011, 'relay write failed', session));
 
-        client.once('close', (code, reason) => this.closePeer(sessionId, upstream, code, reason));
-        upstream.once('close', (code, reason) => this.closePeer(sessionId, client, code, reason));
+        client.once('close', (code, reason) => this.closePeer(sessionId, session, upstream, code, reason));
+        upstream.once('close', (code, reason) => this.closePeer(sessionId, session, client, code, reason));
     }
 
-    private closePeer(sessionId: string, peer: WebSocket, code: number, reason: Buffer): void {
+    private closePeer(
+        sessionId: string,
+        expectedSession: SessionSockets,
+        peer: WebSocket,
+        code: number,
+        reason: Buffer,
+    ): void {
+        if (this.sessions.get(sessionId) !== expectedSession) {
+            return;
+        }
         const outgoingCode = isLegalCloseCode(code) ? code : 1011;
         const outgoingReason = isLegalCloseCode(code) ? reason : Buffer.from('peer connection failed');
         closeSocket(peer, outgoingCode, outgoingReason);
-        this.removeSession(sessionId);
+        this.removeSession(sessionId, expectedSession);
     }
 
-    private removeSession(sessionId: string): void {
-        if (this.sessions.delete(sessionId)) {
-            this.emit('sessionClose', sessionId);
+    private removeSession(sessionId: string, expectedSession: SessionSockets): void {
+        if (this.sessions.get(sessionId) !== expectedSession) {
+            return;
         }
+        this.sessions.delete(sessionId);
+        this.emit('sessionClose', sessionId);
     }
 }
 

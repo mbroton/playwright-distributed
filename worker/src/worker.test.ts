@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events';
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import test from 'node:test';
 import WebSocket, { WebSocketServer } from 'ws';
-import { ControlPlaneClient } from './control-plane.js';
+import { ControlPlaneClient, ControlPlaneError } from './control-plane.js';
 import type { WorkerConfig } from './config.js';
 import { WebSocketShim } from './shim.js';
 import type {
@@ -78,6 +78,23 @@ test('registration stops after one non-retryable response', async t => {
         /HTTP 422: address is invalid/,
     );
     assert.equal(attempts, 1);
+});
+
+test('a hung registration request is aborted by its per-attempt timeout', async t => {
+    let requestAborted = false;
+    const server = await startControlPlane(async request => {
+        request.on('aborted', () => {
+            requestAborted = true;
+        });
+    });
+    t.after(() => server.close());
+
+    const controlPlane = new ControlPlaneClient(server.url, undefined, 5_000, undefined, 20);
+    await assert.rejects(
+        controlPlane.register(registration, 1),
+        /register worker failed after 1 attempts/,
+    );
+    await waitFor(() => requestAborted);
 });
 
 test('heartbeat is single-flight, reports sessions, and closes stale sessions', async t => {
@@ -201,6 +218,43 @@ test('heartbeat 404 registers a new worker ID', async t => {
     await worker.shutdown(0);
 
     assert.equal(registrations, 2);
+});
+
+test('heartbeat 404 re-asserts drain status immediately after registration', async () => {
+    const events: string[] = [];
+    let registrations = 0;
+    let heartbeats = 0;
+    const controlPlane: ControlPlaneLike = {
+        register: async () => {
+            registrations += 1;
+            const workerId = `worker-${registrations}`;
+            events.push(`register:${workerId}`);
+            return { id: workerId };
+        },
+        heartbeat: async workerId => {
+            heartbeats += 1;
+            events.push(`heartbeat:${workerId}`);
+            if (heartbeats === 1) {
+                throw new ControlPlaneError('worker not found', 404);
+            }
+            return { status: 'available', stale_session_ids: [] };
+        },
+        setStatus: async (workerId, status) => {
+            events.push(`status:${workerId}:${status}`);
+        },
+    };
+    const worker = createInjectedWorker(controlPlane, new FakeShim([activeId]), 5_000);
+    await worker.start();
+    await worker.requestDrain('SIGTERM');
+
+    await waitFor(() => events.includes('status:worker-2:draining'));
+    assert.deepEqual(events.slice(0, 4), [
+        'register:worker-1',
+        'heartbeat:worker-1',
+        'register:worker-2',
+        'status:worker-2:draining',
+    ]);
+    await worker.shutdown(0);
 });
 
 test('drain with no connections shuts down promptly', async () => {

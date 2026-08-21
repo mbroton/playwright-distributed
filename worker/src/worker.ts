@@ -263,6 +263,9 @@ export class BrowserWorker {
                 this.logger.warn('Worker registration expired; registering again');
                 try {
                     await this.register();
+                    if (this.currentState === 'draining') {
+                        await this.bestEffortStatus('draining');
+                    }
                 } catch (registrationError) {
                     this.logger.warn('Worker re-registration failed', { error: formatError(registrationError) });
                 }
