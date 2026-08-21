@@ -4,6 +4,51 @@ export type ClientOptions = {
     baseUrl: `${string}://${string}` | (string & {});
 };
 
+export type BrowserCapacity = {
+    /**
+     * Fleet-wide active sessions, including sessions on ineligible workers.
+     */
+    active_sessions: number;
+    /**
+     * Free slots on eligible workers; can exceed max_slots - active_sessions, which is fleet-wide.
+     */
+    available_slots: number;
+    browser: string;
+    max_slots: number;
+    workers: number;
+};
+
+export type Capacity = {
+    browsers: Array<BrowserCapacity>;
+    max_queue_size: number;
+    /**
+     * Queue depth on this server replica.
+     */
+    queued: number;
+    totals: CapacityTotals;
+};
+
+export type CapacityTotals = {
+    /**
+     * Fleet-wide active sessions, including sessions on ineligible workers.
+     */
+    active_sessions: number;
+    /**
+     * Free slots on eligible workers; can exceed max_slots - active_sessions, which is fleet-wide.
+     */
+    available_slots: number;
+    max_slots: number;
+    workers: number;
+};
+
+export type CreateSessionInputBody = {
+    browser: 'chromium' | 'firefox' | 'webkit';
+    connect_metadata?: {
+        [key: string]: unknown;
+    };
+    mode?: 'default' | 'dedicated';
+};
+
 export type ErrorDetail = {
     /**
      * Where the error occurred, e.g. 'body.items[3].tags' or 'path.thing-id'
@@ -50,8 +95,13 @@ export type HealthOutputBody = {
     status: string;
 };
 
+export type HeartbeatInputBody = {
+    active_session_ids: Array<string>;
+};
+
 export type HeartbeatOutputBody = {
     commands: Array<string>;
+    stale_session_ids: Array<string>;
     status: 'available' | 'draining' | 'stalled' | 'shutting_down';
 };
 
@@ -75,6 +125,7 @@ export type Session = {
     last_heartbeat: string;
     mode: 'default' | 'dedicated';
     playwright_version: string;
+    started_at: string | null;
     status: 'pending' | 'running' | 'completed' | 'failed' | 'expired';
     worker_address: string;
     worker_id: string;
@@ -159,7 +210,7 @@ export type RegisterWorkerResponses = {
 export type RegisterWorkerResponse = RegisterWorkerResponses[keyof RegisterWorkerResponses];
 
 export type HeartbeatWorkerData = {
-    body?: never;
+    body: HeartbeatInputBody;
     path: {
         /**
          * Worker ID
@@ -282,6 +333,80 @@ export type ReadinessResponses = {
 };
 
 export type ReadinessResponse = ReadinessResponses[keyof ReadinessResponses];
+
+export type GetCapacityData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/v1/capacity';
+};
+
+export type GetCapacityErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ErrorModel;
+    /**
+     * Internal Server Error
+     */
+    500: ErrorModel;
+    /**
+     * Service Unavailable
+     */
+    503: ErrorModel;
+};
+
+export type GetCapacityError = GetCapacityErrors[keyof GetCapacityErrors];
+
+export type GetCapacityResponses = {
+    /**
+     * OK
+     */
+    200: Capacity;
+};
+
+export type GetCapacityResponse = GetCapacityResponses[keyof GetCapacityResponses];
+
+export type CreateSessionData = {
+    body: CreateSessionInputBody;
+    path?: never;
+    query?: never;
+    url: '/v1/sessions';
+};
+
+export type CreateSessionErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ErrorModel;
+    /**
+     * Unprocessable Entity
+     */
+    422: ErrorModel;
+    /**
+     * Too Many Requests
+     */
+    429: ErrorModel;
+    /**
+     * Internal Server Error
+     */
+    500: ErrorModel;
+    /**
+     * Service Unavailable
+     */
+    503: ErrorModel;
+};
+
+export type CreateSessionError = CreateSessionErrors[keyof CreateSessionErrors];
+
+export type CreateSessionResponses = {
+    /**
+     * Created
+     */
+    201: Session;
+};
+
+export type CreateSessionResponse = CreateSessionResponses[keyof CreateSessionResponses];
 
 export type GetSessionData = {
     body?: never;

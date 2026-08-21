@@ -2,7 +2,7 @@
 
 import { client } from './client.gen.js';
 import type { Client, Options as Options2, TDataShape } from './client/index.js';
-import type { GetSessionData, GetSessionErrors, GetSessionResponses, HealthData, HealthErrors, HealthResponses, HeartbeatWorkerData, HeartbeatWorkerErrors, HeartbeatWorkerResponses, ListWorkersData, ListWorkersErrors, ListWorkersResponses, ReadinessData, ReadinessErrors, ReadinessResponses, RegisterWorkerData, RegisterWorkerErrors, RegisterWorkerResponses, SetWorkerStatusData, SetWorkerStatusErrors, SetWorkerStatusResponses } from './types.gen.js';
+import type { CreateSessionData, CreateSessionErrors, CreateSessionResponses, GetCapacityData, GetCapacityErrors, GetCapacityResponses, GetSessionData, GetSessionErrors, GetSessionResponses, HealthData, HealthErrors, HealthResponses, HeartbeatWorkerData, HeartbeatWorkerErrors, HeartbeatWorkerResponses, ListWorkersData, ListWorkersErrors, ListWorkersResponses, ReadinessData, ReadinessErrors, ReadinessResponses, RegisterWorkerData, RegisterWorkerErrors, RegisterWorkerResponses, SetWorkerStatusData, SetWorkerStatusErrors, SetWorkerStatusResponses } from './types.gen.js';
 
 export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends boolean = boolean, TResponse = unknown> = Options2<TData, ThrowOnError, TResponse> & {
     /**
@@ -42,7 +42,11 @@ export const registerWorker = <ThrowOnError extends boolean = false>(options: Op
 export const heartbeatWorker = <ThrowOnError extends boolean = false>(options: Options<HeartbeatWorkerData, ThrowOnError>) => (options.client ?? client).post<HeartbeatWorkerResponses, HeartbeatWorkerErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
     url: '/internal/workers/{id}/heartbeat',
-    ...options
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
 });
 
 /**
@@ -62,6 +66,28 @@ export const setWorkerStatus = <ThrowOnError extends boolean = false>(options: O
  * Check database readiness
  */
 export const readiness = <ThrowOnError extends boolean = false>(options?: Options<ReadinessData, ThrowOnError>) => (options?.client ?? client).get<ReadinessResponses, ReadinessErrors, ThrowOnError>({ url: '/readyz', ...options });
+
+/**
+ * Get session capacity
+ */
+export const getCapacity = <ThrowOnError extends boolean = false>(options?: Options<GetCapacityData, ThrowOnError>) => (options?.client ?? client).get<GetCapacityResponses, GetCapacityErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
+    url: '/v1/capacity',
+    ...options
+});
+
+/**
+ * Create a session
+ */
+export const createSession = <ThrowOnError extends boolean = false>(options: Options<CreateSessionData, ThrowOnError>) => (options.client ?? client).post<CreateSessionResponses, CreateSessionErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
+    url: '/v1/sessions',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
 
 /**
  * Get a session

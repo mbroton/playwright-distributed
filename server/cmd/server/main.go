@@ -14,9 +14,12 @@ import (
 	"time"
 
 	"server/internal/apikey"
+	"server/internal/config"
 	"server/internal/db"
 	"server/internal/db/data"
 	"server/internal/httpapi"
+	"server/internal/rescuer"
+	"server/internal/scheduler"
 )
 
 const (
@@ -71,6 +74,10 @@ func run(ctx context.Context, args []string, stdout io.Writer, logger *slog.Logg
 	if apiKeyCommand != nil {
 		return apiKeyCommand.Execute(ctx, queries, stdout)
 	}
+	runtimeConfig, err := config.Load(os.Getenv)
+	if err != nil {
+		return fmt.Errorf("loading server configuration: %w", err)
+	}
 	if err := db.Migrate(ctx, pool); err != nil {
 		return err
 	}
@@ -79,17 +86,51 @@ func run(ctx context.Context, args []string, stdout io.Writer, logger *slog.Logg
 		address = defaultListenAddress
 	}
 	authenticator := httpapi.NewTokenAuthenticator(queries, logger)
-	controlPlane := httpapi.New(pool, queries, authenticator, logger)
-	return serve(ctx, address, controlPlane.Handler, logger)
+	servicesCtx, stopServices := context.WithCancel(ctx)
+	defer stopServices()
+	sessionScheduler := scheduler.New(servicesCtx, pool, logger, scheduler.Options{
+		WorkerTTL:           runtimeConfig.WorkerHeartbeatTTL,
+		PendingSessionTTL:   runtimeConfig.PendingSessionTTL,
+		MaxLifetimeSessions: runtimeConfig.MaxLifetimeSessions,
+		MaxQueueSize:        runtimeConfig.MaxQueueSize,
+		QueueWaitTimeout:    runtimeConfig.QueueWaitTimeout,
+	})
+	controlPlane := httpapi.New(
+		pool,
+		queries,
+		authenticator,
+		logger,
+		httpapi.WithScheduler(sessionScheduler),
+	)
+	go scheduler.RunListener(servicesCtx, pool, sessionScheduler.Waker(), logger)
+	go rescuer.New(pool, logger, rescuer.Options{
+		WorkerTTL:        runtimeConfig.WorkerHeartbeatTTL,
+		SessionTTL:       runtimeConfig.SessionHeartbeatTTL,
+		StalledWorkerTTL: runtimeConfig.StalledWorkerTTL,
+		Interval:         runtimeConfig.RescuerInterval,
+	}).Run(servicesCtx)
+	return serve(
+		ctx,
+		address,
+		controlPlane.Handler,
+		runtimeConfig.QueueWaitTimeout+5*time.Second,
+		logger,
+	)
 }
 
-func serve(ctx context.Context, address string, handler http.Handler, logger *slog.Logger) error {
+func serve(
+	ctx context.Context,
+	address string,
+	handler http.Handler,
+	writeTimeout time.Duration,
+	logger *slog.Logger,
+) error {
 	server := &http.Server{
 		Addr:              address,
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      30 * time.Second,
+		WriteTimeout:      writeTimeout,
 		IdleTimeout:       60 * time.Second,
 	}
 	listener, err := net.Listen("tcp", address)

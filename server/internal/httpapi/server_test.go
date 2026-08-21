@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -28,6 +29,7 @@ import (
 
 	"server/internal/db"
 	"server/internal/db/data"
+	"server/internal/scheduler"
 )
 
 const postgresImage = "postgres:18-alpine"
@@ -100,18 +102,22 @@ func TestServer_WorkerAndSessionRoutes(t *testing.T) {
 		server.Handler,
 		http.MethodPost,
 		"/internal/workers/"+worker.ID.String()+"/heartbeat",
-		nil,
+		map[string]any{"active_session_ids": []string{}},
 		"",
 	)
 	if heartbeat.Code != http.StatusOK {
 		t.Fatalf("heartbeat status = %d, want %d: %s", heartbeat.Code, http.StatusOK, heartbeat.Body.String())
 	}
 	var heartbeatBody struct {
-		Status   data.WorkerStatus `json:"status"`
-		Commands []string          `json:"commands"`
+		Status          data.WorkerStatus `json:"status"`
+		Commands        []string          `json:"commands"`
+		StaleSessionIDs []uuid.UUID       `json:"stale_session_ids"`
 	}
 	decodeJSON(t, heartbeat.Body.Bytes(), &heartbeatBody)
-	if heartbeatBody.Status != data.WorkerStatusAvailable || heartbeatBody.Commands == nil || len(heartbeatBody.Commands) != 0 {
+	if heartbeatBody.Status != data.WorkerStatusAvailable ||
+		heartbeatBody.Commands == nil ||
+		len(heartbeatBody.Commands) != 0 ||
+		heartbeatBody.StaleSessionIDs == nil {
 		t.Fatalf("heartbeat response = %+v, want available and empty commands", heartbeatBody)
 	}
 	heartbeatAfter := databaseTime(t, pool)
@@ -139,7 +145,7 @@ func TestServer_WorkerAndSessionRoutes(t *testing.T) {
 		server.Handler,
 		http.MethodPost,
 		"/internal/workers/"+worker.ID.String()+"/heartbeat",
-		nil,
+		map[string]any{"active_session_ids": []string{}},
 		"",
 	)
 	if recovered.Code != http.StatusOK {
@@ -155,7 +161,7 @@ func TestServer_WorkerAndSessionRoutes(t *testing.T) {
 		server.Handler,
 		http.MethodPost,
 		"/internal/workers/"+uuid.NewString()+"/heartbeat",
-		map[string]any{},
+		map[string]any{"active_session_ids": []string{}},
 		"",
 	)
 	if missingHeartbeat.Code != http.StatusNotFound {
@@ -244,19 +250,14 @@ func TestServer_WorkerAndSessionRoutes(t *testing.T) {
 		)
 	}
 
-	sessionID := uuid.New()
-	_, err = queries.InsertSession(t.Context(), data.InsertSessionParams{
-		ID:                sessionID,
-		WorkerID:          worker.ID,
-		Browser:           worker.Browser,
-		PlaywrightVersion: worker.PlaywrightVersion,
-		WorkerAddress:     worker.Address,
-		Mode:              data.SessionModeDefault,
-		Status:            data.SessionStatusRunning,
-		ConnectMetadata:   []byte(`{"source":"test"}`),
-	})
+	sessionID := insertTestSession(t, pool, queries, worker.ID, data.SessionStatusRunning)
+	_, err = pool.Exec(
+		t.Context(),
+		`UPDATE sessions SET connect_metadata = '{"source":"test"}'::jsonb WHERE id = $1`,
+		sessionID,
+	)
 	if err != nil {
-		t.Fatalf("InsertSession() returned an error: %v", err)
+		t.Fatalf("updating test session metadata: %v", err)
 	}
 	getSession := requestJSON(t, server.Handler, http.MethodGet, "/v1/sessions/"+sessionID.String(), nil, "")
 	if getSession.Code != http.StatusOK {
@@ -353,6 +354,309 @@ func TestServer_Authentication(t *testing.T) {
 	}
 }
 
+func TestServer_CreateSessionNeverOverAdmits(t *testing.T) {
+	pool := newMigratedTestPool(t)
+	queries := data.New(pool)
+	workerID := uuid.New()
+	_, err := queries.RegisterWorker(t.Context(), data.RegisterWorkerParams{
+		ID:                workerID,
+		Address:           "ws://worker:3000",
+		Browser:           "chromium",
+		PlaywrightVersion: "1.62.1",
+		MaxSlots:          4,
+		Status:            data.WorkerStatusAvailable,
+	})
+	if err != nil {
+		t.Fatalf("RegisterWorker() returned an error: %v", err)
+	}
+	sessionScheduler := newTestScheduler(pool, 0, 250*time.Millisecond)
+	server := New(
+		pool,
+		queries,
+		NoAuthAuthenticator{},
+		testLogger(io.Discard),
+		WithScheduler(sessionScheduler),
+	)
+
+	const requestCount = 32
+	start := make(chan struct{})
+	statuses := make(chan int, requestCount)
+	var group sync.WaitGroup
+	for range requestCount {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			<-start
+			request := httptest.NewRequest(
+				http.MethodPost,
+				"/v1/sessions",
+				strings.NewReader(`{"browser":"chromium"}`),
+			)
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			server.Handler.ServeHTTP(response, request)
+			statuses <- response.Code
+		}()
+	}
+	close(start)
+	group.Wait()
+	close(statuses)
+
+	created := 0
+	rejected := 0
+	for status := range statuses {
+		switch status {
+		case http.StatusCreated:
+			created++
+		case http.StatusTooManyRequests:
+			rejected++
+		default:
+			t.Fatalf("concurrent create status = %d, want 201 or 429", status)
+		}
+	}
+	if created > 4 || created+rejected != requestCount {
+		t.Fatalf("concurrent results = %d created and %d rejected, want at most 4 created", created, rejected)
+	}
+	active, err := queries.CountActiveSessionsByWorker(t.Context(), workerID)
+	if err != nil {
+		t.Fatalf("CountActiveSessionsByWorker() returned an error: %v", err)
+	}
+	if active > 4 {
+		t.Fatalf("active session count = %d, want at most 4", active)
+	}
+	for active < 4 {
+		if _, err := sessionScheduler.Claim(
+			t.Context(),
+			scheduler.ClaimRequest{Browser: "chromium"},
+		); err != nil {
+			t.Fatalf("sequential Claim() returned an error with %d active sessions: %v", active, err)
+		}
+		active++
+	}
+	if _, err := sessionScheduler.Claim(
+		t.Context(),
+		scheduler.ClaimRequest{Browser: "chromium"},
+	); !errors.Is(err, scheduler.ErrNoCapacity) {
+		t.Fatalf("Claim() after filling worker error = %v, want %v", err, scheduler.ErrNoCapacity)
+	}
+	active, err = queries.CountActiveSessionsByWorker(t.Context(), workerID)
+	if err != nil {
+		t.Fatalf("CountActiveSessionsByWorker() after fill returned an error: %v", err)
+	}
+	if active != 4 {
+		t.Fatalf("active session count after fill = %d, want 4", active)
+	}
+}
+
+func TestServer_CreateSessionAdmissionAndAttribution(t *testing.T) {
+	pool := newMigratedTestPool(t)
+	queries := data.New(pool)
+
+	t.Run("stamps authenticated api key", func(t *testing.T) {
+		truncateTables(t, pool)
+		const token = "pwd_session-owner-token"
+		key := insertAPIKey(t, queries, "session owner", token)
+		insertTestWorker(t, queries, data.WorkerStatusAvailable, 1)
+		logger := testLogger(io.Discard)
+		server := New(
+			pool,
+			queries,
+			NewTokenAuthenticator(queries, logger),
+			logger,
+			WithScheduler(newTestScheduler(pool, 0, time.Second)),
+		)
+		response := requestJSON(t, server.Handler, http.MethodPost, "/v1/sessions", map[string]any{
+			"browser": "chromium",
+		}, token)
+		if response.Code != http.StatusCreated {
+			t.Fatalf("create status = %d, want %d: %s", response.Code, http.StatusCreated, response.Body.String())
+		}
+		var session Session
+		decodeJSON(t, response.Body.Bytes(), &session)
+		if session.CreatedByKey == nil || *session.CreatedByKey != key.ID {
+			t.Fatalf("created_by_key = %v, want %s", session.CreatedByKey, key.ID)
+		}
+		stored, err := queries.GetSession(t.Context(), session.ID)
+		if err != nil {
+			t.Fatalf("GetSession() returned an error: %v", err)
+		}
+		if stored.CreatedByKey == nil || *stored.CreatedByKey != key.ID {
+			t.Fatalf("stored created_by_key = %v, want %s", stored.CreatedByKey, key.ID)
+		}
+	})
+
+	t.Run("rejects unavailable request fields", func(t *testing.T) {
+		truncateTables(t, pool)
+		insertTestWorker(t, queries, data.WorkerStatusAvailable, 1)
+		server := New(
+			pool,
+			queries,
+			NoAuthAuthenticator{},
+			testLogger(io.Discard),
+			WithScheduler(newTestScheduler(pool, 0, time.Second)),
+		)
+		dedicated := requestJSON(t, server.Handler, http.MethodPost, "/v1/sessions", map[string]any{
+			"browser": "chromium",
+			"mode":    "dedicated",
+		}, "")
+		if dedicated.Code != http.StatusUnprocessableEntity ||
+			!strings.Contains(dedicated.Body.String(), "dedicated mode is not available yet") {
+			t.Fatalf("dedicated response = %d %s, want 422 dedicated rejection", dedicated.Code, dedicated.Body.String())
+		}
+		tooLarge := requestJSON(t, server.Handler, http.MethodPost, "/v1/sessions", map[string]any{
+			"browser":          "chromium",
+			"connect_metadata": map[string]any{"value": strings.Repeat("x", maxConnectMetadataSize)},
+		}, "")
+		if tooLarge.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("large metadata status = %d, want %d: %s", tooLarge.Code, http.StatusUnprocessableEntity, tooLarge.Body.String())
+		}
+		keepAlive := requestJSON(t, server.Handler, http.MethodPost, "/v1/sessions", map[string]any{
+			"browser":       "chromium",
+			"keep_alive_ms": 30_000,
+		}, "")
+		if keepAlive.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("keep_alive_ms status = %d, want %d: %s", keepAlive.Code, http.StatusUnprocessableEntity, keepAlive.Body.String())
+		}
+	})
+
+	t.Run("wait timeout includes retry after", func(t *testing.T) {
+		truncateTables(t, pool)
+		insertTestWorker(t, queries, data.WorkerStatusAvailable, 1)
+		sessionScheduler := newTestScheduler(pool, 1, 30*time.Millisecond)
+		if _, err := sessionScheduler.Claim(t.Context(), scheduler.ClaimRequest{Browser: "chromium"}); err != nil {
+			t.Fatalf("Claim() returned an error: %v", err)
+		}
+		server := New(
+			pool,
+			queries,
+			NoAuthAuthenticator{},
+			testLogger(io.Discard),
+			WithScheduler(sessionScheduler),
+		)
+		response := requestJSON(t, server.Handler, http.MethodPost, "/v1/sessions", map[string]any{
+			"browser": "chromium",
+		}, "")
+		if response.Code != http.StatusServiceUnavailable {
+			t.Fatalf("queue timeout status = %d, want %d: %s", response.Code, http.StatusServiceUnavailable, response.Body.String())
+		}
+		if response.Header().Get("Retry-After") == "" {
+			t.Fatal("queue timeout response does not contain Retry-After")
+		}
+	})
+}
+
+func TestServer_HeartbeatReconcilesAndSignalsDrain(t *testing.T) {
+	pool := newMigratedTestPool(t)
+	queries := data.New(pool)
+	workerID := insertTestWorker(t, queries, data.WorkerStatusAvailable, 2)
+	if _, err := pool.Exec(
+		t.Context(),
+		"UPDATE workers SET lifetime_sessions = 5 WHERE id = $1",
+		workerID,
+	); err != nil {
+		t.Fatalf("setting worker lifetime: %v", err)
+	}
+	lostSession := insertTestSession(t, pool, queries, workerID, data.SessionStatusRunning)
+	if _, err := pool.Exec(
+		t.Context(),
+		"UPDATE sessions SET started_at = now() - interval '20 seconds' WHERE id = $1",
+		lostSession,
+	); err != nil {
+		t.Fatalf("aging lost session: %v", err)
+	}
+	zombie := uuid.New()
+	sessionScheduler := scheduler.New(
+		t.Context(),
+		pool,
+		testLogger(io.Discard),
+		scheduler.Options{
+			WorkerTTL:           time.Hour,
+			PendingSessionTTL:   time.Hour,
+			MaxLifetimeSessions: 5,
+			MaxQueueSize:        0,
+			QueueWaitTimeout:    time.Second,
+		},
+	)
+	server := New(
+		pool,
+		queries,
+		NoAuthAuthenticator{},
+		testLogger(io.Discard),
+		WithScheduler(sessionScheduler),
+	)
+	response := requestJSON(
+		t,
+		server.Handler,
+		http.MethodPost,
+		"/internal/workers/"+workerID.String()+"/heartbeat",
+		map[string]any{"active_session_ids": []uuid.UUID{zombie}},
+		"",
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("heartbeat status = %d, want %d: %s", response.Code, http.StatusOK, response.Body.String())
+	}
+	var body struct {
+		Status          data.WorkerStatus `json:"status"`
+		StaleSessionIDs []uuid.UUID       `json:"stale_session_ids"`
+	}
+	decodeJSON(t, response.Body.Bytes(), &body)
+	if body.Status != data.WorkerStatusDraining ||
+		len(body.StaleSessionIDs) != 1 ||
+		body.StaleSessionIDs[0] != zombie {
+		t.Fatalf("heartbeat response = %+v, want draining with zombie %s", body, zombie)
+	}
+	stored, err := queries.GetSession(t.Context(), lostSession)
+	if err != nil {
+		t.Fatalf("GetSession() returned an error: %v", err)
+	}
+	if stored.Status != data.SessionStatusFailed {
+		t.Fatalf("lost session status = %q, want failed", stored.Status)
+	}
+}
+
+func TestServer_Capacity(t *testing.T) {
+	pool := newMigratedTestPool(t)
+	queries := data.New(pool)
+	full := insertTestWorker(t, queries, data.WorkerStatusAvailable, 2)
+	free := insertTestWorker(t, queries, data.WorkerStatusAvailable, 3)
+	draining := insertTestWorker(t, queries, data.WorkerStatusDraining, 10)
+	insertTestSession(t, pool, queries, full, data.SessionStatusPending)
+	insertTestSession(t, pool, queries, full, data.SessionStatusRunning)
+	insertTestSession(t, pool, queries, free, data.SessionStatusRunning)
+	insertTestSession(t, pool, queries, draining, data.SessionStatusRunning)
+	server := New(
+		pool,
+		queries,
+		NoAuthAuthenticator{},
+		testLogger(io.Discard),
+		WithScheduler(newTestScheduler(pool, 100, time.Second)),
+	)
+
+	response := requestJSON(t, server.Handler, http.MethodGet, "/v1/capacity", nil, "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("capacity status = %d, want %d: %s", response.Code, http.StatusOK, response.Body.String())
+	}
+	var capacity Capacity
+	decodeJSON(t, response.Body.Bytes(), &capacity)
+	if len(capacity.Browsers) != 1 {
+		t.Fatalf("capacity browsers = %+v, want one browser", capacity.Browsers)
+	}
+	want := BrowserCapacity{
+		Browser:        "chromium",
+		Workers:        2,
+		MaxSlots:       5,
+		ActiveSessions: 4,
+		AvailableSlots: 2,
+	}
+	if capacity.Browsers[0] != want {
+		t.Fatalf("browser capacity = %+v, want %+v", capacity.Browsers[0], want)
+	}
+	if capacity.Totals != (CapacityTotals{Workers: 2, MaxSlots: 5, ActiveSessions: 4, AvailableSlots: 2}) ||
+		capacity.Queued != 0 || capacity.MaxQueueSize != 100 {
+		t.Fatalf("capacity totals and queue = %+v, want fleet totals and replica queue", capacity)
+	}
+}
+
 func TestServer_TouchFailureDoesNotRejectRequest(t *testing.T) {
 	pool := newMigratedTestPool(t)
 	queries := data.New(pool)
@@ -412,9 +716,20 @@ func TestServer_SecuredRoutesRequireAuthentication(t *testing.T) {
 		body   any
 	}{
 		{
+			name:   "create session",
+			method: http.MethodPost,
+			path:   "/v1/sessions",
+			body:   map[string]any{"browser": "chromium"},
+		},
+		{
 			name:   "get session",
 			method: http.MethodGet,
 			path:   "/v1/sessions/" + uuid.NewString(),
+		},
+		{
+			name:   "get capacity",
+			method: http.MethodGet,
+			path:   "/v1/capacity",
 		},
 		{
 			name:   "list workers",
@@ -436,6 +751,7 @@ func TestServer_SecuredRoutesRequireAuthentication(t *testing.T) {
 			name:   "heartbeat worker",
 			method: http.MethodPost,
 			path:   "/internal/workers/" + uuid.NewString() + "/heartbeat",
+			body:   map[string]any{"active_session_ids": []string{}},
 		},
 		{
 			name:   "set worker status",
@@ -679,6 +995,91 @@ func hashToken(token string) string {
 
 func testLogger(output io.Writer) *slog.Logger {
 	return slog.New(slog.NewJSONHandler(output, nil))
+}
+
+func newTestScheduler(
+	pool *pgxpool.Pool,
+	maxQueueSize int,
+	queueWaitTimeout time.Duration,
+) *scheduler.Scheduler {
+	return scheduler.New(
+		context.Background(),
+		pool,
+		testLogger(io.Discard),
+		scheduler.Options{
+			WorkerTTL:           time.Hour,
+			PendingSessionTTL:   time.Hour,
+			MaxLifetimeSessions: 50,
+			MaxQueueSize:        maxQueueSize,
+			QueueWaitTimeout:    queueWaitTimeout,
+			PollingInterval:     10 * time.Millisecond,
+		},
+	)
+}
+
+func insertTestWorker(
+	t *testing.T,
+	queries *data.Queries,
+	status data.WorkerStatus,
+	maxSlots int32,
+) uuid.UUID {
+	t.Helper()
+	id := uuid.New()
+	_, err := queries.RegisterWorker(t.Context(), data.RegisterWorkerParams{
+		ID:                id,
+		Address:           "ws://worker-" + id.String() + ":3000",
+		Browser:           "chromium",
+		PlaywrightVersion: "1.62.1",
+		MaxSlots:          maxSlots,
+		Status:            status,
+	})
+	if err != nil {
+		t.Fatalf("RegisterWorker() returned an error: %v", err)
+	}
+	return id
+}
+
+func insertTestSession(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	queries *data.Queries,
+	workerID uuid.UUID,
+	status data.SessionStatus,
+) uuid.UUID {
+	t.Helper()
+	worker, err := queries.GetWorker(t.Context(), workerID)
+	if err != nil {
+		t.Fatalf("GetWorker() returned an error: %v", err)
+	}
+	id := uuid.New()
+	_, err = pool.Exec(
+		t.Context(),
+		`INSERT INTO sessions (
+    id, worker_id, browser, playwright_version, worker_address,
+    mode, status, started_at, last_heartbeat
+) VALUES (
+    $1, $2, $3, $4, $5, 'default', $6,
+    CASE WHEN $6::session_status = 'running' THEN now() END,
+    now()
+)`,
+		id,
+		workerID,
+		worker.Browser,
+		worker.PlaywrightVersion,
+		worker.Address,
+		status,
+	)
+	if err != nil {
+		t.Fatalf("inserting test session: %v", err)
+	}
+	return id
+}
+
+func truncateTables(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	if _, err := pool.Exec(t.Context(), "TRUNCATE sessions, api_keys, workers"); err != nil {
+		t.Fatalf("truncating test data: %v", err)
+	}
 }
 
 func newMigratedTestPool(t *testing.T) *pgxpool.Pool {

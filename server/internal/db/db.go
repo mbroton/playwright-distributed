@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -12,6 +13,11 @@ func Open(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 	config, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("parsing database dsn: %w", err)
+	}
+	if config.MaxConns < 2 {
+		// Keep one pooled connection as operational headroom. The hijacked
+		// listener connection is outside pool accounting after acquisition.
+		return nil, errors.New("database pool max_conns must be at least 2 for operational headroom")
 	}
 
 	if config.MaxConnLifetimeJitter == 0 {
