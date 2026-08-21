@@ -38,8 +38,8 @@ browser gets recycled for a fresh one.
 - **Isolated sessions.** Each connection is a fresh session with its own
   contexts, cookies, and storage. Sessions never see each other.
 - **Self-healing capacity.** Sessions and workers are rows in PostgreSQL. If
-  a worker dies mid-session, the session is marked failed, the capacity is
-  reclaimed, and a restarted worker registers itself again — no operator in
+  a worker dies mid-session, the grid closes out its sessions and reclaims
+  the capacity, and workers register themselves on start — no operator in
   the loop.
 - **Your infrastructure.** Data stays on your network. Scaling is adding
   worker containers. There is no per-session bill.
@@ -96,11 +96,10 @@ its own.
 | Self-hosted | ✅ | ✅ | ✅ (source-available) | ❌ |
 | Multi-node fleet built in | ✅ | ✅ | ❌ one instance per node, bring your own load balancer | n/a |
 | Browsers stay warm between sessions | ✅ | ❌ launched per session | ❌ launched per session | varies |
-| Native Playwright protocol | ✅ | ❌ WebDriver | ✅ | ✅ |
+| Native Playwright protocol | ✅ | ❌ WebDriver | ✅ | ❌ CDP (`connectOverCDP`) |
 | Chromium + Firefox + WebKit | ✅ | ✅ | ✅ | mostly Chromium |
-| Automatic recovery of crashed capacity | ✅ | manual | manual | ✅ |
-| Session records + REST API | ✅ | ❌ | partial | ✅ |
-| Stealth, proxies, live session view | ❌ | ❌ | ✅ | ✅ |
+| Sessions and workers as database records | ✅ | live state only | partial | ✅ |
+| Stealth / unblocking features | ❌ | ❌ | ✅ | varies |
 | Ops burden | yours | yours | yours | none |
 
 Pick Selenium Grid if your stack is WebDriver. Pick Browserless if you need
@@ -131,18 +130,18 @@ flowchart TD
     end
 ```
 
-- **The server** is one stateless Go binary: it authenticates clients, picks
-  a worker, relays the WebSocket bytes, and exposes a REST API for sessions,
+- **The server** is a single Go binary: it authenticates clients, picks a
+  worker, relays the WebSocket bytes, and exposes a REST API for sessions,
   workers, and capacity.
 - **Workers** are containers built on the official Playwright image. Each
-  keeps one browser running and serves up to `MAX_SLOTS` sessions as
-  isolated contexts.
-- **PostgreSQL** is the only state: sessions, workers, and API keys are
-  rows. A rescuer marks sessions of dead workers failed, so capacity
-  recovers without intervention.
+  keeps one browser running and serves up to `MAX_SLOTS` concurrent
+  sessions; every session creates its own isolated contexts on that browser.
+- **PostgreSQL** holds all durable state: sessions, workers, and API keys
+  are rows. Sessions of dead workers are closed out automatically, so
+  capacity recovers without intervention.
 - **Recycling**: after a configurable number of sessions, a worker drains
-  and restarts with a fresh browser. Selection staggers this so the fleet
-  never drains at once.
+  and restarts with a fresh browser. Selection concentrates load on the
+  longest-serving worker, so recycles tend to happen one worker at a time.
 
 The repository also ships a reproducible benchmark suite
 ([`bench/`](bench/README.md)) measuring time-to-first-page and session
@@ -160,10 +159,10 @@ Kubernetes):
 - **Exposure**: keep PostgreSQL and workers private; expose only the server.
 - **Authentication**: a server with zero API keys runs in open bootstrap
   mode. Create the first key
-  (`docker compose exec server server apikey create --name <name>`) and the
-  whole API locks; hand the key to every worker (`WORKER_API_KEY`) and
-  client (`chromium.connect('ws://host:8080/?token=pwd_...')`) in the same
-  step.
+  (`docker compose exec server server apikey create --name <name>`) and from
+  then on every request except health checks needs a key; hand it to every
+  worker (`WORKER_API_KEY`) and client
+  (`chromium.connect('ws://host:8080/?token=pwd_...')`) in the same step.
 - **Scaling**: add or remove worker containers freely; each registers itself
   and starts serving.
 
@@ -207,13 +206,21 @@ asyncio.run(main())
 
 ### Sessions over REST
 
-Every connection is a session record you can inspect or terminate:
+Create a session through the API to get an ID you can inspect, connect to,
+and terminate:
 
 ```bash
 curl -s localhost:8080/v1/capacity               # slots and queue depth
 curl -s localhost:8080/v1/workers                # the fleet
-curl -s localhost:8080/v1/sessions/<id>          # inspect a session
-curl -X DELETE localhost:8080/v1/sessions/<id>   # kill a live session
+
+# Create a session, then connect to it by ID:
+curl -s -X POST localhost:8080/v1/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"browser": "chromium", "playwright_version": "1.62.1"}'
+# -> { "id": "..." }  connect: chromium.connect('ws://localhost:8080/sessions/<id>')
+
+curl -s localhost:8080/v1/sessions/<id>          # inspect it
+curl -X DELETE localhost:8080/v1/sessions/<id>   # terminate it, even mid-use
 ```
 
 ## Roadmap
