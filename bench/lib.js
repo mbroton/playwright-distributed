@@ -77,6 +77,8 @@ export async function withDeadline(promise, ms, label) {
   }
 }
 
+class CapacityAuthError extends Error {}
+
 // Polls /v1/capacity (derived from the ws endpoint) until exactly the
 // expected number of workers for the benchmarked browser has registered and
 // is idle, then verifies they have enough slots for the run. Exact count,
@@ -94,24 +96,25 @@ export async function waitForWorkers(wsEndpoint, expectedWorkers, requiredSlots,
 
   const deadline = Date.now() + 120_000;
   let entry;
+  let lastCapacity;
   for (;;) {
     try {
       const response = await fetch(url, { headers, signal: AbortSignal.timeout(5_000) });
       if (response.status === 401 || response.status === 403) {
-        throw new Error(
-          `Capacity check got HTTP ${response.status}: the server requires an API key. ` +
-            "Pass it in the endpoint: --endpoint 'ws://host:8080/?token=pwd_...'"
+        throw new CapacityAuthError(
+          `Capacity check got HTTP ${response.status}: missing or rejected API key. ` +
+            "Pass a valid one in the endpoint: --endpoint 'ws://host:8080/?token=pwd_...'"
         );
       }
       if (response.ok) {
-        const capacity = await response.json();
-        entry = capacity.browsers.find((candidate) => candidate.browser === browser);
+        lastCapacity = await response.json();
+        entry = lastCapacity.browsers.find((candidate) => candidate.browser === browser);
         if (entry && entry.workers === expectedWorkers && entry.active_sessions === 0) {
           break;
         }
       }
     } catch (error) {
-      if (error instanceof Error && error.message.startsWith('Capacity check got HTTP')) {
+      if (error instanceof CapacityAuthError) {
         throw error;
       }
       // Server may still be starting; keep polling until the deadline.
@@ -119,7 +122,7 @@ export async function waitForWorkers(wsEndpoint, expectedWorkers, requiredSlots,
     if (Date.now() > deadline) {
       throw new Error(
         `Timed out waiting for exactly ${expectedWorkers} idle ${browser} workers` +
-          (entry ? ` (last capacity: ${JSON.stringify(entry)})` : '')
+          (lastCapacity ? ` (last capacity: ${JSON.stringify(lastCapacity.browsers)})` : '')
       );
     }
     await new Promise((resolve) => setTimeout(resolve, 1_000));

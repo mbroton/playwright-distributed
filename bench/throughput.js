@@ -4,10 +4,12 @@
 // A session is connect -> newContext -> newPage -> goto -> close, and the
 // per-session timer covers all of it, including close. A discarded warmup
 // phase runs first so ramp costs (cold client, first context on each worker,
-// the scheduler filling slots) stay out of the measured window. Keep
-// --concurrency at or below the grid's capacity (workers x MAX_SLOTS) so the
-// result measures service rate, not admission-control queueing;
-// --expect-workers enforces that before the run starts.
+// the scheduler filling slots) stay out of the measured window. Run with
+// --concurrency equal to the grid's capacity (workers x MAX_SLOTS): above it
+// the result measures admission-control queueing, and below it the
+// busiest-first scheduler leaves added workers idle. --expect-workers
+// verifies registration and refuses concurrency above capacity; matching
+// capacity exactly is on the operator.
 
 import { parseArgs } from 'node:util';
 import { chromium } from 'playwright';

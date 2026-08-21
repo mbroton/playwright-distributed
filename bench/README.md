@@ -69,8 +69,8 @@ Node process and can become the ceiling on small machines):
 
 ```bash
 docker stats --no-stream --format '{{.Name}}\t{{.CPUPerc}}'
-pidstat -p "$(pgrep -f throughput.js)" 5 1
-curl -s localhost:8080/v1/capacity   # "queued" must stay 0 mid-run
+ps -o %cpu= -p "$(pgrep -fn throughput.js)"
+curl -s localhost:8080/v1/capacity   # "queued" should stay at or near 0
 ```
 
 **Throughput, scaling mode** (fixed-size workers, growing fleet). Fresh stack
@@ -97,9 +97,11 @@ concurrency), `--expect-workers`, `--label` for throughput.
 
 ## Methodology notes
 
-- `--expect-workers` polls `/v1/capacity` until the fleet has registered and
-  refuses to run when `--concurrency` exceeds free slots, so the result
-  measures service rate rather than admission-control queueing.
+- `--expect-workers` polls `/v1/capacity` until *exactly* that many idle
+  workers of the benchmarked browser have registered (extra or leftover
+  workers fail the gate too — hence the fresh stack per point), and refuses
+  to run when `--concurrency` exceeds free slots. It does not check the
+  concurrency-equals-capacity rule below; that is on the operator.
 - Concurrency must equal capacity (workers x MAX_SLOTS) in scaling runs, not
   just stay below it: the scheduler deliberately packs the busiest worker
   first (that staggers recycling in production), so at partial concurrency
