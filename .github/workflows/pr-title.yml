@@ -22,5 +22,5 @@ jobs:
             exit 0
           fi
 
-          echo "::error title=Invalid pull request title::Use Conventional Commits, for example: fix(proxy): handle closed connections"
+          echo "::error title=Invalid pull request title::Use Conventional Commits, for example: fix(server): handle closed connections"
           exit 1

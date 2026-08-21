@@ -1,39 +1,60 @@
 services:
-  redis:
-    image: redis:8.0
-
-  proxy:
-    image: ghcr.io/mbroton/playwright-distributed/proxy:latest
+  postgres:
+    image: postgres:18-alpine
     environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - LOG_LEVEL=info
-      - LOG_FORMAT=text
-      # Maximum number of concurrent browser sessions allowed
-      - MAX_CONCURRENT_SESSIONS=5
-      # Maximum number of sessions a worker will handle before it is recycled. The proxy tracks this for each worker.
-      - MAX_LIFETIME_SESSIONS=50
+      - POSTGRES_USER=pwd
+      - POSTGRES_PASSWORD=pwd
+      - POSTGRES_DB=pwd
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pwd -d pwd"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  server:
+    image: ghcr.io/mbroton/playwright-distributed/server:latest
+    environment:
+      # A server with zero API keys runs in unauthenticated bootstrap mode.
+      # Create the first key: docker compose exec server server apikey create --name <name>
+      - DATABASE_URL=postgres://pwd:pwd@postgres:5432/pwd?sslmode=disable
     ports:
       - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
     depends_on:
-      - redis
+      postgres:
+        condition: service_healthy
 
+  # Stop budget: each cleanup step is bounded by the worker's 2.5s cleanup
+  # timeout, not its inner deadline. Worst case: 2.5s drain status + 30s drain
+  # + 2.5s shutdown status + 2.5s gateway + 10s browser close + 2.5s kill = 50s.
   worker:
     image: ghcr.io/mbroton/playwright-distributed/worker:latest
     init: true
     security_opt:
       - seccomp=./worker/seccomp_profile.json
     shm_size: "1gb"
+    stop_grace_period: 60s
     environment:
-      - REDIS_URL=redis://redis:6379
-      # Port for the worker to listen on for browser connections
-      - PORT=3131
-      # Hostname for the worker, registered in Redis. Must be resolvable by the proxy.
-      - PRIVATE_HOSTNAME=worker
-      - LOG_LEVEL=info
-      - LOG_FORMAT=text
-      # Type of browser to use: chromium, firefox, webkit
+      - SERVER_URL=http://server:8080
+      # Supported values: chromium, firefox, webkit
       - BROWSER_TYPE=chromium
+      # Port for browser relay connections
+      - PORT=3131
+      # Maximum number of concurrent browser sessions
+      - MAX_SLOTS=5
+      # Max seconds to wait for open sessions on SIGTERM. Raise together with
+      # stop_grace_period: grace must stay above DRAIN_TIMEOUT + 20s cleanup.
+      - DRAIN_TIMEOUT=30
     depends_on:
-      - redis
+      server:
+        condition: service_healthy
     restart: unless-stopped
+
+volumes:
+  postgres-data:

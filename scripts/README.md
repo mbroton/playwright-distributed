@@ -1,5 +1,2 @@
-This directory contains helper scripts for development purposes.
-
-These scripts are intended to assist with tasks such as testing the proxy and worker, and monitoring the Redis state during development.
-
-Please note that these scripts are for convenience during the initial development phase and may be removed or changed in the future.
+This directory contains `check-playwright-version.js`. It verifies that the
+worker package and Docker image use the same Playwright version.
