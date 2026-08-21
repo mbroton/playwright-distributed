@@ -56,7 +56,7 @@ node time-to-first-page.js --expect-workers 1
 ```
 
 **Throughput, saturation mode** (CPU-uncapped workers, concurrency = workers
-x MAX_SLOTS, 5 per worker). Run it three times and publish the median:
+x MAX_SLOTS, 5 per worker). Run it three times and take the median:
 
 ```bash
 docker compose down -v && docker compose up -d --scale worker=3
@@ -74,7 +74,7 @@ curl -s localhost:8080/v1/capacity   # "queued" should stay at or near 0
 ```
 
 **Throughput, scaling mode** (fixed-size workers, growing fleet). Fresh stack
-per point, three runs per point, publish the median:
+per point, three runs per point, take the median:
 
 ```bash
 docker compose down -v && WORKER_CPUS=2 docker compose up -d --scale worker=1
@@ -106,7 +106,7 @@ concurrency), `--expect-workers`, `--label` for throughput.
   just stay below it: the scheduler deliberately packs the busiest worker
   first (that staggers recycling in production), so at partial concurrency
   added workers sit idle and the curve looks flat even though capacity grew.
-- Fresh stacks per point are the main ramp control; the short warmup phase
+- Start each point from a fresh stack (`down -v`); the short warmup phase
   (default 2x concurrency sessions, discarded) additionally keeps cold-client
   and first-context costs out of the measured window.
 - Sessions are isolated browser contexts, not browser processes: a worker
@@ -122,17 +122,17 @@ concurrency), `--expect-workers`, `--label` for throughput.
 - The bench stack runs in unauthenticated bootstrap mode (zero API keys),
   like the local compose stack. With authentication enabled the server also
   verifies the key hash on every request (an indexed lookup, plus a last-used
-  timestamp update throttled to once per minute), which these numbers do not
-  include. An authenticated grid can still be benched:
+  timestamp update throttled to once per minute), which adds a small
+  per-request cost. To benchmark an authenticated grid:
   `--endpoint 'ws://host:8080/?token=pwd_...'`.
-- The scaling mode exists because stacking unlimited workers on one machine
-  cannot show scale-out: they all share the same CPUs, so throughput flattens
-  at the machine's limit no matter how many workers run. Capping each worker
-  at a fixed CPU budget makes "add a worker" mean "add capacity", which is
-  what adding a node does in a real deployment. It stays honest only while
-  the machine has spare CPUs for the client, server, and postgres.
-- Everything (client, server, workers, postgres) shares one machine in this
-  setup, so the processes compete for CPU. That deflates grid numbers rather
-  than inflating them: a client on a separate host will only look better.
-- Report the hardware next to any published numbers: CPU count, RAM, and
-  whether other load was present.
+- Workers sharing one machine share its CPUs, so adding workers there cannot
+  show scale-out: throughput flattens at the machine's limit no matter how
+  many run. The scaling mode caps each worker at a fixed CPU budget
+  (`WORKER_CPUS`) so that "add a worker" means "add capacity", as adding a
+  node does in a real deployment. The simulation holds only while the machine
+  keeps spare CPUs for the client, server, and postgres.
+- Results depend on where the bench client runs: on the same machine as the
+  grid it competes with the browsers for CPU and lowers grid numbers. For
+  representative results, run the client on a separate machine.
+- Record the hardware together with any results: CPU count, RAM, and whether
+  other load was present.
