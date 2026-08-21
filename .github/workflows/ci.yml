@@ -89,10 +89,22 @@ jobs:
           go-version: '1.26.6'
           cache-dependency-path: server/go.sum
 
-      - name: Verify generated server code
-        working-directory: ./server
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+
+      - name: Verify generated server and API client code
         run: |
+          cd server
           make generate
+          make openapi
+          cd ../worker
+          npm ci
+          npm run generate:api
+          cd ..
           git add -A
           git diff --cached --exit-code
 

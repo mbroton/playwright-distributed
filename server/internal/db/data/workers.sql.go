@@ -130,18 +130,25 @@ func (q *Queries) RegisterWorker(ctx context.Context, arg RegisterWorkerParams) 
 
 const setWorkerStatus = `-- name: SetWorkerStatus :one
 UPDATE workers
-SET status = $2
-WHERE id = $1
+SET status = $1::worker_status
+WHERE id = $2
+  AND (
+      ($1::worker_status = 'draining' AND status IN ('available', 'draining'))
+      OR (
+          $1::worker_status = 'shutting_down'
+          AND status IN ('available', 'draining', 'stalled', 'shutting_down')
+      )
+  )
 RETURNING id, address, browser, playwright_version, max_slots, status, last_heartbeat, lifetime_sessions, created_at
 `
 
 type SetWorkerStatusParams struct {
-	ID     uuid.UUID
 	Status WorkerStatus
+	ID     uuid.UUID
 }
 
 func (q *Queries) SetWorkerStatus(ctx context.Context, arg SetWorkerStatusParams) (Worker, error) {
-	row := q.db.QueryRow(ctx, setWorkerStatus, arg.ID, arg.Status)
+	row := q.db.QueryRow(ctx, setWorkerStatus, arg.Status, arg.ID)
 	var i Worker
 	err := row.Scan(
 		&i.ID,
@@ -160,18 +167,18 @@ func (q *Queries) SetWorkerStatus(ctx context.Context, arg SetWorkerStatusParams
 const updateWorkerHeartbeat = `-- name: UpdateWorkerHeartbeat :one
 UPDATE workers
 SET last_heartbeat = now(),
-    status = $2
+    -- A heartbeat can revive stalled workers only because the rescuer may mark
+    -- available workers stalled; it must never overwrite drain or shutdown intent.
+    status = CASE
+        WHEN status = 'stalled' THEN 'available'
+        ELSE status
+    END
 WHERE id = $1
 RETURNING id, address, browser, playwright_version, max_slots, status, last_heartbeat, lifetime_sessions, created_at
 `
 
-type UpdateWorkerHeartbeatParams struct {
-	ID     uuid.UUID
-	Status WorkerStatus
-}
-
-func (q *Queries) UpdateWorkerHeartbeat(ctx context.Context, arg UpdateWorkerHeartbeatParams) (Worker, error) {
-	row := q.db.QueryRow(ctx, updateWorkerHeartbeat, arg.ID, arg.Status)
+func (q *Queries) UpdateWorkerHeartbeat(ctx context.Context, id uuid.UUID) (Worker, error) {
+	row := q.db.QueryRow(ctx, updateWorkerHeartbeat, id)
 	var i Worker
 	err := row.Scan(
 		&i.ID,

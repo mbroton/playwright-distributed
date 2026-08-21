@@ -3,14 +3,16 @@
   "type": "module",
   "private": true,
   "scripts": {
+    "generate:api": "openapi-ts",
     "start": "tsx src/index.ts",
     "test": "node --import tsx --test src/*.test.ts",
     "typecheck": "tsc --noEmit",
     "smoke": "tsx scripts/smoke.ts"
   },
   "devDependencies": {
+    "@hey-api/openapi-ts": "0.95.0",
     "@types/node": "^24.13.3",
-    "tsx": "^4.23.12"
+    "undici-types": "8.10.0"
   },
   "peerDependencies": {
     "typescript": "^5"
@@ -19,6 +21,7 @@
     "dotenv": "^17.4.2",
     "playwright-core": "1.62.1",
     "redis": "^6.2.1",
+    "tsx": "^4.23.12",
     "zod": "^4.4.3"
   }
 }

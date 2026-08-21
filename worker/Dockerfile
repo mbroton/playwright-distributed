@@ -5,7 +5,7 @@ WORKDIR /browser_server
 COPY ./package.json ./package.json
 COPY ./package-lock.json ./package-lock.json
 
-RUN npm ci
+RUN npm ci --omit=dev
 
 COPY ./tsconfig.json ./tsconfig.json
 COPY ./src/ ./src/

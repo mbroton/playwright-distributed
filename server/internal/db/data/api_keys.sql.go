@@ -7,9 +7,54 @@ package data
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 )
+
+const countActiveAPIKeys = `-- name: CountActiveAPIKeys :one
+SELECT count(*)
+FROM api_keys
+WHERE revoked_at IS NULL
+`
+
+func (q *Queries) CountActiveAPIKeys(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, countActiveAPIKeys)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const deleteAPIKey = `-- name: DeleteAPIKey :exec
+DELETE FROM api_keys
+WHERE id = $1
+`
+
+func (q *Queries) DeleteAPIKey(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, deleteAPIKey, id)
+	return err
+}
+
+const getAPIKey = `-- name: GetAPIKey :one
+SELECT id, name, hash, prefix, created_at, last_used_at, revoked_at
+FROM api_keys
+WHERE id = $1
+`
+
+func (q *Queries) GetAPIKey(ctx context.Context, id uuid.UUID) (APIKey, error) {
+	row := q.db.QueryRow(ctx, getAPIKey, id)
+	var i APIKey
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Hash,
+		&i.Prefix,
+		&i.CreatedAt,
+		&i.LastUsedAt,
+		&i.RevokedAt,
+	)
+	return i, err
+}
 
 const getActiveAPIKeyByHash = `-- name: GetActiveAPIKeyByHash :one
 SELECT id, name, hash, prefix, created_at, last_used_at, revoked_at
@@ -72,10 +117,53 @@ func (q *Queries) InsertAPIKey(ctx context.Context, arg InsertAPIKeyParams) (API
 	return i, err
 }
 
+const listAPIKeys = `-- name: ListAPIKeys :many
+SELECT id, name, prefix, created_at, last_used_at, revoked_at
+FROM api_keys
+ORDER BY created_at, id
+`
+
+type ListAPIKeysRow struct {
+	ID         uuid.UUID
+	Name       string
+	Prefix     string
+	CreatedAt  time.Time
+	LastUsedAt *time.Time
+	RevokedAt  *time.Time
+}
+
+func (q *Queries) ListAPIKeys(ctx context.Context) ([]ListAPIKeysRow, error) {
+	rows, err := q.db.Query(ctx, listAPIKeys)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListAPIKeysRow
+	for rows.Next() {
+		var i ListAPIKeysRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.Prefix,
+			&i.CreatedAt,
+			&i.LastUsedAt,
+			&i.RevokedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const revokeAPIKey = `-- name: RevokeAPIKey :one
 UPDATE api_keys
 SET revoked_at = now()
 WHERE id = $1
+  AND revoked_at IS NULL
 RETURNING id, name, hash, prefix, created_at, last_used_at, revoked_at
 `
 
@@ -94,24 +182,14 @@ func (q *Queries) RevokeAPIKey(ctx context.Context, id uuid.UUID) (APIKey, error
 	return i, err
 }
 
-const touchAPIKey = `-- name: TouchAPIKey :one
+const touchAPIKey = `-- name: TouchAPIKey :exec
 UPDATE api_keys
 SET last_used_at = now()
 WHERE id = $1
-RETURNING id, name, hash, prefix, created_at, last_used_at, revoked_at
+  AND (last_used_at IS NULL OR last_used_at < now() - interval '1 minute')
 `
 
-func (q *Queries) TouchAPIKey(ctx context.Context, id uuid.UUID) (APIKey, error) {
-	row := q.db.QueryRow(ctx, touchAPIKey, id)
-	var i APIKey
-	err := row.Scan(
-		&i.ID,
-		&i.Name,
-		&i.Hash,
-		&i.Prefix,
-		&i.CreatedAt,
-		&i.LastUsedAt,
-		&i.RevokedAt,
-	)
-	return i, err
+func (q *Queries) TouchAPIKey(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, touchAPIKey, id)
+	return err
 }

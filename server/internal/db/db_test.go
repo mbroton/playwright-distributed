@@ -126,12 +126,26 @@ func TestQueries(t *testing.T) {
 	}
 
 	touchBefore := databaseTime(t, pool)
-	touchedKey, err := queries.TouchAPIKey(t.Context(), keyID)
-	if err != nil {
+	if err := queries.TouchAPIKey(t.Context(), keyID); err != nil {
 		t.Fatalf("TouchAPIKey() returned an error: %v", err)
 	}
 	touchAfter := databaseTime(t, pool)
+	touchedKey, err := queries.GetActiveAPIKeyByHash(t.Context(), key.Hash)
+	if err != nil {
+		t.Fatalf("GetActiveAPIKeyByHash() after touch returned an error: %v", err)
+	}
 	assertOptionalTimeBetween(t, "TouchAPIKey().LastUsedAt", touchedKey.LastUsedAt, touchBefore, touchAfter)
+	firstTouch := *touchedKey.LastUsedAt
+	if err := queries.TouchAPIKey(t.Context(), keyID); err != nil {
+		t.Fatalf("second TouchAPIKey() returned an error: %v", err)
+	}
+	touchedKey, err = queries.GetActiveAPIKeyByHash(t.Context(), key.Hash)
+	if err != nil {
+		t.Fatalf("GetActiveAPIKeyByHash() after second touch returned an error: %v", err)
+	}
+	if !touchedKey.LastUsedAt.Equal(firstTouch) {
+		t.Fatalf("second TouchAPIKey() changed last_used_at from %v to %v", firstTouch, touchedKey.LastUsedAt)
+	}
 
 	registerBefore := databaseTime(t, pool)
 	worker, err := queries.RegisterWorker(t.Context(), data.RegisterWorkerParams{
@@ -160,10 +174,7 @@ func TestQueries(t *testing.T) {
 	}
 
 	heartbeatBefore := databaseTime(t, pool)
-	gotWorker, err = queries.UpdateWorkerHeartbeat(t.Context(), data.UpdateWorkerHeartbeatParams{
-		ID:     workerID,
-		Status: data.WorkerStatusDraining,
-	})
+	gotWorker, err = queries.UpdateWorkerHeartbeat(t.Context(), workerID)
 	if err != nil {
 		t.Fatalf("UpdateWorkerHeartbeat() returned an error: %v", err)
 	}
@@ -175,19 +186,71 @@ func TestQueries(t *testing.T) {
 		heartbeatBefore,
 		heartbeatAfter,
 	)
-	if gotWorker.Status != data.WorkerStatusDraining {
-		t.Fatalf("UpdateWorkerHeartbeat().Status = %q, want %q", gotWorker.Status, data.WorkerStatusDraining)
+	if gotWorker.Status != data.WorkerStatusAvailable {
+		t.Fatalf("UpdateWorkerHeartbeat().Status = %q, want unchanged %q", gotWorker.Status, data.WorkerStatusAvailable)
+	}
+	if _, err := pool.Exec(
+		t.Context(),
+		"UPDATE workers SET status = 'stalled' WHERE id = $1",
+		workerID,
+	); err != nil {
+		t.Fatalf("setting worker status to stalled: %v", err)
+	}
+	gotWorker, err = queries.UpdateWorkerHeartbeat(t.Context(), workerID)
+	if err != nil {
+		t.Fatalf("UpdateWorkerHeartbeat() for stalled worker returned an error: %v", err)
+	}
+	if gotWorker.Status != data.WorkerStatusAvailable {
+		t.Fatalf(
+			"UpdateWorkerHeartbeat().Status for stalled worker = %q, want %q",
+			gotWorker.Status,
+			data.WorkerStatusAvailable,
+		)
+	}
+	if _, err := pool.Exec(
+		t.Context(),
+		"UPDATE workers SET status = 'stalled' WHERE id = $1",
+		workerID,
+	); err != nil {
+		t.Fatalf("setting worker status to stalled before status transitions: %v", err)
+	}
+	if _, err := queries.SetWorkerStatus(t.Context(), data.SetWorkerStatusParams{
+		ID:     workerID,
+		Status: data.WorkerStatusDraining,
+	}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("SetWorkerStatus(stalled to draining) error = %v, want %v", err, pgx.ErrNoRows)
+	}
+	gotWorker, err = queries.SetWorkerStatus(t.Context(), data.SetWorkerStatusParams{
+		ID:     workerID,
+		Status: data.WorkerStatusShuttingDown,
+	})
+	if err != nil {
+		t.Fatalf("SetWorkerStatus(stalled to shutting_down) returned an error: %v", err)
+	}
+	if gotWorker.Status != data.WorkerStatusShuttingDown {
+		t.Fatalf(
+			"SetWorkerStatus(stalled to shutting_down).Status = %q, want %q",
+			gotWorker.Status,
+			data.WorkerStatusShuttingDown,
+		)
+	}
+	if _, err := pool.Exec(
+		t.Context(),
+		"UPDATE workers SET status = 'available' WHERE id = $1",
+		workerID,
+	); err != nil {
+		t.Fatalf("resetting worker status to available: %v", err)
 	}
 
 	gotWorker, err = queries.SetWorkerStatus(t.Context(), data.SetWorkerStatusParams{
 		ID:     workerID,
-		Status: data.WorkerStatusAvailable,
+		Status: data.WorkerStatusDraining,
 	})
 	if err != nil {
 		t.Fatalf("SetWorkerStatus() returned an error: %v", err)
 	}
-	if gotWorker.Status != data.WorkerStatusAvailable {
-		t.Fatalf("SetWorkerStatus().Status = %q, want %q", gotWorker.Status, data.WorkerStatusAvailable)
+	if gotWorker.Status != data.WorkerStatusDraining {
+		t.Fatalf("SetWorkerStatus().Status = %q, want %q", gotWorker.Status, data.WorkerStatusDraining)
 	}
 
 	workers, err := queries.ListWorkers(t.Context())
