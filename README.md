@@ -1,159 +1,115 @@
 <p align="center">
-  <img src="assets/logo.png" alt="Playwright-Distributed logo" width="160">
+  <img src="assets/logo.png" alt="playwright-distributed logo" width="160">
 </p>
 
 <h1 align="center">playwright-distributed</h1>
 
 <p align="center">
-  <strong>Self-hosted, horizontally-scalable <a href="https://playwright.dev/">Playwright</a> grid.</strong><br/>
-  Spin up as many browser workers as you need on your own infrastructure and access them through a single WebSocket endpoint.
+  <strong>A self-hosted fleet of browsers behind one endpoint.</strong><br/>
+  Run warm <a href="https://playwright.dev/">Playwright</a> browsers on your own machines. Connect from anywhere with one line of code.
 </p>
 
 <p align="center">
+  <a href="https://github.com/mbroton/playwright-distributed/actions/workflows/ci.yml"><img src="https://github.com/mbroton/playwright-distributed/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/mbroton/playwright-distributed?color=blue" alt="License"></a>
 </p>
 
 ---
 
-## Why use playwright-distributed?
-- Single WebSocket endpoint routes each session through a smart selector that balances load *and* staggers worker restarts.
-- Warm browser instances (Chrome, Firefox, WebKit) - no waiting for browser startup.
-- Each connection gets a fresh, isolated browser session.
-- PostgreSQL stores sessions and workers as rows; a rescuer reclaims capacity after crashes.
-- Optional API-key authentication and a small REST API expose sessions and capacity at `/v1/sessions` and `/v1/capacity`.
-- Works with any Playwright client.
+```js
+import { chromium } from 'playwright';
 
-### Motivation
+const browser = await chromium.connect('ws://your-grid:8080');
+// A fresh, isolated browser session. No launch, no install, no cleanup.
+```
 
-Modern teams often need **many concurrent browsers**: scraping pipelines, AI agents, CI test suites, synthetic monitors… Spawning a fresh headless browser for every task wastes tens of seconds and huge amounts of memory. Existing SaaS grids solve this but:
+Every connection gets its own isolated session on a browser that is already
+running. Close the connection and the session is gone. The fleet handles the
+rest: which worker serves you, what happens when one crashes, and when a
+browser gets recycled for a fresh one.
 
-1. You may not want to ship data to a third-party cloud.
-2. Vendor pricing scales linearly with sessions.
-3. Latency to a remote grid quickly adds up.
+## What you get
 
-`playwright-distributed` lets you run **your own grid** with Docker-simple deployment:
+- **One endpoint, every Playwright client.** The same `ws://` URL works from
+  Node.js, Python, Java, and .NET. Chromium, Firefox, and WebKit workers can
+  serve the same grid (`?browser=firefox`).
+- **No browser launch on the request path.** Workers keep browsers running;
+  connecting is a WebSocket dial, not a cold start.
+- **Isolated sessions.** Each connection is a fresh session with its own
+  contexts, cookies, and storage. Sessions never see each other.
+- **Self-healing capacity.** Sessions and workers are rows in PostgreSQL. If
+  a worker dies mid-session, the session is marked failed, the capacity is
+  reclaimed, and a restarted worker registers itself again — no operator in
+  the loop.
+- **Your infrastructure.** Data stays on your network. Scaling is adding
+  worker containers. There is no per-session bill.
 
-- Keep data on your infrastructure.
-- Pay only for the compute you actually run (add/remove workers on demand).
-- Share one endpoint across languages, teams and use-cases.
-
-
-## 🚀 Quick Start (Local)
+## Quick start
 
 ```bash
-# 1. Grab the repo
 git clone https://github.com/mbroton/playwright-distributed.git
 cd playwright-distributed
-
-# 2. Fire it up (server + 1 Chrome worker + Postgres)
 docker compose up -d
 ```
 
-Connect from your code:
+That starts the server, PostgreSQL, and one Chromium worker. Connect:
 
 ```js
 import { chromium } from 'playwright';
 
 const browser = await chromium.connect('ws://localhost:8080');
-const context = await browser.newContext();
-const page = await context.newPage();
+const page = await (await browser.newContext()).newPage();
 await page.goto('https://example.com');
 console.log(await page.title());
 await browser.close();
 ```
 
-> Want Firefox or WebKit? The quick-start stack runs one Chromium worker. Add a worker service with `BROWSER_TYPE=firefox` or `BROWSER_TYPE=webkit` (see `docker-compose.local.yaml` for a three-browser example), then append `/?browser=firefox` or `/?browser=webkit` to the WebSocket URL and use the matching Playwright client (`p.firefox.connect`, `p.webkit.connect`, etc.). Your client's Playwright major.minor version must match a registered worker's version.
+> Your client's Playwright `major.minor` version must match a registered
+> worker's version — the server routes each client to a version-matched
+> worker. For Firefox or WebKit, add a worker with `BROWSER_TYPE=firefox` or
+> `BROWSER_TYPE=webkit` (see `docker-compose.local.yaml` for a three-browser
+> stack) and connect with `firefox.connect('ws://host:8080/?browser=firefox')`.
 
-That's it! The same `ws://localhost:8080` endpoint works with any Playwright client (Node.js, Python, Java, .NET, etc.).
+More workers:
 
-
-## 🛠 Use Cases
-
-| Scenario | Benefit |
-|----------|---------|
-| **AI / LLM agents** | Give each agent an isolated browser with zero startup cost. |
-| **Web scraping / data collection** | Crawl at scale; add workers to raise throughput, remove them to save money. |
-| **CI end-to-end tests** | Parallelise test runs across many browsers and cut build times dramatically. |
-| **Synthetic monitoring** | Continuously exercise critical user journeys from multiple regions. |
-| **Shared “browser-as-a-service”** | One endpoint for your whole team – no more local browser zoo. |
-
-
-## ⚙️ Production Deployment
-
-Run the server, PostgreSQL, and workers as independent services (Docker/K8s). Checklist:
-
-- **Worker runtime** – workers are intended to run in the official Playwright Docker image. If you run `worker/` directly on a host instead, install matching Playwright browser binaries separately.
-- **Networking**
-  - Workers ➜ Server (register and heartbeat over HTTP)
-  - Server ➜ Workers (WebSocket dial)
-  - Server ➜ PostgreSQL (session, worker, and API-key records)
-- **Exposure** – keep PostgreSQL and workers private. The server supports bearer-token authentication with API keys. Zero keys means unauthenticated bootstrap mode; create the first key to lock it, and give that key to every worker (`WORKER_API_KEY`) and client in the same step. A locked server accepts clients with a query token: `chromium.connect('ws://host:8080/?token=pwd_...')`.
-- **Scaling** – add or remove workers freely; the server chooses the next worker according to the staggered-restart algorithm.
-
-See [`server/README.md`](server/README.md) for the full server environment, configuration, and authentication reference.
-
-### Security boundary
-
-The supported deployment model trusts every authenticated client that can reach the server, while allowing browsers to visit untrusted pages. In bootstrap mode, it trusts every client. The Compose files bind the server to `127.0.0.1`, keep PostgreSQL and workers on the internal network, and run workers as a non-root user with Playwright's Chromium sandbox profile.
-
-An API key grants full browser and control-plane access. Authentication does not encrypt plain `http://` or `ws://` traffic. Never publish the server directly to an untrusted network; use a TLS reverse proxy, VPN, or private service network. Container hardening reduces risk but is not a strong isolation boundary for hostile tenants or browser exploits. Use dedicated VMs or another stronger sandbox when that boundary is required. See [Playwright's Docker security guidance](https://playwright.dev/docs/docker).
-
-
-## 📚 Usage Examples
-
-### Node.js
-
-```js
-import { chromium, firefox, webkit } from 'playwright';
-
-// Chromium workers connect without any query parameters.
-const browser = await chromium.connect('ws://localhost:8080');
-const context = await browser.newContext();
-const page = await context.newPage();
-await page.goto('https://example.com');
-console.log(await page.title());
-await browser.close();
-
-// Target Firefox workers explicitly.
-const firefoxBrowser = await firefox.connect('ws://localhost:8080/?browser=firefox');
-await firefoxBrowser.close();
-
-// Or WebKit workers.
-const webkitBrowser = await webkit.connect('ws://localhost:8080/?browser=webkit');
-await webkitBrowser.close();
+```bash
+docker compose up -d --scale worker=5
 ```
 
-### Python
+## Who it's for
 
-```python
-from playwright.async_api import async_playwright
-import asyncio
+| You run | The grid gives you |
+|---------|--------------------|
+| AI agents | An isolated browser per agent, available the moment the agent asks. |
+| Scraping pipelines | Throughput that scales by adding workers, and shrinks to save money. |
+| CI end-to-end tests | Parallel browsers without installing them on every runner. |
+| Synthetic monitoring | Long-running checks on browsers that recycle themselves. |
+| A platform team | One internal browser endpoint instead of a browser install per team. |
 
-async def main():
-    async with async_playwright() as p:
-        # Chromium (default)
-        browser = await p.chromium.connect('ws://localhost:8080')
-        context = await browser.new_context()
-        page = await context.new_page()
-        await page.goto('https://example.com')
-        print(await page.title())
-        await browser.close()
+## How it compares
 
-        # Firefox
-        firefox = await p.firefox.connect('ws://localhost:8080/?browser=firefox')
-        await firefox.close()
+Honest version: these tools solve different problems, and each is better at
+its own.
 
-        # WebKit
-        webkit = await p.webkit.connect('ws://localhost:8080/?browser=webkit')
-        await webkit.close()
+| | playwright-distributed | Selenium Grid | Browserless | Hosted (Browserbase, Cloudflare, …) |
+|---|---|---|---|---|
+| Self-hosted | ✅ | ✅ | ✅ (source-available) | ❌ |
+| Multi-node fleet built in | ✅ | ✅ | ❌ one instance per node, bring your own load balancer | n/a |
+| Browsers stay warm between sessions | ✅ | ❌ launched per session | ❌ launched per session | varies |
+| Native Playwright protocol | ✅ | ❌ WebDriver | ✅ | ✅ |
+| Chromium + Firefox + WebKit | ✅ | ✅ | ✅ | mostly Chromium |
+| Automatic recovery of crashed capacity | ✅ | manual | manual | ✅ |
+| Session records + REST API | ✅ | ❌ | partial | ✅ |
+| Stealth, proxies, live session view | ❌ | ❌ | ✅ | ✅ |
+| Ops burden | yours | yours | yours | none |
 
-asyncio.run(main())
-```
+Pick Selenium Grid if your stack is WebDriver. Pick Browserless if you need
+per-session features like stealth and a live debugger on a single beefy
+machine. Pick a hosted service if you don't want to run infrastructure at
+all. Pick playwright-distributed if you want a Playwright-native fleet on
+your own machines with nobody metering your sessions.
 
-> Any Playwright-compatible client can connect to the same `ws://localhost:8080` endpoint.
-
-
-## 🏗 Architecture
+## Architecture
 
 ```mermaid
 flowchart TD
@@ -175,27 +131,102 @@ flowchart TD
     end
 ```
 
-### Session Handling
+- **The server** is one stateless Go binary: it authenticates clients, picks
+  a worker, relays the WebSocket bytes, and exposes a REST API for sessions,
+  workers, and capacity.
+- **Workers** are containers built on the official Playwright image. Each
+  keeps one browser running and serves up to `MAX_SLOTS` sessions as
+  isolated contexts.
+- **PostgreSQL** is the only state: sessions, workers, and API keys are
+  rows. A rescuer marks sessions of dead workers failed, so capacity
+  recovers without intervention.
+- **Recycling**: after a configurable number of sessions, a worker drains
+  and restarts with a fresh browser. Selection staggers this so the fleet
+  never drains at once.
 
-1. **One connection → One session** – every websocket is an isolated Playwright session; your client creates as many browser contexts inside it as it needs.
-2. **Session records** – every connection is a session record with an ID that you can inspect or delete through the REST API.
-3. **Concurrent sessions** – each worker serves several sessions in parallel.
-4. **Recycling** – the server counts lifetime sessions and returns a drain command in the worker's heartbeat response; the worker then restarts with a fresh browser.
-5. **Smart worker selection** – selection is staggered by lifetime-session count, then balanced toward the least loaded eligible worker.
+The repository also ships a reproducible benchmark suite
+([`bench/`](bench/README.md)) measuring time-to-first-page and session
+throughput, with the full methodology documented.
 
+<!-- TODO(cloud-bench): add the two-machine cloud numbers here before release. -->
 
-## 🗺️ Roadmap
+## Production deployment
 
-Here's what's planned for the near future:
+Run the server, PostgreSQL, and workers as independent services (Docker or
+Kubernetes):
 
-- **Documentation:** Create comprehensive guides for deployment (K8s, bare metal) and various use-cases.
-- **Testing:** Implement a full test suite to ensure stability and reliability.
+- **Networking**: workers → server (HTTP: register, heartbeat), server →
+  workers (WebSocket dial), server → PostgreSQL.
+- **Exposure**: keep PostgreSQL and workers private; expose only the server.
+- **Authentication**: a server with zero API keys runs in open bootstrap
+  mode. Create the first key
+  (`docker compose exec server server apikey create --name <name>`) and the
+  whole API locks; hand the key to every worker (`WORKER_API_KEY`) and
+  client (`chromium.connect('ws://host:8080/?token=pwd_...')`) in the same
+  step.
+- **Scaling**: add or remove worker containers freely; each registers itself
+  and starts serving.
 
+See [`server/README.md`](server/README.md) for the full configuration and
+API reference.
 
-## 🤝 Contributing
+### Security boundary
 
-Found a bug? Have an idea for improvement? PRs and issues are welcome!
+The grid trusts every authenticated client (in bootstrap mode: every client
+that can reach the server) while letting browsers visit untrusted pages. The
+compose files bind the server to `127.0.0.1`, keep PostgreSQL and workers on
+an internal network, and run workers as a non-root user with Playwright's
+Chromium sandbox profile.
 
-## 📜 License
+An API key grants full browser and control-plane access, and authentication
+does not encrypt plain `http://`/`ws://` traffic — put the server behind a
+TLS reverse proxy, VPN, or private network. Containers are hardening, not a
+strong isolation boundary against hostile tenants or browser exploits; use
+dedicated VMs where that boundary is required. See
+[Playwright's Docker security guidance](https://playwright.dev/docs/docker).
 
-This project is licensed under the [Apache-2.0 License](LICENSE).
+## Usage examples
+
+### Python
+
+```python
+from playwright.async_api import async_playwright
+import asyncio
+
+async def main():
+    async with async_playwright() as p:
+        browser = await p.chromium.connect('ws://localhost:8080')
+        context = await browser.new_context()
+        page = await context.new_page()
+        await page.goto('https://example.com')
+        print(await page.title())
+        await browser.close()
+
+asyncio.run(main())
+```
+
+### Sessions over REST
+
+Every connection is a session record you can inspect or terminate:
+
+```bash
+curl -s localhost:8080/v1/capacity               # slots and queue depth
+curl -s localhost:8080/v1/workers                # the fleet
+curl -s localhost:8080/v1/sessions/<id>          # inspect a session
+curl -X DELETE localhost:8080/v1/sessions/<id>   # kill a live session
+```
+
+## Roadmap
+
+- Persistent sessions: keep a browser session alive between connections and
+  reattach to it by ID.
+- Kubernetes deployment guide.
+- Prometheus metrics and a dashboard over the existing REST API.
+
+## Contributing
+
+Bugs, ideas, and pull requests are welcome — open an issue.
+
+## License
+
+[Apache-2.0](LICENSE).
