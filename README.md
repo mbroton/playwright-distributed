@@ -16,12 +16,15 @@
 
 ---
 
-The whole system is one server and as many workers as you want. A worker is
-a container that keeps a browser running — start it anywhere and it
-registers itself with the server. Your code talks only to the server: every
-connection gets its own isolated session on a browser that is already
-running. Which worker serves you, what happens when one dies, when a browser
-gets recycled — the grid's problem, not your code's.
+```
+your code ──── one WebSocket ────▶ server ──▶ worker · worker · worker
+                                             (warm browsers, self-registered)
+```
+
+Start workers anywhere — they register themselves. Every connection gets its
+own isolated session on a browser that is already running. Which worker
+serves you, what happens when one dies, when a browser gets recycled — the
+grid's problem, not your code's.
 
 ## Quick start
 
