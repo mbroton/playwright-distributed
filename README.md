@@ -173,10 +173,6 @@ flowchart TD
   and restarts with a fresh browser. Selection concentrates load on the
   longest-serving worker, so recycles tend to happen one worker at a time.
 
-The repository also ships a reproducible benchmark suite
-([`scripts/bench/`](scripts/bench/README.md)) measuring time-to-first-page and session
-throughput, with the full methodology documented.
-
 ## Production deployment
 
 Run the server, PostgreSQL, and workers as independent services (Docker or
