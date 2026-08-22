@@ -29,7 +29,7 @@ numbers.
 Requires Node.js 20+ and Docker.
 
 ```bash
-cd bench
+cd scripts/bench
 npm ci
 npx playwright install --with-deps chromium   # local baselines need a local browser
 ```
@@ -40,7 +40,7 @@ clients to version-matched workers).
 
 ## Run
 
-All commands run from `bench/`. Start every measured sequence from a fresh
+All commands run from `scripts/bench/`. Start every measured sequence from a fresh
 stack — `down -v` also removes postgres's anonymous volume, so no session
 rows or per-worker counters leak between sequences:
 

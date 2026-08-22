@@ -2,7 +2,7 @@
 
 /**
  * Ensures the Playwright package versions declared in worker/package.json and
- * bench/package.json match the Playwright image tag used in worker/Dockerfile.
+ * scripts/bench/package.json match the Playwright image tag used in worker/Dockerfile.
  */
 
 const { readFileSync } = require('node:fs');
@@ -14,7 +14,7 @@ const workerDir = resolve(rootDir, 'worker');
 const dockerfilePath = resolve(workerDir, 'Dockerfile');
 const packageJsonPaths = [
   resolve(workerDir, 'package.json'),
-  resolve(rootDir, 'bench', 'package.json'),
+  resolve(rootDir, 'scripts', 'bench', 'package.json'),
 ];
 
 function getDockerfileVersion() {

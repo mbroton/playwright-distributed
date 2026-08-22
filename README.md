@@ -174,7 +174,7 @@ flowchart TD
   longest-serving worker, so recycles tend to happen one worker at a time.
 
 The repository also ships a reproducible benchmark suite
-([`bench/`](bench/README.md)) measuring time-to-first-page and session
+([`scripts/bench/`](scripts/bench/README.md)) measuring time-to-first-page and session
 throughput, with the full methodology documented.
 
 ## Production deployment

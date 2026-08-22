@@ -18,7 +18,7 @@ services:
 
   server:
     build:
-      context: ../server
+      context: ../../server
       dockerfile: Dockerfile
     environment:
       - DATABASE_URL=postgres://pwd:pwd@postgres:5432/pwd?sslmode=disable
@@ -40,7 +40,7 @@ services:
 
   worker:
     build:
-      context: ../worker
+      context: ../../worker
       dockerfile: Dockerfile
     init: true
     # Scaling runs pin each worker to a fixed CPU budget so that adding
