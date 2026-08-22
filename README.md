@@ -251,7 +251,8 @@ curl -X DELETE localhost:8080/v1/sessions/<id>   # terminate it, even mid-use
 
 ## Contributing
 
-Bugs, ideas, and pull requests are welcome — open an issue.
+Bugs and ideas are welcome — open an issue. Code changes should start as an
+issue too, so the approach is agreed on before anyone writes it.
 
 ## License
 
