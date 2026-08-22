@@ -16,38 +16,12 @@
 
 ---
 
-```js
-import { chromium } from 'playwright';
-
-const browser = await chromium.connect('ws://your-grid:8080');
-// A fresh, isolated browser session. No launch, no install, no cleanup.
-```
-
 The whole system is one server and as many workers as you want. A worker is
 a container that keeps a browser running — start it anywhere and it
 registers itself with the server. Your code talks only to the server: every
 connection gets its own isolated session on a browser that is already
-running, and closing the connection cleans everything up. Which worker
-serves you, what happens when one dies, when a browser gets recycled — the
-grid's problem, not your code's.
-
-## What you get
-
-- **One endpoint, every Playwright client.** The same `ws://` URL works from
-  Node.js, Python, Java, and .NET. Chromium, Firefox, and WebKit workers can
-  serve the same grid (`?browser=firefox`).
-- **No browser launch on the request path.** Workers keep browsers running;
-  connecting is a WebSocket dial, not a cold start.
-- **Parallel sessions out of the box.** Every worker serves several sessions
-  at once; total capacity is workers × `MAX_SLOTS`.
-- **Isolated sessions.** Each connection is a fresh session with its own
-  contexts, cookies, and storage. Sessions never see each other.
-- **Self-healing capacity.** Sessions and workers are rows in PostgreSQL. If
-  a worker dies mid-session, the grid closes out its sessions and reclaims
-  the capacity, and workers register themselves on start — no operator in
-  the loop.
-- **Your infrastructure.** Data stays on your network. Scaling is adding
-  worker containers. There is no per-session bill.
+running. Which worker serves you, what happens when one dies, when a browser
+gets recycled — the grid's problem, not your code's.
 
 ## Quick start
 
@@ -88,6 +62,19 @@ For Firefox or WebKit, add a worker service with `BROWSER_TYPE=firefox` or
 `BROWSER_TYPE=webkit` (copy the `worker` service in the compose file; see
 `docker-compose.local.yaml` in the repository for a three-browser stack) and
 connect with `firefox.connect('ws://host:8080/?browser=firefox')`.
+
+## What you get
+
+- **One endpoint, every Playwright client.** The same `ws://` URL works from
+  Node.js, Python, Java, and .NET — Chromium, Firefox, and WebKit alike.
+- **No browser launch on the request path.** Connecting is a WebSocket dial,
+  not a cold start.
+- **Parallel, isolated sessions.** Each worker serves several sessions at
+  once; sessions never see each other.
+- **Self-healing capacity.** Workers register themselves and dead workers'
+  sessions are closed out automatically — no operator in the loop.
+- **Your infrastructure.** Data stays on your network. There is no
+  per-session bill.
 
 ## Who it's for
 
