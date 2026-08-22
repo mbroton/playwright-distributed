@@ -5,8 +5,8 @@
 <h1 align="center">playwright-distributed</h1>
 
 <p align="center">
-  <strong>A self-hosted fleet of browsers behind one endpoint.</strong><br/>
-  Run warm <a href="https://playwright.dev/">Playwright</a> browsers on your own machines. Connect from anywhere with one line of code.
+  <strong>Turn any Docker host into a browser grid.</strong><br/>
+  Warm <a href="https://playwright.dev/">Playwright</a> browsers behind one endpoint — connect from any language with one line.
 </p>
 
 <p align="center">
@@ -24,7 +24,7 @@ const browser = await chromium.connect('ws://your-grid:8080');
 ```
 
 Every connection gets its own isolated session on a browser that is already
-running. Close the connection and the session is gone. The fleet handles the
+running. Close the connection and the session is gone. The grid handles the
 rest: which worker serves you, what happens when one crashes, and when a
 browser gets recycled for a fresh one.
 
@@ -35,6 +35,8 @@ browser gets recycled for a fresh one.
   serve the same grid (`?browser=firefox`).
 - **No browser launch on the request path.** Workers keep browsers running;
   connecting is a WebSocket dial, not a cold start.
+- **Parallel sessions out of the box.** Every worker serves several sessions
+  at once; total capacity is workers × `MAX_SLOTS`.
 - **Isolated sessions.** Each connection is a fresh session with its own
   contexts, cookies, and storage. Sessions never see each other.
 - **Self-healing capacity.** Sessions and workers are rows in PostgreSQL. If
@@ -67,8 +69,8 @@ await browser.close();
 > worker's version — the server routes each client to a version-matched
 > worker.
 
-Grow the grid by adding workers — each serves up to `MAX_SLOTS` (default 5)
-concurrent sessions:
+Grow the grid by adding workers — each serves up to `MAX_SLOTS` (default 5,
+[how to tune it](worker/README.md)) concurrent sessions:
 
 ```bash
 docker compose up -d --scale worker=5    # 25 session slots
@@ -95,30 +97,46 @@ Self-hosted, Playwright-native options:
 
 | | playwright-distributed | Browserless | Aerokube Moon |
 |---|---|---|---|
-| License | Apache-2.0 | source-available, paid tiers | commercial, free up to 4 parallel browsers |
+| License | Apache-2.0 | SSPL-1.0 or commercial | commercial, free up to 4 parallel browsers |
 | Runs on | any Docker host | any Docker host | Kubernetes / OpenShift only |
-| Multi-node fleet built in | ✅ | ❌ one instance per node, bring your own load balancer | ✅ |
+| Parallel sessions | ✅ workers × `MAX_SLOTS` | ✅ per-instance cap | ✅ capped by license |
+| Scales beyond one machine | ✅ built in — start more workers on any host | ✅ more containers behind your own load balancer | ✅ |
 | Browsers stay warm between sessions | ✅ | ❌ launched per session | ❌ pod launched per session |
-| Native Playwright protocol | ✅ | ✅ | ✅ |
-| Chromium + Firefox + WebKit | ✅ | ✅ | ✅ |
 | Session records and control (REST) | ✅ with history | live only | live UI |
 
-Warm sharing is a trade, not a free win: sessions are isolated as browser
-contexts rather than processes (see [Security boundary](#security-boundary)),
-and launch flags cannot vary per session; worker recycling caps how long any
-browser lives.
+### Warm browsers vs a browser per session
 
-Related tools outside the table:
+The biggest practical difference in the table is how a session gets its
+browser. Browserless starts a fresh browser for every connection; here,
+sessions run on browsers that are already warm. Side by side on an AWS
+`m8i.xlarge` (4 vCPUs, 16 GB), same Playwright version, one worker vs one
+node:
 
-- **Hosted browser platforms** (Browserbase, Steel, Cloudflare Browser Run,
-  Browserless cloud, …): no infrastructure to run; the browsers live outside
-  your network, pricing is per session or usage, and Playwright mostly
-  connects to them over CDP (`connectOverCDP`) rather than its native
-  protocol.
-- **Selenium Grid**: multi-node and mature, but WebDriver-based; Playwright
-  connects to it only through an experimental Chrome/Edge bridge.
-- **AI agent frameworks** (Stagehand, browser-use, …): clients, not grids —
-  they drive a browser endpoint rather than provide one.
+| | playwright-distributed | Browserless |
+|---|---|---|
+| Get a browser, open a page, read it | **51 ms** | 217 ms |
+| CPU used per task | **0.09 s** | 0.70 s |
+| 1,000 such tasks, 5 at a time | **26 s** | 154 s |
+
+The saving repeats on every session, so it adds up fastest for services that
+open and close browsers all day.
+
+Sharing a warm browser is a trade. Each session is an isolated browser
+context — own cookies, storage, and cache — but it shares the browser
+process with the other sessions on its worker:
+
+- A separate process is a harder wall around a hostile page (see
+  [Security boundary](#security-boundary)).
+- Browser command-line flags are set when the worker starts, so one session
+  cannot bring its own — say, a browser extension — the way a
+  freshly-launched browser can. Per-session proxy, locale, viewport, and
+  cookies work as usual via contexts.
+- If the shared browser crashes, all sessions on that worker end with it;
+  the grid closes them out and the container restarts with a fresh browser.
+
+Many workloads never feel these limits: taking screenshots, scraping sites
+you chose, or running your own test suite needs neither a process wall
+around each page nor per-session browser flags.
 
 ## Architecture
 
@@ -158,8 +176,6 @@ flowchart TD
 The repository also ships a reproducible benchmark suite
 ([`bench/`](bench/README.md)) measuring time-to-first-page and session
 throughput, with the full methodology documented.
-
-<!-- TODO(cloud-bench): add the two-machine cloud numbers here before release. -->
 
 ## Production deployment
 
@@ -223,7 +239,7 @@ and terminate:
 
 ```bash
 curl -s localhost:8080/v1/capacity               # slots and queue depth
-curl -s localhost:8080/v1/workers                # the fleet
+curl -s localhost:8080/v1/workers                # the whole grid
 
 # Create a session, then connect to it by ID:
 curl -s -X POST localhost:8080/v1/sessions \
