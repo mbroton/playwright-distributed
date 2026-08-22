@@ -16,11 +16,6 @@
 
 ---
 
-```
-your code ──── one WebSocket ────▶ server ──▶ worker · worker · worker
-                                             (warm browsers, self-registered)
-```
-
 Start workers anywhere — they register themselves. Every connection gets its
 own isolated session on a browser that is already running. Which worker
 serves you, what happens when one dies, when a browser gets recycled — the
