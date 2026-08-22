@@ -8,7 +8,7 @@ API) and a TypeScript Playwright worker.
 - Preserve the server/worker boundary unless the task explicitly changes the
   architecture.
 - Keep `worker/package.json`'s `playwright-core` version and
-  `bench/package.json`'s `playwright` version equal to the Playwright image
+  `scripts/bench/package.json`'s `playwright` version equal to the Playwright image
   version in `worker/Dockerfile`. Update them together.
 - Worker code uses ES modules. Keep explicit `.js` suffixes in local imports.
 - Avoid unrelated refactors, dependencies, or repository-wide tooling changes.
