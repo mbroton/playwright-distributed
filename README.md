@@ -23,10 +23,13 @@ const browser = await chromium.connect('ws://your-grid:8080');
 // A fresh, isolated browser session. No launch, no install, no cleanup.
 ```
 
-Every connection gets its own isolated session on a browser that is already
-running. Close the connection and the session is gone. The grid handles the
-rest: which worker serves you, what happens when one crashes, and when a
-browser gets recycled for a fresh one.
+The whole system is one server and as many workers as you want. A worker is
+a container that keeps a browser running — start it anywhere and it
+registers itself with the server. Your code talks only to the server: every
+connection gets its own isolated session on a browser that is already
+running, and closing the connection cleans everything up. Which worker
+serves you, what happens when one dies, when a browser gets recycled — the
+grid's problem, not your code's.
 
 ## What you get
 
@@ -48,12 +51,16 @@ browser gets recycled for a fresh one.
 
 ## Quick start
 
+**1. Start the grid** — the server, PostgreSQL, and one Chromium worker:
+
 ```bash
 curl -LO https://raw.githubusercontent.com/mbroton/playwright-distributed/main/docker-compose.yaml
 docker compose up -d
 ```
 
-That starts the server, PostgreSQL, and one Chromium worker. Connect:
+**2. Connect** — you get a fresh session (in milliseconds — see
+[the comparison](#warm-browsers-vs-a-browser-per-session)); do your work
+and close, everything is cleaned up for the next client:
 
 ```js
 import { chromium } from 'playwright';
@@ -69,7 +76,8 @@ await browser.close();
 > worker's version — the server routes each client to a version-matched
 > worker.
 
-Grow the grid by adding workers — each serves up to `MAX_SLOTS` (default 5,
+That's the whole setup. When you need more browsers, add workers — each
+serves up to `MAX_SLOTS` (default 5,
 [how to tune it](worker/README.md)) concurrent sessions:
 
 ```bash
