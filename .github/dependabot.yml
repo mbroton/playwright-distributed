@@ -24,7 +24,7 @@ updates:
     patterns: ["playwright"]
     multi-ecosystem-group: playwright
   - package-ecosystem: npm
-    directory: "/bench"
+    directory: "/scripts/bench"
     patterns: ["playwright"]
     multi-ecosystem-group: playwright
   - package-ecosystem: gomod

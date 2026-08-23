@@ -29,7 +29,7 @@ jobs:
         run: node scripts/check-playwright-version.js
 
       - name: Verify bench lockfile and scripts
-        working-directory: bench
+        working-directory: scripts/bench
         run: |
           npm ci
           node --check lib.js
