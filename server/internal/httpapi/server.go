@@ -357,6 +357,16 @@ func registerWorkerRoutes(
 			MaxSlots          int32  `json:"max_slots" minimum:"1" maximum:"1024"`
 		}
 	}
+	type registeredWorker struct {
+		Worker
+		// Session budget for this worker (0 = unlimited). The worker drains
+		// itself once it has served this many sessions, without waiting for
+		// the heartbeat that would tell it to.
+		MaxLifetimeSessions int64 `json:"max_lifetime_sessions" doc:"Sessions this worker may serve before it must recycle; 0 means unlimited"`
+	}
+	type registerOutput struct {
+		Body registeredWorker
+	}
 	type workerOutput struct {
 		Body Worker
 	}
@@ -372,7 +382,7 @@ func registerWorkerRoutes(
 			http.StatusUnprocessableEntity,
 			http.StatusServiceUnavailable,
 		},
-	}, func(ctx context.Context, input *registerWorkerInput) (*workerOutput, error) {
+	}, func(ctx context.Context, input *registerWorkerInput) (*registerOutput, error) {
 		// The pattern cannot reject an empty hostname (ws://:3000, ws://user@).
 		if parsed, err := url.Parse(input.Body.Address); err != nil || parsed.Hostname() == "" {
 			return nil, huma.Error422UnprocessableEntity("address must include a hostname")
@@ -388,7 +398,14 @@ func registerWorkerRoutes(
 		if err != nil {
 			return nil, internalError(logger, "register worker", err)
 		}
-		return &workerOutput{Body: workerFromData(worker)}, nil
+		budget := int64(0)
+		if sessionScheduler != nil {
+			budget = sessionScheduler.MaxLifetimeSessions()
+		}
+		return &registerOutput{Body: registeredWorker{
+			Worker:              workerFromData(worker),
+			MaxLifetimeSessions: budget,
+		}}, nil
 	})
 
 	type heartbeatInput struct {

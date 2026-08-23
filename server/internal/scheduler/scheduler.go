@@ -111,6 +111,13 @@ func New(
 	}
 }
 
+// MaxLifetimeSessions is the per-worker session budget (0 disables recycling).
+// Workers receive it at registration so they can drain themselves the moment
+// the budget is spent instead of waiting for the next heartbeat.
+func (s *Scheduler) MaxLifetimeSessions() int64 {
+	return s.maxLifetimeSessions
+}
+
 func (s *Scheduler) Claim(ctx context.Context, request ClaimRequest) (data.Session, error) {
 	excluded := []uuid.UUID{}
 	for attempt := range maxClaimAttempts {

@@ -215,6 +215,53 @@ components:
         - playwright_version
         - max_slots
       type: object
+    RegisteredWorker:
+      additionalProperties: false
+      properties:
+        address:
+          type: string
+        browser:
+          type: string
+        created_at:
+          format: date-time
+          type: string
+        id:
+          format: uuid
+          type: string
+        last_heartbeat:
+          format: date-time
+          type: string
+        lifetime_sessions:
+          format: int64
+          type: integer
+        max_lifetime_sessions:
+          description: Sessions this worker may serve before it must recycle; 0 means unlimited
+          format: int64
+          type: integer
+        max_slots:
+          format: int32
+          type: integer
+        playwright_version:
+          type: string
+        status:
+          enum:
+            - available
+            - draining
+            - stalled
+            - shutting_down
+          type: string
+      required:
+        - max_lifetime_sessions
+        - id
+        - address
+        - browser
+        - playwright_version
+        - max_slots
+        - status
+        - last_heartbeat
+        - lifetime_sessions
+        - created_at
+      type: object
     Session:
       additionalProperties: false
       properties:
@@ -375,7 +422,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Worker"
+                $ref: "#/components/schemas/RegisteredWorker"
           description: Created
         "401":
           content:

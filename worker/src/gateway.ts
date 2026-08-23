@@ -39,7 +39,7 @@ export class SessionGateway extends EventEmitter<GatewayEvents> {
     private listenPort: number | null = null;
 
     constructor(
-        private readonly browserEndpoint: string,
+        private browserEndpoint: string,
         private readonly port: number,
         private readonly host = '0.0.0.0',
     ) {
@@ -47,6 +47,12 @@ export class SessionGateway extends EventEmitter<GatewayEvents> {
         this.server.on('upgrade', (request, socket, head) => {
             this.handleUpgrade(request, socket, head);
         });
+    }
+
+    // Recycling swaps the browser under a running gateway: new sessions dial
+    // the fresh endpoint, established sessions keep their upstream sockets.
+    setBrowserEndpoint(endpoint: string): void {
+        this.browserEndpoint = endpoint;
     }
 
     get activeSessionIds(): string[] {

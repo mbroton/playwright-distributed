@@ -6,6 +6,7 @@ import {
 } from './api/sdk.gen.js';
 import type {
     HeartbeatOutputBody,
+    RegisteredWorker,
     RegisterWorkerInputBody,
     SetStatusInputBody,
     Worker,
@@ -44,7 +45,7 @@ export class ControlPlaneClient {
         attempts = 30,
         retryDelayMs = 1000,
         signal?: AbortSignal,
-    ): Promise<Worker> {
+    ): Promise<RegisteredWorker> {
         let lastError: unknown;
         for (let attempt = 1; attempt <= attempts; attempt += 1) {
             signal?.throwIfAborted();
