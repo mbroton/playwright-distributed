@@ -139,7 +139,10 @@ export class BrowserWorker {
                 // Drain without waiting for the heartbeat to say so: until the
                 // recycled worker re-registers, the scheduler has already
                 // stopped selecting this one, so every waiting second is dead
-                // capacity on small deployments.
+                // capacity on small deployments. This counts gateway closes
+                // while the server counts claims, so a claim that never
+                // reaches the gateway leaves this counter short — the
+                // heartbeat's draining status stays as the backstop.
                 if (
                     this.currentState === 'running' &&
                     this.sessionBudget > 0 &&
@@ -247,9 +250,9 @@ export class BrowserWorker {
             // as a new worker with a zeroed session count.
             await this.bestEffortStatus('shutting_down');
             this.workerIdValue = null;
-            if (oldServer) {
-                await this.closeBrowserServer(oldServer);
-            }
+            // Launch the replacement before closing the old browser: sessions
+            // that dial the gateway mid-recycle reach a live endpoint instead
+            // of a dead one, at the cost of two browsers briefly coexisting.
             const browserServer = await this.launchBrowser(this.config);
             if (this.shutdownStarted) {
                 await this.closeBrowserServer(browserServer);
@@ -257,7 +260,13 @@ export class BrowserWorker {
             }
             this.attachBrowserServer(browserServer);
             this.gateway?.setBrowserEndpoint(browserServer.wsEndpoint());
+            if (oldServer && !(await this.closeBrowserServer(oldServer))) {
+                // A wedged browser we cannot stop would leak a process per
+                // recycle; exit instead so the supervisor reclaims them all.
+                throw new Error('old browser could not be stopped');
+            }
             await this.register();
+            this.servedSessions = 0;
             this.currentState = 'running';
             this.logger.info('Worker recycled with a fresh browser', { workerId: this.workerIdValue });
         } catch (error) {
@@ -303,7 +312,9 @@ export class BrowserWorker {
         this.shutdownController.signal.throwIfAborted();
         this.workerIdValue = worker.id;
         this.sessionBudget = worker.max_lifetime_sessions ?? 0;
-        this.servedSessions = 0;
+        // servedSessions is deliberately NOT reset here: a heartbeat-404
+        // re-registration keeps the same browser, so its spent budget must
+        // keep counting. Only a recycle (fresh browser) resets the counter.
         this.logger.info('Worker registered', { workerId: worker.id, sessionBudget: this.sessionBudget });
     }
 
@@ -330,12 +341,17 @@ export class BrowserWorker {
             this.armHeartbeat();
             return;
         }
+        // A recycle can replace the worker ID while this request is in
+        // flight; a response for the abandoned row must not be acted on —
+        // its 'draining'/'shutting_down' status would shut down the freshly
+        // recycled worker.
+        const workerId = this.workerIdValue;
         try {
             const response = await this.controlPlane.heartbeat(
-                this.workerIdValue,
+                workerId,
                 this.gateway.activeSessionIds,
             );
-            if (!this.heartbeatEnabled || this.currentState === 'shutting_down') {
+            if (!this.heartbeatEnabled || this.currentState === 'shutting_down' || this.workerIdValue !== workerId) {
                 return;
             }
             for (const sessionId of response.stale_session_ids) {
@@ -351,7 +367,9 @@ export class BrowserWorker {
                 await this.requestDrain('control plane');
             }
         } catch (error) {
-            if (error instanceof ControlPlaneError && error.status === 404) {
+            if (this.workerIdValue !== workerId) {
+                // Stale failure for a row a recycle already abandoned.
+            } else if (error instanceof ControlPlaneError && error.status === 404) {
                 this.logger.warn('Worker registration expired; registering again');
                 try {
                     await this.register();
@@ -417,7 +435,7 @@ export class BrowserWorker {
         ).then(() => undefined));
     }
 
-    private async closeBrowserServer(browserServer: BrowserServerLike): Promise<void> {
+    private async closeBrowserServer(browserServer: BrowserServerLike): Promise<boolean> {
         let timer: NodeJS.Timeout | null = null;
         try {
             await Promise.race([
@@ -426,9 +444,10 @@ export class BrowserWorker {
                     timer = setTimeout(() => reject(new Error('browser close timed out')), this.browserCloseTimeoutMs);
                 }),
             ]);
+            return true;
         } catch (error) {
             this.logger.warn('Browser did not close cleanly; killing it', { error: formatError(error) });
-            await this.runCleanup('kill browser server', () => browserServer.kill());
+            return this.runCleanup('kill browser server', () => browserServer.kill());
         } finally {
             if (timer) {
                 clearTimeout(timer);
@@ -436,7 +455,7 @@ export class BrowserWorker {
         }
     }
 
-    private async runCleanup(operation: string, cleanup: () => Promise<void>): Promise<void> {
+    private async runCleanup(operation: string, cleanup: () => Promise<void>): Promise<boolean> {
         let timer: NodeJS.Timeout | null = null;
         try {
             await Promise.race([
@@ -448,8 +467,10 @@ export class BrowserWorker {
                     );
                 }),
             ]);
+            return true;
         } catch (error) {
             this.logger.warn(`Failed to ${operation}`, { error: formatError(error) });
+            return false;
         } finally {
             if (timer) {
                 clearTimeout(timer);

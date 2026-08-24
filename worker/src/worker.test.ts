@@ -326,6 +326,95 @@ test('the worker recycles itself once its session budget is spent', async () => 
     await worker.shutdown(0);
 });
 
+test('a stale heartbeat response cannot shut down the recycled worker', async () => {
+    let heartbeats = 0;
+    let releaseFirstHeartbeat!: () => void;
+    const firstHeartbeatGate = new Promise<void>(resolve => {
+        releaseFirstHeartbeat = resolve;
+    });
+    let registrations = 0;
+    const controlPlane: ControlPlaneLike = {
+        register: async () => {
+            registrations += 1;
+            return { id: `worker-${registrations}`, max_lifetime_sessions: 0 };
+        },
+        heartbeat: async () => {
+            heartbeats += 1;
+            if (heartbeats === 1) {
+                // Held in flight across the recycle, then answered for the
+                // old, already-abandoned worker row.
+                await firstHeartbeatGate;
+                return { status: 'shutting_down' as const, stale_session_ids: [] };
+            }
+            return { status: 'available' as const, stale_session_ids: [] };
+        },
+        setStatus: async () => undefined,
+    };
+    const worker = createInjectedWorker(controlPlane, new FakeGateway(), 5_000);
+    await worker.start();
+    await waitFor(() => heartbeats >= 1);
+
+    await worker.requestDrain('control plane'); // recycles: registers worker-2
+    assert.equal(registrations, 2);
+    releaseFirstHeartbeat();
+    await delay(50);
+
+    assert.equal(worker.state, 'running');
+    assert.equal(worker.workerId, 'worker-2');
+    await worker.shutdown(0);
+});
+
+test('heartbeat-404 re-registration keeps the spent session budget', async () => {
+    let registrations = 0;
+    let heartbeats = 0;
+    const controlPlane: ControlPlaneLike = {
+        register: async () => {
+            registrations += 1;
+            return { id: `worker-${registrations}`, max_lifetime_sessions: 2 };
+        },
+        heartbeat: async () => {
+            heartbeats += 1;
+            if (heartbeats === 1) {
+                throw new ControlPlaneError('worker not found', 404);
+            }
+            return { status: 'available' as const, stale_session_ids: [] };
+        },
+        setStatus: async () => undefined,
+    };
+    const gateway = new FakeGateway([activeId, secondId]);
+    const worker = createInjectedWorker(controlPlane, gateway, 5_000);
+    await worker.start();
+
+    gateway.closeSession(activeId); // budget 1 of 2 spent
+    await waitFor(() => registrations === 2); // 404 re-registers, same browser
+
+    gateway.closeSession(secondId); // 2 of 2 — must drain despite re-registration
+    await waitFor(() => registrations === 3);
+    assert.equal(worker.state, 'running');
+    await worker.shutdown(0);
+});
+
+test('a recycle that cannot stop the old browser exits for a supervisor restart', async () => {
+    const controlPlane = new FakeControlPlane();
+    const wedged = new WedgedBrowser();
+    let launches = 0;
+    const worker = new BrowserWorker(testConfig(5_000), {
+        controlPlane,
+        createGateway: () => new FakeGateway(),
+        launchBrowser: async () => {
+            launches += 1;
+            return launches === 1 ? wedged : new FakeBrowser();
+        },
+        exit: () => undefined,
+        browserCloseTimeoutMs: 20,
+        cleanupTimeoutMs: 20,
+    });
+    await worker.start();
+
+    await worker.requestDrain('control plane');
+    assert.equal(await worker.waitForExit(), 1);
+});
+
 test('a failed browser relaunch exits for a supervisor restart', async () => {
     const controlPlane = new FakeControlPlane();
     let launches = 0;
@@ -389,6 +478,13 @@ test('drain timeout swaps the browser under a live session on the real gateway',
     assert.equal(browsers.length, 2);
     assert.equal(gateway.activeConnectionCount, 0);
     client.terminate();
+
+    // A post-swap session must reach the replacement browser end to end.
+    const postSwap = await connectWebSocket(`ws://127.0.0.1:${gateway.listeningPort}`, secondId);
+    const echoed = new Promise<string>(resolve => postSwap.once('message', data => resolve(String(data))));
+    postSwap.send('after-swap');
+    assert.equal(await bounded(echoed, 1_000), 'after-swap');
+    postSwap.terminate();
 });
 
 test('startup does not resume after shutdown wins a registration race', async () => {
@@ -538,6 +634,21 @@ class FakeBrowser extends EventEmitter implements BrowserServerLike {
     async kill(): Promise<void> {
         this.killCalled = true;
         this.emit('close');
+    }
+}
+
+// A browser that neither closes nor dies: close() hangs, kill() rejects.
+class WedgedBrowser extends EventEmitter implements BrowserServerLike {
+    wsEndpoint(): string {
+        return 'ws://127.0.0.1:12345/wedged-browser';
+    }
+
+    async close(): Promise<void> {
+        await new Promise<void>(() => undefined);
+    }
+
+    async kill(): Promise<void> {
+        throw new Error('kill failed');
     }
 }
 
