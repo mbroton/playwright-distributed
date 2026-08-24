@@ -245,28 +245,38 @@ export class BrowserWorker {
         }
         const oldServer = this.browserServer;
         this.browserServer = null;
+        // Abandon the old worker ID before the first await: a heartbeat
+        // response landing mid-recycle must fail the identity guard, or its
+        // 'draining'/'shutting_down' status would shut this worker down.
+        const oldWorkerId = this.workerIdValue;
+        this.workerIdValue = null;
         try {
             // Close out the old worker row first; the fresh browser registers
             // as a new worker with a zeroed session count.
-            await this.bestEffortStatus('shutting_down');
-            this.workerIdValue = null;
+            await this.bestEffortStatus('shutting_down', oldWorkerId);
             // Launch the replacement before closing the old browser: sessions
             // that dial the gateway mid-recycle reach a live endpoint instead
             // of a dead one, at the cost of two browsers briefly coexisting.
             const browserServer = await this.launchBrowser(this.config);
             if (this.shutdownStarted) {
                 await this.closeBrowserServer(browserServer);
+                if (oldServer) {
+                    await this.closeBrowserServer(oldServer);
+                }
                 return;
             }
             this.attachBrowserServer(browserServer);
             this.gateway?.setBrowserEndpoint(browserServer.wsEndpoint());
+            // Reset at the swap, not after register(): sessions served by the
+            // replacement browser while the old one is still closing must
+            // count toward the new budget, not be erased by a later reset.
+            this.servedSessions = 0;
             if (oldServer && !(await this.closeBrowserServer(oldServer))) {
                 // A wedged browser we cannot stop would leak a process per
                 // recycle; exit instead so the supervisor reclaims them all.
                 throw new Error('old browser could not be stopped');
             }
             await this.register();
-            this.servedSessions = 0;
             this.currentState = 'running';
             this.logger.info('Worker recycled with a fresh browser', { workerId: this.workerIdValue });
         } catch (error) {
@@ -424,12 +434,15 @@ export class BrowserWorker {
         }
     }
 
-    private async bestEffortStatus(status: 'draining' | 'shutting_down'): Promise<void> {
-        if (!this.workerIdValue) {
+    private async bestEffortStatus(
+        status: 'draining' | 'shutting_down',
+        workerId: string | null = this.workerIdValue,
+    ): Promise<void> {
+        if (!workerId) {
             return;
         }
         await this.runCleanup(`set worker status to ${status}`, () => this.controlPlane.setStatus(
-            this.workerIdValue!,
+            workerId,
             status,
             AbortSignal.timeout(2_000),
         ).then(() => undefined));

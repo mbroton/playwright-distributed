@@ -364,6 +364,122 @@ test('a stale heartbeat response cannot shut down the recycled worker', async ()
     await worker.shutdown(0);
 });
 
+test('a heartbeat resolving during the recycle status handoff is discarded', async () => {
+    let releaseHeartbeat!: () => void;
+    const heartbeatGate = new Promise<void>(resolve => {
+        releaseHeartbeat = resolve;
+    });
+    let heartbeats = 0;
+    let registrations = 0;
+    const controlPlane: ControlPlaneLike = {
+        register: async () => {
+            registrations += 1;
+            return { id: `worker-${registrations}`, max_lifetime_sessions: 0 };
+        },
+        heartbeat: async () => {
+            heartbeats += 1;
+            if (heartbeats === 1) {
+                await heartbeatGate;
+                return { status: 'draining' as const, stale_session_ids: [] };
+            }
+            return { status: 'available' as const, stale_session_ids: [] };
+        },
+        setStatus: async (_workerId, status) => {
+            if (status === 'shutting_down') {
+                // Resolve the held heartbeat while runRecycle awaits this
+                // very call — the response lands inside the handoff window.
+                releaseHeartbeat();
+                await delay(30);
+            }
+        },
+    };
+    const worker = createInjectedWorker(controlPlane, new FakeGateway(), 5_000);
+    await worker.start();
+    await waitFor(() => heartbeats >= 1);
+
+    await worker.requestDrain('control plane');
+    await delay(50);
+
+    assert.equal(worker.state, 'running');
+    assert.equal(registrations, 2);
+    await worker.shutdown(0);
+});
+
+test('a stale heartbeat 404 does not register a duplicate worker', async () => {
+    let releaseHeartbeat!: () => void;
+    const heartbeatGate = new Promise<void>(resolve => {
+        releaseHeartbeat = resolve;
+    });
+    let heartbeats = 0;
+    let registrations = 0;
+    const controlPlane: ControlPlaneLike = {
+        register: async () => {
+            registrations += 1;
+            return { id: `worker-${registrations}`, max_lifetime_sessions: 0 };
+        },
+        heartbeat: async () => {
+            heartbeats += 1;
+            if (heartbeats === 1) {
+                await heartbeatGate;
+                throw new ControlPlaneError('worker not found', 404);
+            }
+            return { status: 'available' as const, stale_session_ids: [] };
+        },
+        setStatus: async () => undefined,
+    };
+    const worker = createInjectedWorker(controlPlane, new FakeGateway(), 5_000);
+    await worker.start();
+    await waitFor(() => heartbeats >= 1);
+
+    await worker.requestDrain('control plane'); // recycles: registers worker-2
+    assert.equal(registrations, 2);
+    releaseHeartbeat(); // the old row's 404 lands now — must not re-register
+    await delay(50);
+
+    assert.equal(registrations, 2);
+    assert.equal(worker.workerId, 'worker-2');
+    await worker.shutdown(0);
+});
+
+test('the replacement endpoint is swapped before the old browser closes', async () => {
+    const events: string[] = [];
+    class LoggingGateway extends FakeGateway {
+        override setBrowserEndpoint(endpoint: string): void {
+            events.push(`swap:${endpoint}`);
+            super.setBrowserEndpoint(endpoint);
+        }
+    }
+    class LoggingBrowser extends FakeBrowser {
+        constructor(private readonly name: string) {
+            super();
+        }
+
+        override wsEndpoint(): string {
+            return `ws://127.0.0.1:12345/${this.name}`;
+        }
+
+        override async close(): Promise<void> {
+            events.push(`close:${this.name}`);
+            await super.close();
+        }
+    }
+    let launches = 0;
+    const worker = new BrowserWorker(testConfig(5_000), {
+        controlPlane: new FakeControlPlane(),
+        createGateway: () => new LoggingGateway(),
+        launchBrowser: async () => {
+            launches += 1;
+            return new LoggingBrowser(`browser-${launches}`);
+        },
+        exit: () => undefined,
+    });
+    await worker.start();
+
+    await worker.requestDrain('control plane');
+    assert.deepEqual(events, ['swap:ws://127.0.0.1:12345/browser-2', 'close:browser-1']);
+    await worker.shutdown(0);
+});
+
 test('heartbeat-404 re-registration keeps the spent session budget', async () => {
     let registrations = 0;
     let heartbeats = 0;
