@@ -21,6 +21,7 @@ export interface GatewayLike {
     readonly activeConnectionCount: number;
     readonly listeningPort: number | null;
     start(): Promise<void>;
+    setBrowserEndpoint(endpoint: string): void;
     closeSession(sessionId: string, code?: number, reason?: string): void;
     shutdown(): Promise<void>;
     on(event: 'sessionClose', listener: (sessionId: string) => void): this;
@@ -32,7 +33,7 @@ export interface ControlPlaneLike {
         attempts?: number,
         retryDelayMs?: number,
         signal?: AbortSignal,
-    ): Promise<{ id: string }>;
+    ): Promise<{ id: string; max_lifetime_sessions?: number }>;
     heartbeat(workerId: string, activeSessionIds: string[]): Promise<{
         status: WorkerStatus;
         stale_session_ids: string[];
@@ -65,6 +66,10 @@ export class BrowserWorker {
     private heartbeatTimer: NodeJS.Timeout | null = null;
     private heartbeatEnabled = false;
     private drainTimer: NodeJS.Timeout | null = null;
+    private recycleOnDrained = false;
+    private recyclePromise: Promise<void> | null = null;
+    private sessionBudget = 0;
+    private servedSessions = 0;
     private shutdownPromise: Promise<void> | null = null;
     private readonly shutdownController = new AbortController();
     private readonly controlPlane: ControlPlaneLike;
@@ -122,18 +127,28 @@ export class BrowserWorker {
                 await this.closeBrowserServer(browserServer);
                 return;
             }
-            this.browserServer = browserServer;
-            this.browserServer.once('close', () => {
-                if (this.currentState !== 'shutting_down') {
-                    this.logger.error('Browser server exited unexpectedly');
-                    void this.fatal(new Error('browser server exited unexpectedly'));
-                }
-            });
+            this.attachBrowserServer(browserServer);
 
-            this.gateway = this.createGateway(this.browserServer.wsEndpoint(), this.config.gateway.port);
+            this.gateway = this.createGateway(browserServer.wsEndpoint(), this.config.gateway.port);
             this.gateway.on('sessionClose', () => {
+                this.servedSessions += 1;
                 if (this.currentState === 'draining' && this.gateway?.activeConnectionCount === 0) {
-                    void this.shutdown(0);
+                    void this.drainCompleted();
+                    return;
+                }
+                // Drain without waiting for the heartbeat to say so: until the
+                // recycled worker re-registers, the scheduler has already
+                // stopped selecting this one, so every waiting second is dead
+                // capacity on small deployments. This counts gateway closes
+                // while the server counts claims, so a claim that never
+                // reaches the gateway leaves this counter short — the
+                // heartbeat's draining status stays as the backstop.
+                if (
+                    this.currentState === 'running' &&
+                    this.sessionBudget > 0 &&
+                    this.servedSessions >= this.sessionBudget
+                ) {
+                    void this.requestDrain('session budget spent');
                 }
             });
             await this.gateway.start();
@@ -175,18 +190,112 @@ export class BrowserWorker {
         }
 
         this.currentState = 'draining';
-        this.logger.info('Worker is draining', { reason });
+        // A control-plane drain means "give me a fresh browser" (the shipped
+        // compose files restart exited workers anyway). Recycling in place
+        // avoids the supervisor's crash-loop backoff, which grows into tens
+        // of seconds of downtime when sessions turn over quickly. A signal
+        // drain is a real stop request and still exits.
+        this.recycleOnDrained = !fromSignal;
+        this.logger.info('Worker is draining', { reason, recycleOnDrained: this.recycleOnDrained });
         if (fromSignal && this.workerIdValue) {
             await this.bestEffortStatus('draining');
         }
         if (!this.gateway || this.gateway.activeConnectionCount === 0) {
-            await this.shutdown(0);
+            await this.drainCompleted();
             return;
         }
         this.drainTimer = setTimeout(() => {
-            this.logger.warn('Drain timeout expired; forcing shutdown');
-            void this.shutdown(0);
+            this.logger.warn('Drain timeout expired; forcing the drain to complete');
+            void this.drainCompleted();
         }, this.config.lifecycle.drainTimeoutMs);
+    }
+
+    private async drainCompleted(): Promise<void> {
+        if (this.currentState !== 'draining') {
+            return;
+        }
+        if (this.drainTimer) {
+            clearTimeout(this.drainTimer);
+            this.drainTimer = null;
+        }
+        if (this.recycleOnDrained) {
+            await this.recycle();
+        } else {
+            await this.shutdown(0);
+        }
+    }
+
+    private recycle(): Promise<void> {
+        this.recyclePromise ??= this.runRecycle().finally(() => {
+            this.recyclePromise = null;
+        });
+        return this.recyclePromise;
+    }
+
+    private async runRecycle(): Promise<void> {
+        if (this.shutdownStarted) {
+            return;
+        }
+        this.currentState = 'starting';
+        this.logger.info('Recycling the browser in place');
+        // A forced recycle (drain timeout) can still have live sessions;
+        // close them first so the old browser shuts down promptly.
+        for (const sessionId of this.gateway?.activeSessionIds ?? []) {
+            this.gateway?.closeSession(sessionId, 1001, 'worker is recycling');
+        }
+        const oldServer = this.browserServer;
+        this.browserServer = null;
+        // Abandon the old worker ID before the first await: a heartbeat
+        // response landing mid-recycle must fail the identity guard, or its
+        // 'draining'/'shutting_down' status would shut this worker down.
+        const oldWorkerId = this.workerIdValue;
+        this.workerIdValue = null;
+        try {
+            // Close out the old worker row first; the fresh browser registers
+            // as a new worker with a zeroed session count.
+            await this.bestEffortStatus('shutting_down', oldWorkerId);
+            // Launch the replacement before closing the old browser: sessions
+            // that dial the gateway mid-recycle reach a live endpoint instead
+            // of a dead one, at the cost of two browsers briefly coexisting.
+            const browserServer = await this.launchBrowser(this.config);
+            if (this.shutdownStarted) {
+                await this.closeBrowserServer(browserServer);
+                if (oldServer) {
+                    await this.closeBrowserServer(oldServer);
+                }
+                return;
+            }
+            this.attachBrowserServer(browserServer);
+            this.gateway?.setBrowserEndpoint(browserServer.wsEndpoint());
+            // Reset at the swap, not after register(): sessions served by the
+            // replacement browser while the old one is still closing must
+            // count toward the new budget, not be erased by a later reset.
+            this.servedSessions = 0;
+            if (oldServer && !(await this.closeBrowserServer(oldServer))) {
+                // A wedged browser we cannot stop would leak a process per
+                // recycle; exit instead so the supervisor reclaims them all.
+                throw new Error('old browser could not be stopped');
+            }
+            await this.register();
+            this.currentState = 'running';
+            this.logger.info('Worker recycled with a fresh browser', { workerId: this.workerIdValue });
+        } catch (error) {
+            if (this.shutdownStarted) {
+                return;
+            }
+            this.logger.error('Recycle failed; exiting for a supervisor restart', { error: formatError(error) });
+            await this.shutdown(1);
+        }
+    }
+
+    private attachBrowserServer(browserServer: BrowserServerLike): void {
+        this.browserServer = browserServer;
+        browserServer.once('close', () => {
+            if (this.browserServer === browserServer && this.currentState !== 'shutting_down') {
+                this.logger.error('Browser server exited unexpectedly');
+                void this.fatal(new Error('browser server exited unexpectedly'));
+            }
+        });
     }
 
     async fatal(error: unknown): Promise<void> {
@@ -212,7 +321,11 @@ export class BrowserWorker {
         );
         this.shutdownController.signal.throwIfAborted();
         this.workerIdValue = worker.id;
-        this.logger.info('Worker registered', { workerId: worker.id });
+        this.sessionBudget = worker.max_lifetime_sessions ?? 0;
+        // servedSessions is deliberately NOT reset here: a heartbeat-404
+        // re-registration keeps the same browser, so its spent budget must
+        // keep counting. Only a recycle (fresh browser) resets the counter.
+        this.logger.info('Worker registered', { workerId: worker.id, sessionBudget: this.sessionBudget });
     }
 
     private registration(): WorkerRegistration {
@@ -238,12 +351,17 @@ export class BrowserWorker {
             this.armHeartbeat();
             return;
         }
+        // A recycle can replace the worker ID while this request is in
+        // flight; a response for the abandoned row must not be acted on —
+        // its 'draining'/'shutting_down' status would shut down the freshly
+        // recycled worker.
+        const workerId = this.workerIdValue;
         try {
             const response = await this.controlPlane.heartbeat(
-                this.workerIdValue,
+                workerId,
                 this.gateway.activeSessionIds,
             );
-            if (!this.heartbeatEnabled || this.currentState === 'shutting_down') {
+            if (!this.heartbeatEnabled || this.currentState === 'shutting_down' || this.workerIdValue !== workerId) {
                 return;
             }
             for (const sessionId of response.stale_session_ids) {
@@ -259,7 +377,9 @@ export class BrowserWorker {
                 await this.requestDrain('control plane');
             }
         } catch (error) {
-            if (error instanceof ControlPlaneError && error.status === 404) {
+            if (this.workerIdValue !== workerId) {
+                // Stale failure for a row a recycle already abandoned.
+            } else if (error instanceof ControlPlaneError && error.status === 404) {
                 this.logger.warn('Worker registration expired; registering again');
                 try {
                     await this.register();
@@ -314,18 +434,21 @@ export class BrowserWorker {
         }
     }
 
-    private async bestEffortStatus(status: 'draining' | 'shutting_down'): Promise<void> {
-        if (!this.workerIdValue) {
+    private async bestEffortStatus(
+        status: 'draining' | 'shutting_down',
+        workerId: string | null = this.workerIdValue,
+    ): Promise<void> {
+        if (!workerId) {
             return;
         }
         await this.runCleanup(`set worker status to ${status}`, () => this.controlPlane.setStatus(
-            this.workerIdValue!,
+            workerId,
             status,
             AbortSignal.timeout(2_000),
         ).then(() => undefined));
     }
 
-    private async closeBrowserServer(browserServer: BrowserServerLike): Promise<void> {
+    private async closeBrowserServer(browserServer: BrowserServerLike): Promise<boolean> {
         let timer: NodeJS.Timeout | null = null;
         try {
             await Promise.race([
@@ -334,9 +457,10 @@ export class BrowserWorker {
                     timer = setTimeout(() => reject(new Error('browser close timed out')), this.browserCloseTimeoutMs);
                 }),
             ]);
+            return true;
         } catch (error) {
             this.logger.warn('Browser did not close cleanly; killing it', { error: formatError(error) });
-            await this.runCleanup('kill browser server', () => browserServer.kill());
+            return this.runCleanup('kill browser server', () => browserServer.kill());
         } finally {
             if (timer) {
                 clearTimeout(timer);
@@ -344,7 +468,7 @@ export class BrowserWorker {
         }
     }
 
-    private async runCleanup(operation: string, cleanup: () => Promise<void>): Promise<void> {
+    private async runCleanup(operation: string, cleanup: () => Promise<void>): Promise<boolean> {
         let timer: NodeJS.Timeout | null = null;
         try {
             await Promise.race([
@@ -356,8 +480,10 @@ export class BrowserWorker {
                     );
                 }),
             ]);
+            return true;
         } catch (error) {
             this.logger.warn(`Failed to ${operation}`, { error: formatError(error) });
+            return false;
         } finally {
             if (timer) {
                 clearTimeout(timer);

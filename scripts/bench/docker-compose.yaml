@@ -47,7 +47,7 @@ services:
     # workers simulates adding fixed-size nodes (see README.md). 0 = no limit.
     cpus: ${WORKER_CPUS:-0}
     security_opt:
-      - seccomp=../worker/seccomp_profile.json
+      - seccomp=../../worker/seccomp_profile.json
     shm_size: "1gb"
     stop_grace_period: 60s
     environment:

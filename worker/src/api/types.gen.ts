@@ -112,6 +112,22 @@ export type RegisterWorkerInputBody = {
     playwright_version: string;
 };
 
+export type RegisteredWorker = {
+    address: string;
+    browser: string;
+    created_at: string;
+    id: string;
+    last_heartbeat: string;
+    lifetime_sessions: number;
+    /**
+     * Sessions this worker may serve before it must recycle; 0 means unlimited
+     */
+    max_lifetime_sessions: number;
+    max_slots: number;
+    playwright_version: string;
+    status: 'available' | 'draining' | 'stalled' | 'shutting_down';
+};
+
 export type Session = {
     browser: string;
     connect_metadata: {
@@ -204,7 +220,7 @@ export type RegisterWorkerResponses = {
     /**
      * Created
      */
-    201: Worker;
+    201: RegisteredWorker;
 };
 
 export type RegisterWorkerResponse = RegisterWorkerResponses[keyof RegisterWorkerResponses];
