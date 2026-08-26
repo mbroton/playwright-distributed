@@ -667,10 +667,103 @@ func TestRelay_VersionRoutingAndDialFailure(t *testing.T) {
 		}
 	})
 
-	t.Run("dial failure after start happens before upgrade and frees capacity", func(t *testing.T) {
+	t.Run("dial failure retries on a compatible worker", func(t *testing.T) {
+		truncateTables(t, pool)
+		var failedDials atomic.Int32
+		failedServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			failedDials.Add(1)
+			http.Error(w, "not a WebSocket worker", http.StatusServiceUnavailable)
+		}))
+		t.Cleanup(failedServer.Close)
+		failedWorkerID := insertRelayWorker(
+			t,
+			queries,
+			wsURL(failedServer.URL),
+			"chromium",
+			"1.62.1",
+			1,
+		)
+		if _, err := pool.Exec(
+			t.Context(),
+			"UPDATE workers SET lifetime_sessions = 20 WHERE id = $1",
+			failedWorkerID,
+		); err != nil {
+			t.Fatalf("aging failed worker: %v", err)
+		}
+		replacement := newEchoWorker(t)
+		replacementWorkerID := insertRelayWorker(
+			t,
+			queries,
+			replacement.wsURL(),
+			"chromium",
+			"1.62.2",
+			1,
+		)
+		incompatible := newEchoWorker(t)
+		incompatibleWorkerID := insertRelayWorker(
+			t,
+			queries,
+			incompatible.wsURL(),
+			"chromium",
+			"1.63.0",
+			1,
+		)
+		if _, err := pool.Exec(
+			t.Context(),
+			"UPDATE workers SET lifetime_sessions = 50 WHERE id = $1",
+			incompatibleWorkerID,
+		); err != nil {
+			t.Fatalf("aging incompatible worker: %v", err)
+		}
+		logger := testLogger(io.Discard)
+		manager := newTestRelayManager(queries, logger, relay.Options{})
+		server := newRelayHTTPServer(t, pool, NoAuthAuthenticator{}, manager, logger, 0)
+
+		client, response, err := websocket.DefaultDialer.Dial(
+			wsURL(server.URL)+"/",
+			http.Header{"User-Agent": []string{"Playwright/1.62.1 (linux)"}},
+		)
+		if err != nil || response == nil || response.StatusCode != http.StatusSwitchingProtocols {
+			t.Fatalf("retried relay response = %v, error = %v; want 101", response, err)
+		}
+		defer client.Close()
+		assertMessage(t, client, []byte("worker-ready"))
+
+		session := latestSession(t, pool, queries)
+		if session.WorkerID != replacementWorkerID || session.WorkerAddress != replacement.wsURL() ||
+			session.PlaywrightVersion != "1.62.2" || session.Status != data.SessionStatusRunning {
+			t.Fatalf("retried session = %+v, want running session on compatible replacement", session)
+		}
+		failedWorker, err := queries.GetWorker(t.Context(), failedWorkerID)
+		if err != nil {
+			t.Fatalf("GetWorker() for failed worker returned an error: %v", err)
+		}
+		if failedWorker.Status != data.WorkerStatusStalled {
+			t.Fatalf("failed worker status = %q, want %q", failedWorker.Status, data.WorkerStatusStalled)
+		}
+		replacementWorker, err := queries.GetWorker(t.Context(), replacementWorkerID)
+		if err != nil {
+			t.Fatalf("GetWorker() for replacement returned an error: %v", err)
+		}
+		if replacementWorker.LifetimeSessions != 1 {
+			t.Fatalf("replacement lifetime sessions = %d, want 1", replacementWorker.LifetimeSessions)
+		}
+		if failedDials.Load() != 1 || replacement.upgrades.Load() != 1 || incompatible.upgrades.Load() != 0 {
+			t.Fatalf(
+				"dial attempts = failed:%d replacement:%d incompatible:%d, want 1/1/0",
+				failedDials.Load(),
+				replacement.upgrades.Load(),
+				incompatible.upgrades.Load(),
+			)
+		}
+		closeWebSocket(t, client, websocket.CloseNormalClosure, "done")
+		_ = receiveClose(t, replacement, session.ID)
+	})
+
+	t.Run("dial failure with no replacement returns bad gateway", func(t *testing.T) {
 		truncateTables(t, pool)
 		workerURL := newSlowHandshakeWorker(t)
-		insertRelayWorker(t, queries, workerURL, "chromium", "1.62.1", 1)
+		workerID := insertRelayWorker(t, queries, workerURL, "chromium", "1.62.1", 1)
 		logger := testLogger(io.Discard)
 		manager := newTestRelayManager(queries, logger, relay.Options{})
 		server := newRelayHTTPServer(t, pool, NoAuthAuthenticator{}, manager, logger, 0)
@@ -698,20 +791,6 @@ func TestRelay_VersionRoutingAndDialFailure(t *testing.T) {
 		).Scan(&failedSessionID); err != nil {
 			t.Fatalf("selecting dial-running session: %v", err)
 		}
-		waitingScheduler := newTestScheduler(pool, 1, time.Second)
-		type claimResult struct {
-			session data.Session
-			err     error
-		}
-		claimDone := make(chan claimResult, 1)
-		go func() {
-			session, err := waitingScheduler.Admit(
-				t.Context(),
-				scheduler.ClaimRequest{Browser: "chromium"},
-			)
-			claimDone <- claimResult{session: session, err: err}
-		}()
-		waitForCondition(t, time.Second, func() bool { return waitingScheduler.QueueDepth() == 1 })
 		result := <-dialDone
 		if result.err == nil || result.response == nil || result.response.StatusCode != http.StatusBadGateway {
 			t.Fatalf("dead worker response = %v, error = %v; want 502", result.response, result.err)
@@ -724,16 +803,12 @@ func TestRelay_VersionRoutingAndDialFailure(t *testing.T) {
 		if failed.Status != data.SessionStatusFailed {
 			t.Fatalf("dial-failed session status = %q, want %q", failed.Status, data.SessionStatusFailed)
 		}
-		select {
-		case claimed := <-claimDone:
-			if claimed.err != nil {
-				t.Fatalf("waiting claim after dial failure returned an error: %v", claimed.err)
-			}
-			if claimed.session.Status != data.SessionStatusPending {
-				t.Fatalf("waiting claim status = %q, want pending", claimed.session.Status)
-			}
-		case <-time.After(time.Second):
-			t.Fatal("waiting claim did not proceed after dial failure")
+		failedWorker, err := queries.GetWorker(t.Context(), workerID)
+		if err != nil {
+			t.Fatalf("GetWorker() after dial failure returned an error: %v", err)
+		}
+		if failedWorker.Status != data.WorkerStatusStalled {
+			t.Fatalf("dial-failed worker status = %q, want %q", failedWorker.Status, data.WorkerStatusStalled)
 		}
 	})
 

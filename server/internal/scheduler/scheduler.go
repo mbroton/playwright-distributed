@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"strings"
 	"sync"
 	"time"
 
@@ -122,6 +123,35 @@ func (s *Scheduler) Claim(ctx context.Context, request ClaimRequest) (data.Sessi
 	excluded := []uuid.UUID{}
 	for attempt := range maxClaimAttempts {
 		session, fullWorkerID, err := s.claimOnce(ctx, request, excluded)
+		if err == nil {
+			return session, nil
+		}
+		if !errors.Is(err, ErrNoCapacity) {
+			return data.Session{}, err
+		}
+		if fullWorkerID != nil {
+			excluded = append(excluded, *fullWorkerID)
+			continue
+		}
+		if attempt == maxClaimAttempts-1 {
+			break
+		}
+		if err := waitForRetry(ctx, claimRetryDelay); err != nil {
+			return data.Session{}, err
+		}
+	}
+
+	return data.Session{}, ErrNoCapacity
+}
+
+func (s *Scheduler) Reassign(
+	ctx context.Context,
+	sessionID uuid.UUID,
+	excludedWorkerIDs []uuid.UUID,
+) (data.Session, error) {
+	excluded := append([]uuid.UUID{}, excludedWorkerIDs...)
+	for attempt := range maxClaimAttempts {
+		session, fullWorkerID, err := s.reassignOnce(ctx, sessionID, excluded)
 		if err == nil {
 			return session, nil
 		}
@@ -368,6 +398,75 @@ func (s *Scheduler) claimOnce(
 	}
 
 	return session, nil, nil
+}
+
+func (s *Scheduler) reassignOnce(
+	ctx context.Context,
+	sessionID uuid.UUID,
+	excluded []uuid.UUID,
+) (_ data.Session, fullWorkerID *uuid.UUID, err error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return data.Session{}, nil, fmt.Errorf("beginning session reassignment: %w", err)
+	}
+	defer rollback(ctx, tx, &err)
+	queries := s.queries.WithTx(tx)
+
+	session, err := queries.GetSession(ctx, sessionID)
+	if err != nil {
+		return data.Session{}, nil, fmt.Errorf("loading session for reassignment: %w", err)
+	}
+	if session.Status != data.SessionStatusRunning {
+		return data.Session{}, nil, pgx.ErrNoRows
+	}
+	versionParts := strings.SplitN(session.PlaywrightVersion, ".", 3)
+	if len(versionParts) < 3 {
+		return data.Session{}, nil, fmt.Errorf(
+			"invalid session Playwright version %q",
+			session.PlaywrightVersion,
+		)
+	}
+	versionPrefix := versionParts[0] + "." + versionParts[1] + "."
+
+	worker, err := queries.SelectClaimableWorker(ctx, data.SelectClaimableWorkerParams{
+		Browser:               session.Browser,
+		VersionPrefix:         versionPrefix,
+		WorkerTtlMicroseconds: s.workerTTL.Microseconds(),
+		MaxLifetimeSessions:   s.maxLifetimeSessions,
+		ExcludedIds:           excluded,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return data.Session{}, nil, ErrNoCapacity
+	}
+	if err != nil {
+		return data.Session{}, nil, fmt.Errorf("selecting reassignment worker: %w", err)
+	}
+	activeCount, err := queries.CountActiveSessionsByWorker(ctx, worker.ID)
+	if err != nil {
+		return data.Session{}, nil, fmt.Errorf("recounting reassignment worker sessions: %w", err)
+	}
+	if activeCount >= int64(worker.MaxSlots) {
+		workerID := worker.ID
+		return data.Session{}, &workerID, ErrNoCapacity
+	}
+
+	reassigned, err := queries.ReassignRunningSession(ctx, data.ReassignRunningSessionParams{
+		WorkerID:          worker.ID,
+		PlaywrightVersion: worker.PlaywrightVersion,
+		WorkerAddress:     worker.Address,
+		ID:                sessionID,
+	})
+	if err != nil {
+		return data.Session{}, nil, fmt.Errorf("updating reassigned session: %w", err)
+	}
+	if _, err := queries.IncrementWorkerLifetimeSessions(ctx, worker.ID); err != nil {
+		return data.Session{}, nil, fmt.Errorf("incrementing reassignment worker lifetime sessions: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return data.Session{}, nil, fmt.Errorf("%w: %w", errUncertainCommit, err)
+	}
+
+	return reassigned, nil, nil
 }
 
 func (s *Scheduler) queueWaitError(ctx, waitCtx context.Context) error {

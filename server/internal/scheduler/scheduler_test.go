@@ -287,6 +287,90 @@ func TestScheduler_Claims(t *testing.T) {
 	})
 }
 
+func TestScheduler_Reassign(t *testing.T) {
+	pool := newMigratedTestPool(t)
+	queries := data.New(pool)
+
+	t.Run("moves a running session to a compatible worker", func(t *testing.T) {
+		truncate(t, pool)
+		failedWorkerID := insertWorker(t, pool, queries, workerSpec{
+			playwrightVersion: "1.62.1",
+			lifetimeSessions:  20,
+		})
+		replacementWorkerID := insertWorker(t, pool, queries, workerSpec{
+			playwrightVersion: "1.62.2",
+		})
+		insertWorker(t, pool, queries, workerSpec{
+			playwrightVersion: "1.63.0",
+			lifetimeSessions:  50,
+		})
+		insertWorker(t, pool, queries, workerSpec{
+			browser:          "firefox",
+			lifetimeSessions: 50,
+		})
+		sessionScheduler := newTestScheduler(pool, 0, 100)
+		claimed, err := sessionScheduler.Claim(
+			t.Context(),
+			ClaimRequest{Browser: "chromium", VersionPrefix: "1.62."},
+		)
+		if err != nil {
+			t.Fatalf("Claim() returned an error: %v", err)
+		}
+		if claimed.WorkerID != failedWorkerID {
+			t.Fatalf("Claim().WorkerID = %s, want failed worker %s", claimed.WorkerID, failedWorkerID)
+		}
+		if _, err := queries.StartSession(t.Context(), claimed.ID); err != nil {
+			t.Fatalf("StartSession() returned an error: %v", err)
+		}
+
+		reassigned, err := sessionScheduler.Reassign(
+			t.Context(),
+			claimed.ID,
+			[]uuid.UUID{failedWorkerID},
+		)
+		if err != nil {
+			t.Fatalf("Reassign() returned an error: %v", err)
+		}
+		replacement, err := queries.GetWorker(t.Context(), replacementWorkerID)
+		if err != nil {
+			t.Fatalf("GetWorker() for replacement returned an error: %v", err)
+		}
+		if reassigned.ID != claimed.ID || reassigned.Status != data.SessionStatusRunning ||
+			reassigned.WorkerID != replacementWorkerID ||
+			reassigned.WorkerAddress != replacement.Address ||
+			reassigned.PlaywrightVersion != replacement.PlaywrightVersion {
+			t.Fatalf("Reassign() = %+v, want running session on replacement %+v", reassigned, replacement)
+		}
+		if replacement.LifetimeSessions != 1 {
+			t.Fatalf("replacement lifetime sessions = %d, want 1", replacement.LifetimeSessions)
+		}
+	})
+
+	t.Run("returns no capacity without changing the running session", func(t *testing.T) {
+		truncate(t, pool)
+		failedWorkerID := insertWorker(t, pool, queries, workerSpec{})
+		sessionScheduler := newTestScheduler(pool, 0, 100)
+		claimed, err := sessionScheduler.Claim(t.Context(), ClaimRequest{Browser: "chromium"})
+		if err != nil {
+			t.Fatalf("Claim() returned an error: %v", err)
+		}
+		if _, err := queries.StartSession(t.Context(), claimed.ID); err != nil {
+			t.Fatalf("StartSession() returned an error: %v", err)
+		}
+		_, err = sessionScheduler.Reassign(t.Context(), claimed.ID, []uuid.UUID{failedWorkerID})
+		if !errors.Is(err, ErrNoCapacity) {
+			t.Fatalf("Reassign() error = %v, want %v", err, ErrNoCapacity)
+		}
+		stored, err := queries.GetSession(t.Context(), claimed.ID)
+		if err != nil {
+			t.Fatalf("GetSession() returned an error: %v", err)
+		}
+		if stored.WorkerID != failedWorkerID || stored.Status != data.SessionStatusRunning {
+			t.Fatalf("stored session = %+v, want unchanged running session on %s", stored, failedWorkerID)
+		}
+	})
+}
+
 func TestScheduler_Queue(t *testing.T) {
 	pool := newMigratedTestPool(t)
 	queries := data.New(pool)

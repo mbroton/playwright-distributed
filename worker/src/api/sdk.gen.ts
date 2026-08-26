@@ -2,7 +2,7 @@
 
 import { client } from './client.gen.js';
 import type { Client, Options as Options2, TDataShape } from './client/index.js';
-import type { CreateSessionData, CreateSessionErrors, CreateSessionResponses, DeleteSessionData, DeleteSessionErrors, DeleteSessionResponses, GetCapacityData, GetCapacityErrors, GetCapacityResponses, GetSessionData, GetSessionErrors, GetSessionResponses, HealthData, HealthErrors, HealthResponses, HeartbeatWorkerData, HeartbeatWorkerErrors, HeartbeatWorkerResponses, ListWorkersData, ListWorkersErrors, ListWorkersResponses, ReadinessData, ReadinessErrors, ReadinessResponses, RegisterWorkerData, RegisterWorkerErrors, RegisterWorkerResponses, SetWorkerStatusData, SetWorkerStatusErrors, SetWorkerStatusResponses } from './types.gen.js';
+import type { CreateSessionData, CreateSessionErrors, CreateSessionResponses, DeleteSessionData, DeleteSessionErrors, DeleteSessionResponses, GetCapacityData, GetCapacityErrors, GetCapacityResponses, GetSessionData, GetSessionErrors, GetSessionResponses, HealthData, HealthErrors, HealthResponses, HeartbeatWorkerData, HeartbeatWorkerErrors, HeartbeatWorkerResponses, ListWorkersData, ListWorkersErrors, ListWorkersResponses, ReadinessData, ReadinessErrors, ReadinessResponses, RecycleWorkerData, RecycleWorkerErrors, RecycleWorkerResponses, RegisterWorkerData, RegisterWorkerErrors, RegisterWorkerResponses, SetWorkerStatusData, SetWorkerStatusErrors, SetWorkerStatusResponses } from './types.gen.js';
 
 export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends boolean = boolean, TResponse = unknown> = Options2<TData, ThrowOnError, TResponse> & {
     /**
@@ -47,6 +47,15 @@ export const heartbeatWorker = <ThrowOnError extends boolean = false>(options: O
         'Content-Type': 'application/json',
         ...options.headers
     }
+});
+
+/**
+ * Recycle a worker
+ */
+export const recycleWorker = <ThrowOnError extends boolean = false>(options: Options<RecycleWorkerData, ThrowOnError>) => (options.client ?? client).post<RecycleWorkerResponses, RecycleWorkerErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
+    url: '/internal/workers/{id}/recycle',
+    ...options
 });
 
 /**

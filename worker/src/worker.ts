@@ -34,6 +34,10 @@ export interface ControlPlaneLike {
         retryDelayMs?: number,
         signal?: AbortSignal,
     ): Promise<{ id: string; max_lifetime_sessions?: number }>;
+    recycle(workerId: string, signal?: AbortSignal): Promise<{
+        id: string;
+        max_lifetime_sessions?: number;
+    }>;
     heartbeat(workerId: string, activeSessionIds: string[]): Promise<{
         status: WorkerStatus;
         stale_session_ids: string[];
@@ -137,7 +141,7 @@ export class BrowserWorker {
                     return;
                 }
                 // Drain without waiting for the heartbeat to say so: until the
-                // recycled worker re-registers, the scheduler has already
+                // recycled worker becomes available, the scheduler has already
                 // stopped selecting this one, so every waiting second is dead
                 // capacity on small deployments. This counts gateway closes
                 // while the server counts claims, so a claim that never
@@ -245,15 +249,11 @@ export class BrowserWorker {
         }
         const oldServer = this.browserServer;
         this.browserServer = null;
-        // Abandon the old worker ID before the first await: a heartbeat
-        // response landing mid-recycle must fail the identity guard, or its
-        // 'draining'/'shutting_down' status would shut this worker down.
-        const oldWorkerId = this.workerIdValue;
-        this.workerIdValue = null;
         try {
-            // Close out the old worker row first; the fresh browser registers
-            // as a new worker with a zeroed session count.
-            await this.bestEffortStatus('shutting_down', oldWorkerId);
+            const workerId = this.workerIdValue;
+            if (!workerId) {
+                throw new Error('worker has no registration to recycle');
+            }
             // Launch the replacement before closing the old browser: sessions
             // that dial the gateway mid-recycle reach a live endpoint instead
             // of a dead one, at the cost of two browsers briefly coexisting.
@@ -276,7 +276,18 @@ export class BrowserWorker {
                 // recycle; exit instead so the supervisor reclaims them all.
                 throw new Error('old browser could not be stopped');
             }
-            await this.register();
+            try {
+                const recycled = await this.controlPlane.recycle(workerId, this.shutdownController.signal);
+                this.shutdownController.signal.throwIfAborted();
+                this.workerIdValue = recycled.id;
+                this.sessionBudget = recycled.max_lifetime_sessions ?? 0;
+            } catch (error) {
+                if (!(error instanceof ControlPlaneError) || error.status !== 404) {
+                    throw error;
+                }
+                this.logger.warn('Worker row expired during recycle; registering again');
+                await this.register();
+            }
             this.currentState = 'running';
             this.logger.info('Worker recycled with a fresh browser', { workerId: this.workerIdValue });
         } catch (error) {
@@ -351,17 +362,21 @@ export class BrowserWorker {
             this.armHeartbeat();
             return;
         }
-        // A recycle can replace the worker ID while this request is in
-        // flight; a response for the abandoned row must not be acted on —
-        // its 'draining'/'shutting_down' status would shut down the freshly
-        // recycled worker.
+        // A heartbeat response can arrive while the browser is being swapped.
+        // Ignore it until the recycle finishes so it cannot close sessions on
+        // the replacement browser or start another recycle.
         const workerId = this.workerIdValue;
         try {
             const response = await this.controlPlane.heartbeat(
                 workerId,
                 this.gateway.activeSessionIds,
             );
-            if (!this.heartbeatEnabled || this.currentState === 'shutting_down' || this.workerIdValue !== workerId) {
+            if (
+                !this.heartbeatEnabled ||
+                this.currentState === 'starting' ||
+                this.currentState === 'shutting_down' ||
+                this.workerIdValue !== workerId
+            ) {
                 return;
             }
             for (const sessionId of response.stale_session_ids) {
@@ -377,8 +392,8 @@ export class BrowserWorker {
                 await this.requestDrain('control plane');
             }
         } catch (error) {
-            if (this.workerIdValue !== workerId) {
-                // Stale failure for a row a recycle already abandoned.
+            if (this.currentState === 'starting' || this.workerIdValue !== workerId) {
+                // A recycle owns lifecycle changes while the browser swaps.
             } else if (error instanceof ControlPlaneError && error.status === 404) {
                 this.logger.warn('Worker registration expired; registering again');
                 try {

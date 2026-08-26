@@ -1,6 +1,8 @@
+import { randomUUID } from 'node:crypto';
 import { createClient, createConfig, type Client } from './api/client/index.js';
 import {
     heartbeatWorker,
+    recycleWorker,
     registerWorker,
     setWorkerStatus,
 } from './api/sdk.gen.js';
@@ -46,12 +48,13 @@ export class ControlPlaneClient {
         retryDelayMs = 1000,
         signal?: AbortSignal,
     ): Promise<RegisteredWorker> {
+        const body = { ...registration, instance_id: randomUUID() };
         let lastError: unknown;
         for (let attempt = 1; attempt <= attempts; attempt += 1) {
             signal?.throwIfAborted();
             try {
                 const result = await registerWorker({
-                    body: registration,
+                    body,
                     client: this.client,
                     signal: requestSignal(this.registrationTimeoutMs, signal),
                 });
@@ -76,6 +79,18 @@ export class ControlPlaneClient {
             `register worker failed after ${attempts} attempts: ${formatError(lastError)}`,
             lastError instanceof ControlPlaneError ? lastError.status : undefined,
         );
+    }
+
+    async recycle(workerId: string, signal?: AbortSignal): Promise<RegisteredWorker> {
+        const result = await recycleWorker({
+            path: { id: workerId },
+            client: this.client,
+            signal: requestSignal(statusTimeoutMs, signal),
+        });
+        if (result.data) {
+            return result.data;
+        }
+        throw responseError('recycle worker', result.response, result.error);
     }
 
     async heartbeat(workerId: string, activeSessionIds: string[]): Promise<HeartbeatOutputBody> {

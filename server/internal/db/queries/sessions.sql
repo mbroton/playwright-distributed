@@ -143,6 +143,17 @@ WHERE worker_id = sqlc.arg(worker_id)
   AND status IN ('pending', 'running')
 ORDER BY 1;
 
+-- name: ReassignRunningSession :one
+UPDATE sessions
+SET worker_id = sqlc.arg(worker_id),
+    playwright_version = sqlc.arg(playwright_version),
+    worker_address = sqlc.arg(worker_address)
+-- This predicate is load-bearing. The relay starts a session before it dials;
+-- reassignment must never revive or move a session that has since ended.
+WHERE id = sqlc.arg(id)
+  AND status = 'running'
+RETURNING *;
+
 -- name: ListSessionsByWorker :many
 SELECT *
 FROM sessions

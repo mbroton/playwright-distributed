@@ -186,7 +186,7 @@ func (h *relayHandler) attach(w http.ResponseWriter, request *http.Request, sess
 		return
 	}
 
-	worker, err := h.dialWorker(request, session)
+	worker, err := h.dialWorkerWithRetry(request, session)
 	if err != nil {
 		h.failSession(session.ID)
 		h.logger.Warn("dial session worker", "session_id", session.ID, "error", err)
@@ -214,6 +214,38 @@ func (h *relayHandler) attach(w http.ResponseWriter, request *http.Request, sess
 		!errors.Is(err, relay.ErrDuplicateRelay) {
 		h.logger.Error("run relay", "session_id", session.ID, "error", err)
 	}
+}
+
+func (h *relayHandler) dialWorkerWithRetry(
+	request *http.Request,
+	session data.Session,
+) (*websocket.Conn, error) {
+	excludedWorkerIDs := []uuid.UUID{}
+	dialErrors := []error{}
+	for attempt := range 2 {
+		worker, err := h.dialWorker(request, session)
+		if err == nil {
+			return worker, nil
+		}
+		dialErrors = append(dialErrors, fmt.Errorf("worker %s: %w", session.WorkerID, err))
+		excludedWorkerIDs = append(excludedWorkerIDs, session.WorkerID)
+
+		if _, stallErr := h.queries.StallWorker(request.Context(), session.WorkerID); stallErr != nil &&
+			!errors.Is(stallErr, pgx.ErrNoRows) {
+			dialErrors = append(dialErrors, fmt.Errorf("stalling failed worker: %w", stallErr))
+			return nil, errors.Join(dialErrors...)
+		}
+		if attempt == 1 || h.scheduler == nil {
+			break
+		}
+		session, err = h.scheduler.Reassign(request.Context(), session.ID, excludedWorkerIDs)
+		if err != nil {
+			dialErrors = append(dialErrors, fmt.Errorf("reassigning session: %w", err))
+			return nil, errors.Join(dialErrors...)
+		}
+	}
+
+	return nil, errors.Join(dialErrors...)
 }
 
 func (h *relayHandler) dialWorker(request *http.Request, session data.Session) (*websocket.Conn, error) {

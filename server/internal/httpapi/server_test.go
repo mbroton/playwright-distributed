@@ -290,6 +290,154 @@ func TestServer_WorkerAndSessionRoutes(t *testing.T) {
 	}
 }
 
+func TestServer_RegisterWorkerIdempotency(t *testing.T) {
+	pool := newMigratedTestPool(t)
+	queries := data.New(pool)
+	server := New(pool, queries, NoAuthAuthenticator{}, testLogger(io.Discard))
+	instanceID := uuid.New()
+	body := map[string]any{
+		"address":            "ws://worker-a:3000",
+		"browser":            "chromium",
+		"playwright_version": "1.62.1",
+		"max_slots":          2,
+		"instance_id":        instanceID,
+	}
+
+	firstResponse := requestJSON(t, server.Handler, http.MethodPost, "/internal/workers", body, "")
+	if firstResponse.Code != http.StatusCreated {
+		t.Fatalf("first register status = %d, want %d: %s", firstResponse.Code, http.StatusCreated, firstResponse.Body.String())
+	}
+	var first Worker
+	decodeJSON(t, firstResponse.Body.Bytes(), &first)
+	if _, err := pool.Exec(
+		t.Context(),
+		"UPDATE workers SET lifetime_sessions = 4 WHERE id = $1",
+		first.ID,
+	); err != nil {
+		t.Fatalf("setting worker lifetime sessions: %v", err)
+	}
+	body["address"] = "ws://worker-a-retried:3000"
+	retryResponse := requestJSON(t, server.Handler, http.MethodPost, "/internal/workers", body, "")
+	if retryResponse.Code != http.StatusCreated {
+		t.Fatalf("retry register status = %d, want %d: %s", retryResponse.Code, http.StatusCreated, retryResponse.Body.String())
+	}
+	var retried Worker
+	decodeJSON(t, retryResponse.Body.Bytes(), &retried)
+	if retried.ID != first.ID || retried.Address != body["address"] || retried.LifetimeSessions != 4 {
+		t.Fatalf("retried worker = %+v, want same ID, updated address, and lifetime 4", retried)
+	}
+
+	body["instance_id"] = uuid.New()
+	differentResponse := requestJSON(t, server.Handler, http.MethodPost, "/internal/workers", body, "")
+	var different Worker
+	decodeJSON(t, differentResponse.Body.Bytes(), &different)
+	if differentResponse.Code != http.StatusCreated || different.ID == first.ID {
+		t.Fatalf("different instance response = %d %+v, want a distinct created worker", differentResponse.Code, different)
+	}
+
+	delete(body, "instance_id")
+	legacyAResponse := requestJSON(t, server.Handler, http.MethodPost, "/internal/workers", body, "")
+	legacyBResponse := requestJSON(t, server.Handler, http.MethodPost, "/internal/workers", body, "")
+	var legacyA, legacyB Worker
+	decodeJSON(t, legacyAResponse.Body.Bytes(), &legacyA)
+	decodeJSON(t, legacyBResponse.Body.Bytes(), &legacyB)
+	if legacyAResponse.Code != http.StatusCreated || legacyBResponse.Code != http.StatusCreated || legacyA.ID == legacyB.ID {
+		t.Fatalf(
+			"legacy register responses = %d/%s and %d/%s, want distinct created workers",
+			legacyAResponse.Code,
+			legacyA.ID,
+			legacyBResponse.Code,
+			legacyB.ID,
+		)
+	}
+}
+
+func TestServer_RecycleWorker(t *testing.T) {
+	pool := newMigratedTestPool(t)
+	queries := data.New(pool)
+	sessionScheduler := newTestScheduler(pool, 0, time.Second)
+	server := New(
+		pool,
+		queries,
+		NoAuthAuthenticator{},
+		testLogger(io.Discard),
+		WithScheduler(sessionScheduler),
+	)
+	capacityListener, err := pool.Acquire(t.Context())
+	if err != nil {
+		t.Fatalf("acquiring capacity listener: %v", err)
+	}
+	defer capacityListener.Release()
+	if _, err := capacityListener.Exec(t.Context(), "LISTEN capacity_changed"); err != nil {
+		t.Fatalf("listening for capacity changes: %v", err)
+	}
+
+	tests := []struct {
+		name       string
+		status     data.WorkerStatus
+		wantStatus int
+	}{
+		{name: "available", status: data.WorkerStatusAvailable, wantStatus: http.StatusOK},
+		{name: "draining", status: data.WorkerStatusDraining, wantStatus: http.StatusOK},
+		{name: "stalled", status: data.WorkerStatusStalled, wantStatus: http.StatusOK},
+		{name: "shutting down", status: data.WorkerStatusShuttingDown, wantStatus: http.StatusNotFound},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			workerID := insertTestWorker(t, queries, test.status, 1)
+			if _, err := pool.Exec(
+				t.Context(),
+				"UPDATE workers SET lifetime_sessions = 9 WHERE id = $1",
+				workerID,
+			); err != nil {
+				t.Fatalf("setting worker lifetime sessions: %v", err)
+			}
+			response := requestJSON(
+				t,
+				server.Handler,
+				http.MethodPost,
+				"/internal/workers/"+workerID.String()+"/recycle",
+				nil,
+				"",
+			)
+			if response.Code != test.wantStatus {
+				t.Fatalf("recycle status = %d, want %d: %s", response.Code, test.wantStatus, response.Body.String())
+			}
+			if test.wantStatus != http.StatusOK {
+				return
+			}
+			var recycled struct {
+				Worker
+				MaxLifetimeSessions int64 `json:"max_lifetime_sessions"`
+			}
+			decodeJSON(t, response.Body.Bytes(), &recycled)
+			if recycled.ID != workerID || recycled.Status != data.WorkerStatusAvailable ||
+				recycled.LifetimeSessions != 0 || recycled.MaxLifetimeSessions != 50 {
+				t.Fatalf("recycled worker = %+v, want same available worker with reset lifetime and budget 50", recycled)
+			}
+			if test.status == data.WorkerStatusAvailable {
+				notificationCtx, cancel := context.WithTimeout(t.Context(), time.Second)
+				defer cancel()
+				if _, err := capacityListener.Conn().WaitForNotification(notificationCtx); err != nil {
+					t.Fatalf("waiting for recycle capacity notification: %v", err)
+				}
+			}
+		})
+	}
+
+	missing := requestJSON(
+		t,
+		server.Handler,
+		http.MethodPost,
+		"/internal/workers/"+uuid.NewString()+"/recycle",
+		nil,
+		"",
+	)
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing recycle status = %d, want %d", missing.Code, http.StatusNotFound)
+	}
+}
+
 func TestServer_Authentication(t *testing.T) {
 	pool := newMigratedTestPool(t)
 	queries := data.New(pool)
@@ -791,6 +939,11 @@ func TestServer_SecuredRoutesRequireAuthentication(t *testing.T) {
 			method: http.MethodPost,
 			path:   "/internal/workers/" + uuid.NewString() + "/heartbeat",
 			body:   map[string]any{"active_session_ids": []string{}},
+		},
+		{
+			name:   "recycle worker",
+			method: http.MethodPost,
+			path:   "/internal/workers/" + uuid.NewString() + "/recycle",
 		},
 		{
 			name:   "set worker status",
