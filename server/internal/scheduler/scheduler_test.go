@@ -369,6 +369,45 @@ func TestScheduler_Reassign(t *testing.T) {
 			t.Fatalf("stored session = %+v, want unchanged running session on %s", stored, failedWorkerID)
 		}
 	})
+
+	t.Run("malformed version still preserves the browser match", func(t *testing.T) {
+		truncate(t, pool)
+		failedWorkerID := insertWorker(t, pool, queries, workerSpec{lifetimeSessions: 20})
+		replacementWorkerID := insertWorker(t, pool, queries, workerSpec{})
+		insertWorker(t, pool, queries, workerSpec{browser: "firefox", lifetimeSessions: 50})
+		sessionScheduler := newTestScheduler(pool, 0, 100)
+		claimed, err := sessionScheduler.Claim(t.Context(), ClaimRequest{Browser: "chromium"})
+		if err != nil {
+			t.Fatalf("Claim() returned an error: %v", err)
+		}
+		if _, err := queries.StartSession(t.Context(), claimed.ID); err != nil {
+			t.Fatalf("StartSession() returned an error: %v", err)
+		}
+		if _, err := pool.Exec(
+			t.Context(),
+			"UPDATE sessions SET playwright_version = 'malformed' WHERE id = $1",
+			claimed.ID,
+		); err != nil {
+			t.Fatalf("setting malformed session version: %v", err)
+		}
+
+		reassigned, err := sessionScheduler.Reassign(
+			t.Context(),
+			claimed.ID,
+			[]uuid.UUID{failedWorkerID},
+		)
+		if err != nil {
+			t.Fatalf("Reassign() returned an error: %v", err)
+		}
+		if reassigned.WorkerID != replacementWorkerID || reassigned.Browser != "chromium" {
+			t.Fatalf(
+				"Reassign() worker/browser = %s/%q, want %s/chromium",
+				reassigned.WorkerID,
+				reassigned.Browser,
+				replacementWorkerID,
+			)
+		}
+	})
 }
 
 func TestScheduler_Queue(t *testing.T) {

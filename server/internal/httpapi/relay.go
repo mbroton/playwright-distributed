@@ -220,10 +220,12 @@ func (h *relayHandler) dialWorkerWithRetry(
 	request *http.Request,
 	session data.Session,
 ) (*websocket.Conn, error) {
+	dialCtx, cancel := context.WithTimeout(request.Context(), h.dialTimeout)
+	defer cancel()
 	excludedWorkerIDs := []uuid.UUID{}
 	dialErrors := []error{}
 	for attempt := range 2 {
-		worker, err := h.dialWorker(request, session)
+		worker, err := h.dialWorker(dialCtx, request, session)
 		if err == nil {
 			return worker, nil
 		}
@@ -238,7 +240,7 @@ func (h *relayHandler) dialWorkerWithRetry(
 		if attempt == 1 || h.scheduler == nil {
 			break
 		}
-		session, err = h.scheduler.Reassign(request.Context(), session.ID, excludedWorkerIDs)
+		session, err = h.scheduler.Reassign(dialCtx, session.ID, excludedWorkerIDs)
 		if err != nil {
 			dialErrors = append(dialErrors, fmt.Errorf("reassigning session: %w", err))
 			return nil, errors.Join(dialErrors...)
@@ -248,9 +250,11 @@ func (h *relayHandler) dialWorkerWithRetry(
 	return nil, errors.Join(dialErrors...)
 }
 
-func (h *relayHandler) dialWorker(request *http.Request, session data.Session) (*websocket.Conn, error) {
-	dialCtx, cancel := context.WithTimeout(request.Context(), h.dialTimeout)
-	defer cancel()
+func (h *relayHandler) dialWorker(
+	ctx context.Context,
+	request *http.Request,
+	session data.Session,
+) (*websocket.Conn, error) {
 	headers := make(http.Header)
 	if userAgent := request.UserAgent(); userAgent != "" {
 		headers.Set("User-Agent", userAgent)
@@ -269,7 +273,7 @@ func (h *relayHandler) dialWorker(request *http.Request, session data.Session) (
 	}
 	headers.Set("x-pwd-session-id", session.ID.String())
 	dialer := websocket.Dialer{HandshakeTimeout: h.dialTimeout}
-	connection, response, err := dialer.DialContext(dialCtx, session.WorkerAddress, headers)
+	connection, response, err := dialer.DialContext(ctx, session.WorkerAddress, headers)
 	if response != nil && response.Body != nil {
 		_ = response.Body.Close()
 	}

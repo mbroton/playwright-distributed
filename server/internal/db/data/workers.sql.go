@@ -319,7 +319,11 @@ SET address = EXCLUDED.address,
     browser = EXCLUDED.browser,
     playwright_version = EXCLUDED.playwright_version,
     max_slots = EXCLUDED.max_slots,
-    status = EXCLUDED.status,
+    -- Registration retries must never overwrite drain or shutdown intent.
+    status = CASE
+        WHEN workers.status IN ('draining', 'shutting_down') THEN workers.status
+        ELSE EXCLUDED.status
+    END,
     last_heartbeat = now()
 RETURNING id, address, browser, playwright_version, max_slots, status, last_heartbeat, lifetime_sessions, created_at, instance_id
 `

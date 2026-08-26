@@ -380,7 +380,7 @@ func TestServer_RecycleWorker(t *testing.T) {
 		{name: "available", status: data.WorkerStatusAvailable, wantStatus: http.StatusOK},
 		{name: "draining", status: data.WorkerStatusDraining, wantStatus: http.StatusOK},
 		{name: "stalled", status: data.WorkerStatusStalled, wantStatus: http.StatusOK},
-		{name: "shutting down", status: data.WorkerStatusShuttingDown, wantStatus: http.StatusNotFound},
+		{name: "shutting down", status: data.WorkerStatusShuttingDown, wantStatus: http.StatusConflict},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

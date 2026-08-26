@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
-	"strings"
 	"sync"
 	"time"
 
@@ -16,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"server/internal/db/data"
+	"server/internal/relay"
 )
 
 const (
@@ -419,14 +419,7 @@ func (s *Scheduler) reassignOnce(
 	if session.Status != data.SessionStatusRunning {
 		return data.Session{}, nil, pgx.ErrNoRows
 	}
-	versionParts := strings.SplitN(session.PlaywrightVersion, ".", 3)
-	if len(versionParts) < 3 {
-		return data.Session{}, nil, fmt.Errorf(
-			"invalid session Playwright version %q",
-			session.PlaywrightVersion,
-		)
-	}
-	versionPrefix := versionParts[0] + "." + versionParts[1] + "."
+	versionPrefix, _ := relay.VersionPrefix(session.PlaywrightVersion)
 
 	worker, err := queries.SelectClaimableWorker(ctx, data.SelectClaimableWorkerParams{
 		Browser:               session.Browser,

@@ -121,6 +121,22 @@ test('registration reuses its instance ID for retries and renews it for a new ca
     assert.match(bodies[0]?.instance_id ?? '', /^[0-9a-f-]{36}$/);
 });
 
+test('recycle stops after one 404 response', async t => {
+    let attempts = 0;
+    const server = await startControlPlane(async (_request, response) => {
+        attempts += 1;
+        sendJSON(response, 404, { detail: 'worker not found' });
+    });
+    t.after(() => server.close());
+
+    const controlPlane = new ControlPlaneClient(server.url);
+    await assert.rejects(
+        controlPlane.recycle('worker-1'),
+        /HTTP 404: worker not found/,
+    );
+    assert.equal(attempts, 1);
+});
+
 test('heartbeat is single-flight, reports sessions, and closes stale sessions', async t => {
     let concurrentHeartbeats = 0;
     let maxConcurrentHeartbeats = 0;
@@ -405,6 +421,98 @@ test('a heartbeat response during the swap cannot drain or stale-kill the recycl
     await worker.shutdown(0);
 });
 
+test('a heartbeat response after the swap cannot drain or close a new session', async () => {
+    let heartbeats = 0;
+    let releaseFirstHeartbeat!: () => void;
+    const firstHeartbeatGate = new Promise<void>(resolve => {
+        releaseFirstHeartbeat = resolve;
+    });
+    const gateway = new FakeGateway();
+    let recycles = 0;
+    const controlPlane: ControlPlaneLike = {
+        register: async () => ({ id: 'worker-1' }),
+        recycle: async workerId => {
+            recycles += 1;
+            return { id: workerId };
+        },
+        heartbeat: async () => {
+            heartbeats += 1;
+            if (heartbeats === 1) {
+                await firstHeartbeatGate;
+                return { status: 'draining' as const, stale_session_ids: [] };
+            }
+            return { status: 'available' as const, stale_session_ids: [] };
+        },
+        setStatus: async () => undefined,
+    };
+    const worker = createInjectedWorker(controlPlane, gateway, 30);
+    await worker.start();
+    await waitFor(() => heartbeats >= 1);
+
+    await worker.requestDrain('control plane');
+    assert.equal(worker.state, 'running');
+    assert.equal(recycles, 1);
+    gateway.addSession(thirdId);
+    releaseFirstHeartbeat();
+    await delay(80);
+
+    assert.equal(worker.state, 'running');
+    assert.equal(recycles, 1);
+    assert.deepEqual(gateway.activeSessionIds, [thirdId]);
+    assert.deepEqual(gateway.closedSessions, []);
+    await worker.shutdown(0);
+});
+
+test('a recycle succeeds after transient 503 responses without exiting', async t => {
+    let registrations = 0;
+    let recycleAttempts = 0;
+    const server = await startControlPlane(async (request, response) => {
+        if (request.url === '/internal/workers') {
+            registrations += 1;
+            sendJSON(response, 201, { id: 'worker-1' });
+            return;
+        }
+        if (request.url?.endsWith('/recycle')) {
+            recycleAttempts += 1;
+            if (recycleAttempts < 3) {
+                sendJSON(response, 503, { detail: 'control plane restarting' });
+                return;
+            }
+            sendJSON(response, 200, { id: 'worker-1' });
+            return;
+        }
+        if (request.url?.endsWith('/heartbeat')) {
+            sendJSON(response, 200, { status: 'available', stale_session_ids: [] });
+            return;
+        }
+        sendJSON(response, 200, { id: 'worker-1' });
+    });
+    t.after(() => server.close());
+
+    const exitCodes: number[] = [];
+    const worker = new BrowserWorker(testConfig(5_000), {
+        controlPlane: new ControlPlaneClient(
+            server.url,
+            undefined,
+            5_000,
+            async () => undefined,
+            100,
+        ),
+        createGateway: () => new FakeGateway(),
+        launchBrowser: async () => new FakeBrowser(),
+        exit: code => exitCodes.push(code),
+    });
+    await worker.start();
+
+    await worker.requestDrain('control plane');
+
+    assert.equal(worker.state, 'running');
+    assert.equal(registrations, 1);
+    assert.equal(recycleAttempts, 3);
+    assert.deepEqual(exitCodes, []);
+    await worker.shutdown(0);
+});
+
 test('a recycle 404 falls back to a new worker registration', async () => {
     let registrations = 0;
     const controlPlane: ControlPlaneLike = {
@@ -426,6 +534,29 @@ test('a recycle 404 falls back to a new worker registration', async () => {
     assert.equal(registrations, 2);
     assert.equal(worker.workerId, 'worker-2');
     await worker.shutdown(0);
+});
+
+test('a recycle 409 exits cleanly without registering again', async () => {
+    let registrations = 0;
+    const controlPlane: ControlPlaneLike = {
+        register: async () => {
+            registrations += 1;
+            return { id: 'worker-1' };
+        },
+        recycle: async () => {
+            throw new ControlPlaneError('worker is shutting down', 409);
+        },
+        heartbeat: async () => ({ status: 'available', stale_session_ids: [] }),
+        setStatus: async () => undefined,
+    };
+    const worker = createInjectedWorker(controlPlane, new FakeGateway(), 5_000);
+    await worker.start();
+
+    await worker.requestDrain('control plane');
+
+    assert.equal(await worker.waitForExit(), 0);
+    assert.equal(registrations, 1);
+    assert.equal(worker.state, 'shutting_down');
 });
 
 test('a heartbeat 404 resolving during recycle does not register a duplicate worker', async () => {

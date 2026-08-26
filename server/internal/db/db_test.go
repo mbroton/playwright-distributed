@@ -452,6 +452,24 @@ func TestRegisterWorkerInstanceID(t *testing.T) {
 			params.Address,
 		)
 	}
+	if _, err := pool.Exec(
+		t.Context(),
+		"UPDATE workers SET status = 'shutting_down' WHERE id = $1",
+		first.ID,
+	); err != nil {
+		t.Fatalf("setting worker shutdown intent: %v", err)
+	}
+	intentPreserved, err := queries.RegisterWorker(t.Context(), params)
+	if err != nil {
+		t.Fatalf("RegisterWorker() after shutdown intent returned an error: %v", err)
+	}
+	if intentPreserved.Status != data.WorkerStatusShuttingDown {
+		t.Fatalf(
+			"RegisterWorker().Status after shutdown intent = %q, want %q",
+			intentPreserved.Status,
+			data.WorkerStatusShuttingDown,
+		)
+	}
 
 	differentInstanceID := uuid.New()
 	params.ID = uuid.New()

@@ -34,7 +34,12 @@ export interface ControlPlaneLike {
         retryDelayMs?: number,
         signal?: AbortSignal,
     ): Promise<{ id: string; max_lifetime_sessions?: number }>;
-    recycle(workerId: string, signal?: AbortSignal): Promise<{
+    recycle(
+        workerId: string,
+        attempts?: number,
+        retryDelayMs?: number,
+        signal?: AbortSignal,
+    ): Promise<{
         id: string;
         max_lifetime_sessions?: number;
     }>;
@@ -72,6 +77,7 @@ export class BrowserWorker {
     private drainTimer: NodeJS.Timeout | null = null;
     private recycleOnDrained = false;
     private recyclePromise: Promise<void> | null = null;
+    private recycleGeneration = 0;
     private sessionBudget = 0;
     private servedSessions = 0;
     private shutdownPromise: Promise<void> | null = null;
@@ -240,6 +246,7 @@ export class BrowserWorker {
         if (this.shutdownStarted) {
             return;
         }
+        this.recycleGeneration += 1;
         this.currentState = 'starting';
         this.logger.info('Recycling the browser in place');
         // A forced recycle (drain timeout) can still have live sessions;
@@ -277,16 +284,29 @@ export class BrowserWorker {
                 throw new Error('old browser could not be stopped');
             }
             try {
-                const recycled = await this.controlPlane.recycle(workerId, this.shutdownController.signal);
+                const recycled = await this.controlPlane.recycle(
+                    workerId,
+                    undefined,
+                    undefined,
+                    this.shutdownController.signal,
+                );
                 this.shutdownController.signal.throwIfAborted();
                 this.workerIdValue = recycled.id;
                 this.sessionBudget = recycled.max_lifetime_sessions ?? 0;
             } catch (error) {
-                if (!(error instanceof ControlPlaneError) || error.status !== 404) {
+                if (!(error instanceof ControlPlaneError)) {
                     throw error;
                 }
-                this.logger.warn('Worker row expired during recycle; registering again');
-                await this.register();
+                if (error.status === 404) {
+                    this.logger.warn('Worker row expired during recycle; registering again');
+                    await this.register();
+                } else if (error.status === 409) {
+                    this.logger.info('Worker shutdown intent prevents recycle; shutting down');
+                    await this.shutdown(0);
+                    return;
+                } else {
+                    throw error;
+                }
             }
             this.currentState = 'running';
             this.logger.info('Worker recycled with a fresh browser', { workerId: this.workerIdValue });
@@ -362,10 +382,11 @@ export class BrowserWorker {
             this.armHeartbeat();
             return;
         }
-        // A heartbeat response can arrive while the browser is being swapped.
-        // Ignore it until the recycle finishes so it cannot close sessions on
-        // the replacement browser or start another recycle.
+        // A heartbeat response can arrive during or after a browser swap.
+        // The generation rejects responses from an earlier recycle even when
+        // the worker ID and running state are unchanged after the swap.
         const workerId = this.workerIdValue;
+        const recycleGeneration = this.recycleGeneration;
         try {
             const response = await this.controlPlane.heartbeat(
                 workerId,
@@ -375,7 +396,8 @@ export class BrowserWorker {
                 !this.heartbeatEnabled ||
                 this.currentState === 'starting' ||
                 this.currentState === 'shutting_down' ||
-                this.workerIdValue !== workerId
+                this.workerIdValue !== workerId ||
+                this.recycleGeneration !== recycleGeneration
             ) {
                 return;
             }
@@ -392,8 +414,12 @@ export class BrowserWorker {
                 await this.requestDrain('control plane');
             }
         } catch (error) {
-            if (this.currentState === 'starting' || this.workerIdValue !== workerId) {
-                // A recycle owns lifecycle changes while the browser swaps.
+            if (
+                this.currentState === 'starting' ||
+                this.workerIdValue !== workerId ||
+                this.recycleGeneration !== recycleGeneration
+            ) {
+                // A recycle owns lifecycle changes during and after its browser swap.
             } else if (error instanceof ControlPlaneError && error.status === 404) {
                 this.logger.warn('Worker registration expired; registering again');
                 try {

@@ -81,16 +81,42 @@ export class ControlPlaneClient {
         );
     }
 
-    async recycle(workerId: string, signal?: AbortSignal): Promise<RegisteredWorker> {
-        const result = await recycleWorker({
-            path: { id: workerId },
-            client: this.client,
-            signal: requestSignal(statusTimeoutMs, signal),
-        });
-        if (result.data) {
-            return result.data;
+    async recycle(
+        workerId: string,
+        attempts = 30,
+        retryDelayMs = 1000,
+        signal?: AbortSignal,
+    ): Promise<RegisteredWorker> {
+        let lastError: unknown;
+        for (let attempt = 1; attempt <= attempts; attempt += 1) {
+            signal?.throwIfAborted();
+            try {
+                const result = await recycleWorker({
+                    path: { id: workerId },
+                    client: this.client,
+                    signal: requestSignal(this.registrationTimeoutMs, signal),
+                });
+                if (result.data) {
+                    return result.data;
+                }
+                throw responseError('recycle worker', result.response, result.error);
+            } catch (error) {
+                lastError = error;
+                if (signal?.aborted) {
+                    signal.throwIfAborted();
+                }
+                if (isNonRetryableClientError(error)) {
+                    throw error;
+                }
+                if (attempt < attempts) {
+                    await this.sleep(retryDelayMs, signal);
+                }
+            }
         }
-        throw responseError('recycle worker', result.response, result.error);
+        throw new ControlPlaneError(
+            `recycle worker failed after ${attempts} attempts: ${formatError(lastError)}`,
+            lastError instanceof ControlPlaneError ? lastError.status : undefined,
+        );
     }
 
     async heartbeat(workerId: string, activeSessionIds: string[]): Promise<HeartbeatOutputBody> {

@@ -27,6 +27,8 @@ const (
 	maxConnectMetadataSize = 8 * 1024
 )
 
+var errWorkerRecycleConflict = errors.New("worker status prevents recycling")
+
 type Server struct {
 	Handler http.Handler
 	API     huma.API
@@ -420,12 +422,16 @@ func registerWorkerRoutes(
 		Summary:     "Recycle a worker",
 		Tags:        []string{"Workers"},
 		Errors: []int{
+			http.StatusConflict,
 			http.StatusNotFound,
 			http.StatusUnauthorized,
 			http.StatusServiceUnavailable,
 		},
 	}, func(ctx context.Context, input *recycleWorkerInput) (*registerOutput, error) {
 		worker, err := recycleWorker(ctx, pool, queries, input.ID)
+		if errors.Is(err, errWorkerRecycleConflict) {
+			return nil, huma.Error409Conflict("worker status prevents recycling")
+		}
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, huma.Error404NotFound("worker not found")
 		}
@@ -576,6 +582,14 @@ func recycleWorker(
 	txQueries := queries.WithTx(tx)
 
 	worker, err := txQueries.RecycleWorker(ctx, workerID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if _, getErr := txQueries.GetWorker(ctx, workerID); errors.Is(getErr, pgx.ErrNoRows) {
+			return data.Worker{}, fmt.Errorf("recycling worker: %w", err)
+		} else if getErr != nil {
+			return data.Worker{}, fmt.Errorf("getting worker after rejected recycle: %w", getErr)
+		}
+		return data.Worker{}, fmt.Errorf("recycling worker: %w", errWorkerRecycleConflict)
+	}
 	if err != nil {
 		return data.Worker{}, fmt.Errorf("recycling worker: %w", err)
 	}
