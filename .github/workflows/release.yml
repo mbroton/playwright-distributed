@@ -118,15 +118,27 @@ jobs:
           cache-from: type=gha,scope=worker
           tags: ghcr.io/${{ github.repository }}/worker:latest
 
+      # A visitor runs the quick start from an empty directory that holds only
+      # the files the README tells them to download. Mirror that layout so a
+      # compose file that references anything else fails here, not for them.
+      # Keep this list equal to the README quick start.
+      - name: Stage the quick-start files as a visitor would have them
+        run: |
+          mkdir -p "$RUNNER_TEMP/quick-start/worker"
+          cp docker-compose.yaml "$RUNNER_TEMP/quick-start/"
+          cp worker/seccomp_profile.json "$RUNNER_TEMP/quick-start/worker/"
+
       # `--pull never` guards the ghcr images: the deployment must use the
       # images built above, never ones already published. It also blocks
       # third-party images, which a fresh runner does not have, so pull
       # those explicitly first.
       - name: Pull images not built from this repository
-        run: docker compose -f docker-compose.yaml pull postgres
+        working-directory: ${{ runner.temp }}/quick-start
+        run: docker compose pull postgres
 
       - name: Start the documented deployment
-        run: docker compose -f docker-compose.yaml up -d --pull never
+        working-directory: ${{ runner.temp }}/quick-start
+        run: docker compose up -d --pull never
 
       - name: Smoke-test the release images
         working-directory: ./worker
@@ -143,11 +155,13 @@ jobs:
 
       - name: Show service logs on failure
         if: failure()
-        run: docker compose -f docker-compose.yaml logs
+        working-directory: ${{ runner.temp }}/quick-start
+        run: docker compose logs
 
       - name: Stop the deployment
         if: always()
-        run: docker compose -f docker-compose.yaml down
+        working-directory: ${{ runner.temp }}/quick-start
+        run: docker compose down
 
   publish:
     needs: [checks, build]
