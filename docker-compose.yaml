@@ -28,9 +28,8 @@ services:
       - DATABASE_URL=postgres://pwd:${POSTGRES_PASSWORD:-pwd}@postgres:5432/pwd?sslmode=disable
     ports:
       - "127.0.0.1:8080:8080"
-    # Shutdown budget: 20s relay grace + 10s worker dial + 9s relay cleanup
-    # + 5s buffer = 44s. Raise together with SHUTDOWN_GRACE_PERIOD and
-    # WORKER_DIAL_TIMEOUT.
+    # Must exceed the server's shutdown sequence (~44s with the default
+    # SHUTDOWN_GRACE_PERIOD and WORKER_DIAL_TIMEOUT); raise them together.
     stop_grace_period: 60s
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/healthz"]
@@ -42,9 +41,6 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  # Stop budget: each cleanup step is bounded by the worker's 2.5s cleanup
-  # timeout, not its inner deadline. Worst case: 2.5s drain status + 30s drain
-  # + 2.5s shutdown status + 2.5s gateway + 10s browser close + 2.5s kill = 50s.
   worker:
     image: ghcr.io/mbroton/playwright-distributed/worker:latest
     init: true

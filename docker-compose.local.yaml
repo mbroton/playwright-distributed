@@ -20,8 +20,8 @@ services:
       - DATABASE_URL=postgres://pwd:pwd@postgres:5432/pwd?sslmode=disable
     ports:
       - "127.0.0.1:8080:8080"
-    # Shutdown budget: 20s relay grace + 10s worker dial + 9s relay cleanup
-    # + 5s buffer = 44s.
+    # Must exceed the server's shutdown sequence (~44s with the default
+    # SHUTDOWN_GRACE_PERIOD and WORKER_DIAL_TIMEOUT); raise them together.
     stop_grace_period: 60s
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/healthz"]
@@ -32,9 +32,8 @@ services:
       postgres:
         condition: service_healthy
 
-  # Stop budget: each cleanup step is bounded by the worker's 2.5s cleanup
-  # timeout, not its inner deadline. Worst case: 2.5s drain status + 30s drain
-  # + 2.5s shutdown status + 2.5s gateway + 10s browser close + 2.5s kill = 50s.
+  # Worker stop_grace_period must stay above DRAIN_TIMEOUT plus ~20s of
+  # shutdown cleanup; raise them together.
   worker:
     build:
       context: ./worker
