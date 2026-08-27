@@ -355,7 +355,7 @@ func registerWorkerRoutes(
 		Body struct {
 			Address           string     `json:"address" format:"uri" pattern:"^wss?://[^\\s/?#]+" maxLength:"512"`
 			Browser           string     `json:"browser" enum:"chromium,firefox,webkit"`
-			PlaywrightVersion string     `json:"playwright_version" pattern:"^[0-9]+\\.[0-9]+\\.[0-9]+" minLength:"1" maxLength:"64"`
+			PlaywrightVersion string     `json:"playwright_version" pattern:"^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$" minLength:"1" maxLength:"64"`
 			MaxSlots          int32      `json:"max_slots" minimum:"1" maximum:"1024"`
 			InstanceID        *uuid.UUID `json:"instance_id,omitempty" format:"uuid"`
 		}

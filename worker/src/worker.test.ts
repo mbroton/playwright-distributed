@@ -463,6 +463,59 @@ test('a heartbeat response after the swap cannot drain or close a new session', 
     await worker.shutdown(0);
 });
 
+test('a heartbeat dispatched during the swap is discarded after the recycle completes', async () => {
+    let releaseRecycle!: () => void;
+    const recycleGate = new Promise<void>(resolve => {
+        releaseRecycle = resolve;
+    });
+    let releaseSwapHeartbeat!: () => void;
+    const swapHeartbeatGate = new Promise<void>(resolve => {
+        releaseSwapHeartbeat = resolve;
+    });
+    let heartbeats = 0;
+    let recycles = 0;
+    let recycling = false;
+    let swapHeartbeats = 0;
+    const controlPlane: ControlPlaneLike = {
+        register: async () => ({ id: 'worker-1' }),
+        recycle: async workerId => {
+            recycles += 1;
+            recycling = true;
+            await recycleGate;
+            recycling = false;
+            return { id: workerId };
+        },
+        heartbeat: async () => {
+            heartbeats += 1;
+            if (recycling && swapHeartbeats === 0) {
+                swapHeartbeats += 1;
+                await swapHeartbeatGate;
+                // The server row stays draining for the whole swap.
+                return { status: 'draining' as const, stale_session_ids: [] };
+            }
+            return { status: 'available' as const, stale_session_ids: [] };
+        },
+        setStatus: async () => undefined,
+    };
+    const worker = createInjectedWorker(controlPlane, new FakeGateway(), 20);
+    await worker.start();
+    await waitFor(() => heartbeats >= 1);
+
+    const drainPromise = worker.requestDrain('control plane');
+    await waitFor(() => swapHeartbeats === 1);
+    releaseRecycle();
+    await drainPromise;
+    assert.equal(worker.state, 'running');
+    assert.equal(recycles, 1);
+
+    releaseSwapHeartbeat();
+    await delay(60);
+
+    assert.equal(worker.state, 'running');
+    assert.equal(recycles, 1);
+    await worker.shutdown(0);
+});
+
 test('a recycle succeeds after transient 503 responses without exiting', async t => {
     let registrations = 0;
     let recycleAttempts = 0;
@@ -598,6 +651,54 @@ test('a heartbeat 404 resolving during recycle does not register a duplicate wor
     assert.equal(worker.state, 'running');
     assert.equal(worker.workerId, 'worker-1');
     assert.equal(registrations, 1);
+    assert.equal(recycles, 1);
+    await worker.shutdown(0);
+});
+
+test('an in-flight 404 re-registration is shared with a recycle register fallback', async () => {
+    let releaseRegister!: () => void;
+    const registerGate = new Promise<void>(resolve => {
+        releaseRegister = resolve;
+    });
+    let registrations = 0;
+    let recycles = 0;
+    let heartbeats = 0;
+    const controlPlane: ControlPlaneLike = {
+        register: async () => {
+            registrations += 1;
+            if (registrations === 2) {
+                await registerGate;
+            }
+            return { id: `worker-${registrations}` };
+        },
+        recycle: async () => {
+            recycles += 1;
+            throw new ControlPlaneError('worker not found', 404);
+        },
+        heartbeat: async () => {
+            heartbeats += 1;
+            if (heartbeats === 1) {
+                throw new ControlPlaneError('worker not found', 404);
+            }
+            return { status: 'available' as const, stale_session_ids: [] };
+        },
+        setStatus: async () => undefined,
+    };
+    const worker = createInjectedWorker(controlPlane, new FakeGateway(), 20);
+    await worker.start();
+    // The heartbeat 404 starts a re-registration that is held in flight.
+    await waitFor(() => registrations === 2);
+
+    // A recycle 404 must join that registration, not start a third one.
+    const drainPromise = worker.requestDrain('control plane');
+    await delay(40);
+    releaseRegister();
+    await drainPromise;
+    await delay(40);
+
+    assert.equal(worker.state, 'running');
+    assert.equal(worker.workerId, 'worker-2');
+    assert.equal(registrations, 2);
     assert.equal(recycles, 1);
     await worker.shutdown(0);
 });

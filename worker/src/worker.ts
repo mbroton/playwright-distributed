@@ -78,6 +78,7 @@ export class BrowserWorker {
     private recycleOnDrained = false;
     private recyclePromise: Promise<void> | null = null;
     private recycleGeneration = 0;
+    private registerPromise: Promise<void> | null = null;
     private sessionBudget = 0;
     private servedSessions = 0;
     private shutdownPromise: Promise<void> | null = null;
@@ -246,6 +247,8 @@ export class BrowserWorker {
         if (this.shutdownStarted) {
             return;
         }
+        // First of two bumps (the second is at completion): heartbeats
+        // dispatched before this point must not act after the swap.
         this.recycleGeneration += 1;
         this.currentState = 'starting';
         this.logger.info('Recycling the browser in place');
@@ -308,6 +311,11 @@ export class BrowserWorker {
                     throw error;
                 }
             }
+            // Second bump: heartbeats keep flowing during the swap (they keep
+            // the row alive through a long recycle retry) and carry the
+            // already-bumped generation, so only a bump at completion makes
+            // their late responses distinguishable from post-swap ones.
+            this.recycleGeneration += 1;
             this.currentState = 'running';
             this.logger.info('Worker recycled with a fresh browser', { workerId: this.workerIdValue });
         } catch (error) {
@@ -343,7 +351,18 @@ export class BrowserWorker {
         return this.shutdownPromise;
     }
 
-    private async register(): Promise<void> {
+    private register(): Promise<void> {
+        // Single-flight: a heartbeat-404 re-registration can overlap a
+        // recycle's own register fallback, and each call mints a fresh
+        // instance id — two concurrent calls would create two server rows
+        // for one gateway.
+        this.registerPromise ??= this.runRegister().finally(() => {
+            this.registerPromise = null;
+        });
+        return this.registerPromise;
+    }
+
+    private async runRegister(): Promise<void> {
         const worker = await this.controlPlane.register(
             this.registration(),
             undefined,

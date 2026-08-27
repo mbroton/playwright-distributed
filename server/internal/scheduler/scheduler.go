@@ -419,7 +419,12 @@ func (s *Scheduler) reassignOnce(
 	if session.Status != data.SessionStatusRunning {
 		return data.Session{}, nil, pgx.ErrNoRows
 	}
-	versionPrefix, _ := relay.VersionPrefix(session.PlaywrightVersion)
+	versionPrefix, ok := relay.VersionPrefix(session.PlaywrightVersion)
+	if !ok {
+		// An empty prefix would match every worker version; refuse the
+		// reassignment instead of pairing the client with an incompatible one.
+		return data.Session{}, nil, ErrNoCapacity
+	}
 
 	worker, err := queries.SelectClaimableWorker(ctx, data.SelectClaimableWorkerParams{
 		Browser:               session.Browser,
