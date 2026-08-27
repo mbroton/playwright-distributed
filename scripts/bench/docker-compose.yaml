@@ -1,5 +1,5 @@
 # Benchmark stack: postgres + server + N identical chromium workers.
-# Scale the worker count per run (from bench/):
+# Scale the worker count per run (from scripts/bench/):
 #   docker compose up -d --build --scale worker=3
 # The server runs in unauthenticated bootstrap mode (zero API keys), like
 # docker-compose.local.yaml. Do not use it on a public network.
@@ -22,9 +22,8 @@ services:
       dockerfile: Dockerfile
     environment:
       - DATABASE_URL=postgres://pwd:pwd@postgres:5432/pwd?sslmode=disable
-      # Worker recycling (default: drain after 50 lifetime sessions) is
-      # disabled so throughput measures the grid's service rate, not the
-      # container runtime's restart latency. See README.md before changing.
+      # Recycling disabled: the benchmark measures the grid's service rate,
+      # not browser restart latency.
       - MAX_LIFETIME_SESSIONS=0
     ports:
       - "127.0.0.1:8080:8080"

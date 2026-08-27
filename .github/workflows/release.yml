@@ -225,6 +225,28 @@ jobs:
           tags: ${{ steps.meta-worker.outputs.tags }}
           labels: ${{ steps.meta-worker.outputs.labels }}
 
+      # docker-compose.yaml deploys `latest`. Prove the tag now points at the
+      # images built for this release, so the documented deployment and the
+      # GitHub release can never name different images. Pre-releases do not
+      # move `latest`, so there is nothing to prove for them.
+      - name: Verify docker-compose.yaml deploys the released images
+        if: ${{ !contains(github.ref_name, '-') }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          for service in server worker; do
+            image="ghcr.io/${{ github.repository }}/${service}"
+            if ! grep -qF "image: ${image}:latest" docker-compose.yaml; then
+              echo "docker-compose.yaml does not deploy ${image}:latest" >&2
+              exit 1
+            fi
+            released="$(docker buildx imagetools inspect "${image}:${version}" --format '{{.Manifest.Digest}}')"
+            latest="$(docker buildx imagetools inspect "${image}:latest" --format '{{.Manifest.Digest}}')"
+            if [[ "${released}" != "${latest}" ]]; then
+              echo "${image}:latest (${latest}) is not the ${version} release (${released})" >&2
+              exit 1
+            fi
+          done
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
