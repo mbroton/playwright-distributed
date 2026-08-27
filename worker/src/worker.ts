@@ -301,8 +301,14 @@ export class BrowserWorker {
                     throw error;
                 }
                 if (error.status === 404) {
-                    this.logger.warn('Worker row expired during recycle; registering again');
-                    await this.register();
+                    if (this.workerIdValue !== workerId) {
+                        // A heartbeat-404 re-registration completed during
+                        // the swap; adopt its row instead of minting another.
+                        this.logger.info('Worker row was already replaced during the swap');
+                    } else {
+                        this.logger.warn('Worker row expired during recycle; registering again');
+                        await this.register();
+                    }
                 } else if (error.status === 409) {
                     this.logger.info('Worker shutdown intent prevents recycle; shutting down');
                     await this.shutdown(0);

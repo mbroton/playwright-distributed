@@ -422,8 +422,14 @@ func (s *Scheduler) reassignOnce(
 	versionPrefix, ok := relay.VersionPrefix(session.PlaywrightVersion)
 	if !ok {
 		// An empty prefix would match every worker version; refuse the
-		// reassignment instead of pairing the client with an incompatible one.
-		return data.Session{}, nil, ErrNoCapacity
+		// reassignment instead of pairing the client with an incompatible
+		// one. Registration validates the version format, so this can only
+		// be a legacy or corrupted row — not a retryable condition.
+		return data.Session{}, nil, fmt.Errorf(
+			"session %s has an unparsable playwright version %q",
+			sessionID,
+			session.PlaywrightVersion,
+		)
 	}
 
 	worker, err := queries.SelectClaimableWorker(ctx, data.SelectClaimableWorkerParams{

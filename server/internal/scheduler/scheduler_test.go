@@ -396,8 +396,8 @@ func TestScheduler_Reassign(t *testing.T) {
 			claimed.ID,
 			[]uuid.UUID{failedWorkerID},
 		)
-		if !errors.Is(err, ErrNoCapacity) {
-			t.Fatalf("Reassign() error = %v, want %v", err, ErrNoCapacity)
+		if err == nil || !strings.Contains(err.Error(), "unparsable playwright version") {
+			t.Fatalf("Reassign() error = %v, want an unparsable-version error", err)
 		}
 		stored, err := queries.GetSession(t.Context(), claimed.ID)
 		if err != nil {

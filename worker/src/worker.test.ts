@@ -691,12 +691,78 @@ test('an in-flight 404 re-registration is shared with a recycle register fallbac
 
     // A recycle 404 must join that registration, not start a third one.
     const drainPromise = worker.requestDrain('control plane');
-    await delay(40);
+    await waitFor(() => recycles === 1);
     releaseRegister();
     await drainPromise;
     await delay(40);
 
     assert.equal(worker.state, 'running');
+    assert.equal(worker.workerId, 'worker-2');
+    assert.equal(registrations, 2);
+    assert.equal(recycles, 1);
+    await worker.shutdown(0);
+});
+
+test('a re-registration that completes during the swap is adopted, not repeated', async () => {
+    let releaseRegister!: () => void;
+    const registerGate = new Promise<void>(resolve => {
+        releaseRegister = resolve;
+    });
+    let releaseLaunch!: () => void;
+    const launchGate = new Promise<void>(resolve => {
+        releaseLaunch = resolve;
+    });
+    let registrations = 0;
+    let recycles = 0;
+    let heartbeats = 0;
+    let launches = 0;
+    const controlPlane: ControlPlaneLike = {
+        register: async () => {
+            registrations += 1;
+            if (registrations === 2) {
+                await registerGate;
+            }
+            return { id: `worker-${registrations}` };
+        },
+        recycle: async () => {
+            recycles += 1;
+            throw new ControlPlaneError('worker not found', 404);
+        },
+        heartbeat: async () => {
+            heartbeats += 1;
+            if (heartbeats === 1) {
+                throw new ControlPlaneError('worker not found', 404);
+            }
+            return { status: 'available' as const, stale_session_ids: [] };
+        },
+        setStatus: async () => undefined,
+    };
+    const worker = new BrowserWorker(testConfig(20), {
+        controlPlane,
+        createGateway: () => new FakeGateway(),
+        launchBrowser: async () => {
+            launches += 1;
+            if (launches === 2) {
+                await launchGate;
+            }
+            return new FakeBrowser();
+        },
+        exit: () => undefined,
+    });
+    await worker.start();
+    // The heartbeat 404 starts a re-registration that is held in flight.
+    await waitFor(() => registrations === 2);
+
+    // The recycle blocks in its browser launch; the re-registration then
+    // completes DURING the swap, before the recycle's own 404 fallback runs.
+    const drainPromise = worker.requestDrain('control plane');
+    await waitFor(() => launches === 2);
+    releaseRegister();
+    await waitFor(() => worker.workerId === 'worker-2');
+    releaseLaunch();
+    await drainPromise;
+    await waitFor(() => worker.state === 'running');
+
     assert.equal(worker.workerId, 'worker-2');
     assert.equal(registrations, 2);
     assert.equal(recycles, 1);
