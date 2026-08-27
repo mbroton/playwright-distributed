@@ -182,7 +182,8 @@ Kubernetes):
   worker (`WORKER_API_KEY`) and client
   (`chromium.connect('ws://host:8080/?token=pwd_...')`) in the same step.
 - **Scaling**: add or remove worker containers freely; each registers itself
-  and starts serving.
+  and starts serving. Workers can run on other machines — see
+  [scaling beyond one machine](worker/README.md#scaling-beyond-one-machine).
 
 See [`server/README.md`](server/README.md) for the full configuration and
 API reference.
