@@ -6,10 +6,29 @@ INSERT INTO workers (
     playwright_version,
     max_slots,
     status,
-    last_heartbeat
+    last_heartbeat,
+    instance_id
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, now()
+    sqlc.arg(id),
+    sqlc.arg(address),
+    sqlc.arg(browser),
+    sqlc.arg(playwright_version),
+    sqlc.arg(max_slots),
+    sqlc.arg(status),
+    now(),
+    sqlc.narg(instance_id)
 )
+ON CONFLICT (instance_id) DO UPDATE
+SET address = EXCLUDED.address,
+    browser = EXCLUDED.browser,
+    playwright_version = EXCLUDED.playwright_version,
+    max_slots = EXCLUDED.max_slots,
+    -- Registration retries must never overwrite drain or shutdown intent.
+    status = CASE
+        WHEN workers.status IN ('draining', 'shutting_down') THEN workers.status
+        ELSE EXCLUDED.status
+    END,
+    last_heartbeat = now()
 RETURNING *;
 
 -- name: GetWorker :one
@@ -27,6 +46,17 @@ SET last_heartbeat = now(),
         ELSE status
     END
 WHERE id = $1
+RETURNING *;
+
+-- name: RecycleWorker :one
+UPDATE workers
+SET lifetime_sessions = 0,
+    status = 'available',
+    last_heartbeat = now()
+-- This predicate is load-bearing. A recycle may restore only workers that
+-- have no shutdown intent; it must never revive a shutting-down worker.
+WHERE id = $1
+  AND status IN ('available', 'draining', 'stalled')
 RETURNING *;
 
 -- name: SetWorkerStatus :one
@@ -95,6 +125,15 @@ SET status = 'stalled'
 -- only because this sweep never overwrites drain or shutdown intent.
 WHERE status = 'available'
   AND last_heartbeat < now() - sqlc.arg(worker_ttl_microseconds)::bigint * interval '1 microsecond';
+
+-- name: StallWorker :one
+UPDATE workers
+SET status = 'stalled'
+-- This predicate is load-bearing. A failed relay dial may stall only an
+-- available worker; it must never overwrite drain or shutdown intent.
+WHERE id = $1
+  AND status = 'available'
+RETURNING *;
 
 -- name: DeleteDeadWorkers :many
 DELETE FROM workers AS w

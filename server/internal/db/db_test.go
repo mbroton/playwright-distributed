@@ -412,6 +412,143 @@ func TestQueries(t *testing.T) {
 	}
 }
 
+func TestRegisterWorkerInstanceID(t *testing.T) {
+	pool := newMigratedTestPool(t)
+	queries := data.New(pool)
+	instanceID := uuid.New()
+	firstID := uuid.New()
+	params := data.RegisterWorkerParams{
+		ID:                firstID,
+		Address:           "ws://worker-a:3000",
+		Browser:           "chromium",
+		PlaywrightVersion: "1.62.1",
+		MaxSlots:          2,
+		Status:            data.WorkerStatusAvailable,
+		InstanceID:        &instanceID,
+	}
+	first, err := queries.RegisterWorker(t.Context(), params)
+	if err != nil {
+		t.Fatalf("first RegisterWorker() returned an error: %v", err)
+	}
+	if _, err := pool.Exec(
+		t.Context(),
+		"UPDATE workers SET lifetime_sessions = 3 WHERE id = $1",
+		first.ID,
+	); err != nil {
+		t.Fatalf("setting worker lifetime sessions: %v", err)
+	}
+
+	params.ID = uuid.New()
+	params.Address = "ws://worker-a-retried:3000"
+	retried, err := queries.RegisterWorker(t.Context(), params)
+	if err != nil {
+		t.Fatalf("retried RegisterWorker() returned an error: %v", err)
+	}
+	if retried.ID != firstID || retried.Address != params.Address || retried.LifetimeSessions != 3 {
+		t.Fatalf(
+			"retried RegisterWorker() = %+v, want ID %s, address %q, and lifetime 3",
+			retried,
+			firstID,
+			params.Address,
+		)
+	}
+	if _, err := pool.Exec(
+		t.Context(),
+		"UPDATE workers SET status = 'shutting_down' WHERE id = $1",
+		first.ID,
+	); err != nil {
+		t.Fatalf("setting worker shutdown intent: %v", err)
+	}
+	intentPreserved, err := queries.RegisterWorker(t.Context(), params)
+	if err != nil {
+		t.Fatalf("RegisterWorker() after shutdown intent returned an error: %v", err)
+	}
+	if intentPreserved.Status != data.WorkerStatusShuttingDown {
+		t.Fatalf(
+			"RegisterWorker().Status after shutdown intent = %q, want %q",
+			intentPreserved.Status,
+			data.WorkerStatusShuttingDown,
+		)
+	}
+
+	differentInstanceID := uuid.New()
+	params.ID = uuid.New()
+	params.InstanceID = &differentInstanceID
+	different, err := queries.RegisterWorker(t.Context(), params)
+	if err != nil {
+		t.Fatalf("different-instance RegisterWorker() returned an error: %v", err)
+	}
+	if different.ID == first.ID {
+		t.Fatalf("different instance ID returned worker %s, want a new row", different.ID)
+	}
+
+	params.InstanceID = nil
+	params.ID = uuid.New()
+	legacyA, err := queries.RegisterWorker(t.Context(), params)
+	if err != nil {
+		t.Fatalf("first legacy RegisterWorker() returned an error: %v", err)
+	}
+	params.ID = uuid.New()
+	legacyB, err := queries.RegisterWorker(t.Context(), params)
+	if err != nil {
+		t.Fatalf("second legacy RegisterWorker() returned an error: %v", err)
+	}
+	if legacyA.ID == legacyB.ID {
+		t.Fatalf("legacy registrations returned the same worker ID %s, want distinct rows", legacyA.ID)
+	}
+}
+
+func TestStallWorkerStatusGuard(t *testing.T) {
+	pool := newMigratedTestPool(t)
+	queries := data.New(pool)
+	tests := []struct {
+		name      string
+		status    data.WorkerStatus
+		wantStall bool
+	}{
+		{name: "available", status: data.WorkerStatusAvailable, wantStall: true},
+		{name: "draining", status: data.WorkerStatusDraining},
+		{name: "stalled", status: data.WorkerStatusStalled},
+		{name: "shutting down", status: data.WorkerStatusShuttingDown},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			workerID := uuid.New()
+			_, err := queries.RegisterWorker(t.Context(), data.RegisterWorkerParams{
+				ID:                workerID,
+				Address:           "ws://worker-" + workerID.String() + ":3000",
+				Browser:           "chromium",
+				PlaywrightVersion: "1.62.1",
+				MaxSlots:          1,
+				Status:            test.status,
+			})
+			if err != nil {
+				t.Fatalf("RegisterWorker() returned an error: %v", err)
+			}
+			stalled, err := queries.StallWorker(t.Context(), workerID)
+			if test.wantStall {
+				if err != nil {
+					t.Fatalf("StallWorker() returned an error: %v", err)
+				}
+				if stalled.Status != data.WorkerStatusStalled {
+					t.Fatalf("StallWorker().Status = %q, want %q", stalled.Status, data.WorkerStatusStalled)
+				}
+				return
+			}
+			if !errors.Is(err, pgx.ErrNoRows) {
+				t.Fatalf("StallWorker() error = %v, want %v", err, pgx.ErrNoRows)
+			}
+			stored, err := queries.GetWorker(t.Context(), workerID)
+			if err != nil {
+				t.Fatalf("GetWorker() returned an error: %v", err)
+			}
+			if stored.Status != test.status {
+				t.Fatalf("stored worker status = %q, want unchanged %q", stored.Status, test.status)
+			}
+		})
+	}
+}
+
 func TestEnumConstraints(t *testing.T) {
 	pool := newMigratedTestPool(t)
 	queries := data.New(pool)

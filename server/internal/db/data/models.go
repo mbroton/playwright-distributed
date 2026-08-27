@@ -181,4 +181,5 @@ type Worker struct {
 	LastHeartbeat     time.Time
 	LifetimeSessions  int64
 	CreatedAt         time.Time
+	InstanceID        *uuid.UUID
 }

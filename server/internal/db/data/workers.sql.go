@@ -170,7 +170,7 @@ func (q *Queries) GetCapacityByBrowser(ctx context.Context, arg GetCapacityByBro
 }
 
 const getWorker = `-- name: GetWorker :one
-SELECT id, address, browser, playwright_version, max_slots, status, last_heartbeat, lifetime_sessions, created_at
+SELECT id, address, browser, playwright_version, max_slots, status, last_heartbeat, lifetime_sessions, created_at, instance_id
 FROM workers
 WHERE id = $1
 `
@@ -188,6 +188,7 @@ func (q *Queries) GetWorker(ctx context.Context, id uuid.UUID) (Worker, error) {
 		&i.LastHeartbeat,
 		&i.LifetimeSessions,
 		&i.CreatedAt,
+		&i.InstanceID,
 	)
 	return i, err
 }
@@ -196,7 +197,7 @@ const incrementWorkerLifetimeSessions = `-- name: IncrementWorkerLifetimeSession
 UPDATE workers
 SET lifetime_sessions = lifetime_sessions + 1
 WHERE id = $1
-RETURNING id, address, browser, playwright_version, max_slots, status, last_heartbeat, lifetime_sessions, created_at
+RETURNING id, address, browser, playwright_version, max_slots, status, last_heartbeat, lifetime_sessions, created_at, instance_id
 `
 
 func (q *Queries) IncrementWorkerLifetimeSessions(ctx context.Context, id uuid.UUID) (Worker, error) {
@@ -212,12 +213,13 @@ func (q *Queries) IncrementWorkerLifetimeSessions(ctx context.Context, id uuid.U
 		&i.LastHeartbeat,
 		&i.LifetimeSessions,
 		&i.CreatedAt,
+		&i.InstanceID,
 	)
 	return i, err
 }
 
 const listWorkers = `-- name: ListWorkers :many
-SELECT id, address, browser, playwright_version, max_slots, status, last_heartbeat, lifetime_sessions, created_at
+SELECT id, address, browser, playwright_version, max_slots, status, last_heartbeat, lifetime_sessions, created_at, instance_id
 FROM workers
 ORDER BY created_at, id
 `
@@ -241,6 +243,7 @@ func (q *Queries) ListWorkers(ctx context.Context) ([]Worker, error) {
 			&i.LastHeartbeat,
 			&i.LifetimeSessions,
 			&i.CreatedAt,
+			&i.InstanceID,
 		); err != nil {
 			return nil, err
 		}
@@ -261,6 +264,36 @@ func (q *Queries) NotifyCapacityChanged(ctx context.Context) error {
 	return err
 }
 
+const recycleWorker = `-- name: RecycleWorker :one
+UPDATE workers
+SET lifetime_sessions = 0,
+    status = 'available',
+    last_heartbeat = now()
+WHERE id = $1
+  AND status IN ('available', 'draining', 'stalled')
+RETURNING id, address, browser, playwright_version, max_slots, status, last_heartbeat, lifetime_sessions, created_at, instance_id
+`
+
+// This predicate is load-bearing. A recycle may restore only workers that
+// have no shutdown intent; it must never revive a shutting-down worker.
+func (q *Queries) RecycleWorker(ctx context.Context, id uuid.UUID) (Worker, error) {
+	row := q.db.QueryRow(ctx, recycleWorker, id)
+	var i Worker
+	err := row.Scan(
+		&i.ID,
+		&i.Address,
+		&i.Browser,
+		&i.PlaywrightVersion,
+		&i.MaxSlots,
+		&i.Status,
+		&i.LastHeartbeat,
+		&i.LifetimeSessions,
+		&i.CreatedAt,
+		&i.InstanceID,
+	)
+	return i, err
+}
+
 const registerWorker = `-- name: RegisterWorker :one
 INSERT INTO workers (
     id,
@@ -269,11 +302,30 @@ INSERT INTO workers (
     playwright_version,
     max_slots,
     status,
-    last_heartbeat
+    last_heartbeat,
+    instance_id
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, now()
+    $1,
+    $2,
+    $3,
+    $4,
+    $5,
+    $6,
+    now(),
+    $7
 )
-RETURNING id, address, browser, playwright_version, max_slots, status, last_heartbeat, lifetime_sessions, created_at
+ON CONFLICT (instance_id) DO UPDATE
+SET address = EXCLUDED.address,
+    browser = EXCLUDED.browser,
+    playwright_version = EXCLUDED.playwright_version,
+    max_slots = EXCLUDED.max_slots,
+    -- Registration retries must never overwrite drain or shutdown intent.
+    status = CASE
+        WHEN workers.status IN ('draining', 'shutting_down') THEN workers.status
+        ELSE EXCLUDED.status
+    END,
+    last_heartbeat = now()
+RETURNING id, address, browser, playwright_version, max_slots, status, last_heartbeat, lifetime_sessions, created_at, instance_id
 `
 
 type RegisterWorkerParams struct {
@@ -283,6 +335,7 @@ type RegisterWorkerParams struct {
 	PlaywrightVersion string
 	MaxSlots          int32
 	Status            WorkerStatus
+	InstanceID        *uuid.UUID
 }
 
 func (q *Queries) RegisterWorker(ctx context.Context, arg RegisterWorkerParams) (Worker, error) {
@@ -293,6 +346,7 @@ func (q *Queries) RegisterWorker(ctx context.Context, arg RegisterWorkerParams) 
 		arg.PlaywrightVersion,
 		arg.MaxSlots,
 		arg.Status,
+		arg.InstanceID,
 	)
 	var i Worker
 	err := row.Scan(
@@ -305,12 +359,13 @@ func (q *Queries) RegisterWorker(ctx context.Context, arg RegisterWorkerParams) 
 		&i.LastHeartbeat,
 		&i.LifetimeSessions,
 		&i.CreatedAt,
+		&i.InstanceID,
 	)
 	return i, err
 }
 
 const selectClaimableWorker = `-- name: SelectClaimableWorker :one
-SELECT w.id, w.address, w.browser, w.playwright_version, w.max_slots, w.status, w.last_heartbeat, w.lifetime_sessions, w.created_at
+SELECT w.id, w.address, w.browser, w.playwright_version, w.max_slots, w.status, w.last_heartbeat, w.lifetime_sessions, w.created_at, w.instance_id
 FROM workers AS w
 CROSS JOIN LATERAL (
     SELECT count(*) AS active_count
@@ -362,6 +417,7 @@ func (q *Queries) SelectClaimableWorker(ctx context.Context, arg SelectClaimable
 		&i.LastHeartbeat,
 		&i.LifetimeSessions,
 		&i.CreatedAt,
+		&i.InstanceID,
 	)
 	return i, err
 }
@@ -377,7 +433,7 @@ WHERE id = $2
           AND status IN ('available', 'draining', 'stalled', 'shutting_down')
       )
   )
-RETURNING id, address, browser, playwright_version, max_slots, status, last_heartbeat, lifetime_sessions, created_at
+RETURNING id, address, browser, playwright_version, max_slots, status, last_heartbeat, lifetime_sessions, created_at, instance_id
 `
 
 type SetWorkerStatusParams struct {
@@ -398,6 +454,7 @@ func (q *Queries) SetWorkerStatus(ctx context.Context, arg SetWorkerStatusParams
 		&i.LastHeartbeat,
 		&i.LifetimeSessions,
 		&i.CreatedAt,
+		&i.InstanceID,
 	)
 	return i, err
 }
@@ -419,6 +476,34 @@ func (q *Queries) StallSilentWorkers(ctx context.Context, workerTtlMicroseconds 
 	return result.RowsAffected(), nil
 }
 
+const stallWorker = `-- name: StallWorker :one
+UPDATE workers
+SET status = 'stalled'
+WHERE id = $1
+  AND status = 'available'
+RETURNING id, address, browser, playwright_version, max_slots, status, last_heartbeat, lifetime_sessions, created_at, instance_id
+`
+
+// This predicate is load-bearing. A failed relay dial may stall only an
+// available worker; it must never overwrite drain or shutdown intent.
+func (q *Queries) StallWorker(ctx context.Context, id uuid.UUID) (Worker, error) {
+	row := q.db.QueryRow(ctx, stallWorker, id)
+	var i Worker
+	err := row.Scan(
+		&i.ID,
+		&i.Address,
+		&i.Browser,
+		&i.PlaywrightVersion,
+		&i.MaxSlots,
+		&i.Status,
+		&i.LastHeartbeat,
+		&i.LifetimeSessions,
+		&i.CreatedAt,
+		&i.InstanceID,
+	)
+	return i, err
+}
+
 const updateWorkerHeartbeat = `-- name: UpdateWorkerHeartbeat :one
 UPDATE workers
 SET last_heartbeat = now(),
@@ -429,7 +514,7 @@ SET last_heartbeat = now(),
         ELSE status
     END
 WHERE id = $1
-RETURNING id, address, browser, playwright_version, max_slots, status, last_heartbeat, lifetime_sessions, created_at
+RETURNING id, address, browser, playwright_version, max_slots, status, last_heartbeat, lifetime_sessions, created_at, instance_id
 `
 
 func (q *Queries) UpdateWorkerHeartbeat(ctx context.Context, id uuid.UUID) (Worker, error) {
@@ -445,6 +530,7 @@ func (q *Queries) UpdateWorkerHeartbeat(ctx context.Context, id uuid.UUID) (Work
 		&i.LastHeartbeat,
 		&i.LifetimeSessions,
 		&i.CreatedAt,
+		&i.InstanceID,
 	)
 	return i, err
 }

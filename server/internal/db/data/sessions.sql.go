@@ -407,6 +407,52 @@ func (q *Queries) ListStaleWorkerSessionIDs(ctx context.Context, arg ListStaleWo
 	return items, nil
 }
 
+const reassignRunningSession = `-- name: ReassignRunningSession :one
+UPDATE sessions
+SET worker_id = $1,
+    playwright_version = $2,
+    worker_address = $3
+WHERE id = $4
+  AND status = 'running'
+RETURNING id, worker_id, browser, playwright_version, worker_address, mode, status, created_by_key, created_at, started_at, expires_at, last_heartbeat, keep_alive_ms, connect_metadata
+`
+
+type ReassignRunningSessionParams struct {
+	WorkerID          uuid.UUID
+	PlaywrightVersion string
+	WorkerAddress     string
+	ID                uuid.UUID
+}
+
+// This predicate is load-bearing. The relay starts a session before it dials;
+// reassignment must never revive or move a session that has since ended.
+func (q *Queries) ReassignRunningSession(ctx context.Context, arg ReassignRunningSessionParams) (Session, error) {
+	row := q.db.QueryRow(ctx, reassignRunningSession,
+		arg.WorkerID,
+		arg.PlaywrightVersion,
+		arg.WorkerAddress,
+		arg.ID,
+	)
+	var i Session
+	err := row.Scan(
+		&i.ID,
+		&i.WorkerID,
+		&i.Browser,
+		&i.PlaywrightVersion,
+		&i.WorkerAddress,
+		&i.Mode,
+		&i.Status,
+		&i.CreatedByKey,
+		&i.CreatedAt,
+		&i.StartedAt,
+		&i.ExpiresAt,
+		&i.LastHeartbeat,
+		&i.KeepAliveMs,
+		&i.ConnectMetadata,
+	)
+	return i, err
+}
+
 const renewSessionHeartbeat = `-- name: RenewSessionHeartbeat :one
 UPDATE sessions
 SET last_heartbeat = now()

@@ -186,7 +186,7 @@ func (h *relayHandler) attach(w http.ResponseWriter, request *http.Request, sess
 		return
 	}
 
-	worker, err := h.dialWorker(request, session)
+	worker, err := h.dialWorkerWithRetry(request, session)
 	if err != nil {
 		h.failSession(session.ID)
 		h.logger.Warn("dial session worker", "session_id", session.ID, "error", err)
@@ -216,9 +216,45 @@ func (h *relayHandler) attach(w http.ResponseWriter, request *http.Request, sess
 	}
 }
 
-func (h *relayHandler) dialWorker(request *http.Request, session data.Session) (*websocket.Conn, error) {
+func (h *relayHandler) dialWorkerWithRetry(
+	request *http.Request,
+	session data.Session,
+) (*websocket.Conn, error) {
 	dialCtx, cancel := context.WithTimeout(request.Context(), h.dialTimeout)
 	defer cancel()
+	excludedWorkerIDs := []uuid.UUID{}
+	dialErrors := []error{}
+	for attempt := range 2 {
+		worker, err := h.dialWorker(dialCtx, request, session)
+		if err == nil {
+			return worker, nil
+		}
+		dialErrors = append(dialErrors, fmt.Errorf("worker %s: %w", session.WorkerID, err))
+		excludedWorkerIDs = append(excludedWorkerIDs, session.WorkerID)
+
+		if _, stallErr := h.queries.StallWorker(request.Context(), session.WorkerID); stallErr != nil &&
+			!errors.Is(stallErr, pgx.ErrNoRows) {
+			dialErrors = append(dialErrors, fmt.Errorf("stalling failed worker: %w", stallErr))
+			return nil, errors.Join(dialErrors...)
+		}
+		if attempt == 1 || h.scheduler == nil {
+			break
+		}
+		session, err = h.scheduler.Reassign(dialCtx, session.ID, excludedWorkerIDs)
+		if err != nil {
+			dialErrors = append(dialErrors, fmt.Errorf("reassigning session: %w", err))
+			return nil, errors.Join(dialErrors...)
+		}
+	}
+
+	return nil, errors.Join(dialErrors...)
+}
+
+func (h *relayHandler) dialWorker(
+	ctx context.Context,
+	request *http.Request,
+	session data.Session,
+) (*websocket.Conn, error) {
 	headers := make(http.Header)
 	if userAgent := request.UserAgent(); userAgent != "" {
 		headers.Set("User-Agent", userAgent)
@@ -237,7 +273,7 @@ func (h *relayHandler) dialWorker(request *http.Request, session data.Session) (
 	}
 	headers.Set("x-pwd-session-id", session.ID.String())
 	dialer := websocket.Dialer{HandshakeTimeout: h.dialTimeout}
-	connection, response, err := dialer.DialContext(dialCtx, session.WorkerAddress, headers)
+	connection, response, err := dialer.DialContext(ctx, session.WorkerAddress, headers)
 	if response != nil && response.Body != nil {
 		_ = response.Body.Close()
 	}

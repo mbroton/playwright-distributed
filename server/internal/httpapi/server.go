@@ -27,6 +27,8 @@ const (
 	maxConnectMetadataSize = 8 * 1024
 )
 
+var errWorkerRecycleConflict = errors.New("worker status prevents recycling")
+
 type Server struct {
 	Handler http.Handler
 	API     huma.API
@@ -351,10 +353,11 @@ func registerWorkerRoutes(
 ) {
 	type registerWorkerInput struct {
 		Body struct {
-			Address           string `json:"address" format:"uri" pattern:"^wss?://[^\\s/?#]+" maxLength:"512"`
-			Browser           string `json:"browser" enum:"chromium,firefox,webkit"`
-			PlaywrightVersion string `json:"playwright_version" pattern:"^[0-9]+\\.[0-9]+\\.[0-9]+" minLength:"1" maxLength:"64"`
-			MaxSlots          int32  `json:"max_slots" minimum:"1" maximum:"1024"`
+			Address           string     `json:"address" format:"uri" pattern:"^wss?://[^\\s/?#]+" maxLength:"512"`
+			Browser           string     `json:"browser" enum:"chromium,firefox,webkit"`
+			PlaywrightVersion string     `json:"playwright_version" pattern:"^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$" minLength:"1" maxLength:"64"`
+			MaxSlots          int32      `json:"max_slots" minimum:"1" maximum:"1024"`
+			InstanceID        *uuid.UUID `json:"instance_id,omitempty" format:"uuid"`
 		}
 	}
 	type registeredWorker struct {
@@ -394,9 +397,46 @@ func registerWorkerRoutes(
 			PlaywrightVersion: input.Body.PlaywrightVersion,
 			MaxSlots:          input.Body.MaxSlots,
 			Status:            data.WorkerStatusAvailable,
+			InstanceID:        input.Body.InstanceID,
 		})
 		if err != nil {
 			return nil, internalError(logger, "register worker", err)
+		}
+		budget := int64(0)
+		if sessionScheduler != nil {
+			budget = sessionScheduler.MaxLifetimeSessions()
+		}
+		return &registerOutput{Body: registeredWorker{
+			Worker:              workerFromData(worker),
+			MaxLifetimeSessions: budget,
+		}}, nil
+	})
+
+	type recycleWorkerInput struct {
+		ID uuid.UUID `path:"id" format:"uuid" doc:"Worker ID"`
+	}
+	huma.Register(api, huma.Operation{
+		OperationID: "recycle-worker",
+		Method:      http.MethodPost,
+		Path:        "/workers/{id}/recycle",
+		Summary:     "Recycle a worker",
+		Tags:        []string{"Workers"},
+		Errors: []int{
+			http.StatusConflict,
+			http.StatusNotFound,
+			http.StatusUnauthorized,
+			http.StatusServiceUnavailable,
+		},
+	}, func(ctx context.Context, input *recycleWorkerInput) (*registerOutput, error) {
+		worker, err := recycleWorker(ctx, pool, queries, input.ID)
+		if errors.Is(err, errWorkerRecycleConflict) {
+			return nil, huma.Error409Conflict("worker status prevents recycling")
+		}
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, huma.Error404NotFound("worker not found")
+		}
+		if err != nil {
+			return nil, internalError(logger, "recycle worker", err)
 		}
 		budget := int64(0)
 		if sessionScheduler != nil {
@@ -524,6 +564,40 @@ func registerWorker(
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return data.Worker{}, fmt.Errorf("committing worker registration: %w", err)
+	}
+	return worker, nil
+}
+
+func recycleWorker(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	queries *data.Queries,
+	workerID uuid.UUID,
+) (_ data.Worker, err error) {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return data.Worker{}, fmt.Errorf("beginning worker recycle: %w", err)
+	}
+	defer rollbackTransaction(ctx, tx, &err)
+	txQueries := queries.WithTx(tx)
+
+	worker, err := txQueries.RecycleWorker(ctx, workerID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if _, getErr := txQueries.GetWorker(ctx, workerID); errors.Is(getErr, pgx.ErrNoRows) {
+			return data.Worker{}, fmt.Errorf("recycling worker: %w", err)
+		} else if getErr != nil {
+			return data.Worker{}, fmt.Errorf("getting worker after rejected recycle: %w", getErr)
+		}
+		return data.Worker{}, fmt.Errorf("recycling worker: %w", errWorkerRecycleConflict)
+	}
+	if err != nil {
+		return data.Worker{}, fmt.Errorf("recycling worker: %w", err)
+	}
+	if err := txQueries.NotifyCapacityChanged(ctx); err != nil {
+		return data.Worker{}, fmt.Errorf("notifying recycled worker capacity: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return data.Worker{}, fmt.Errorf("committing worker recycle: %w", err)
 	}
 	return worker, nil
 }

@@ -108,6 +108,7 @@ export type HeartbeatOutputBody = {
 export type RegisterWorkerInputBody = {
     address: string;
     browser: 'chromium' | 'firefox' | 'webkit';
+    instance_id?: string;
     max_slots: number;
     playwright_version: string;
 };
@@ -270,6 +271,56 @@ export type HeartbeatWorkerResponses = {
 };
 
 export type HeartbeatWorkerResponse = HeartbeatWorkerResponses[keyof HeartbeatWorkerResponses];
+
+export type RecycleWorkerData = {
+    body?: never;
+    path: {
+        /**
+         * Worker ID
+         */
+        id: string;
+    };
+    query?: never;
+    url: '/internal/workers/{id}/recycle';
+};
+
+export type RecycleWorkerErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ErrorModel;
+    /**
+     * Not Found
+     */
+    404: ErrorModel;
+    /**
+     * Conflict
+     */
+    409: ErrorModel;
+    /**
+     * Unprocessable Entity
+     */
+    422: ErrorModel;
+    /**
+     * Internal Server Error
+     */
+    500: ErrorModel;
+    /**
+     * Service Unavailable
+     */
+    503: ErrorModel;
+};
+
+export type RecycleWorkerError = RecycleWorkerErrors[keyof RecycleWorkerErrors];
+
+export type RecycleWorkerResponses = {
+    /**
+     * OK
+     */
+    200: RegisteredWorker;
+};
+
+export type RecycleWorkerResponse = RecycleWorkerResponses[keyof RecycleWorkerResponses];
 
 export type SetWorkerStatusData = {
     body: SetStatusInputBody;
