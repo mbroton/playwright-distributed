@@ -27,6 +27,7 @@ grid's problem, not your code's.
 
 ```bash
 curl -LO https://raw.githubusercontent.com/mbroton/playwright-distributed/main/docker-compose.yaml
+curl --create-dirs -o worker/seccomp_profile.json https://raw.githubusercontent.com/mbroton/playwright-distributed/main/worker/seccomp_profile.json
 docker compose up -d
 ```
 
