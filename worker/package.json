@@ -20,7 +20,7 @@
   },
   "dependencies": {
     "dotenv": "^17.4.2",
-    "playwright-core": "1.62.1",
+    "playwright-core": "1.63.0",
     "tsx": "^4.23.12",
     "ws": "^8.21.3",
     "zod": "^4.4.3"
