@@ -1195,7 +1195,8 @@ func withDSNOption(t *testing.T, dsn, key, value string) string {
 	}
 	query := parsed.Query()
 	query.Set(key, value)
-	parsed.RawQuery = query.Encode()
+	// PostgreSQL connection URIs treat '+' as a literal, so spaces need %20.
+	parsed.RawQuery = strings.ReplaceAll(query.Encode(), "+", "%20")
 	return parsed.String()
 }
 
