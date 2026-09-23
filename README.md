@@ -235,7 +235,7 @@ curl -s localhost:8080/v1/workers                # the whole grid
 # Create a session, then connect to it by ID:
 curl -s -X POST localhost:8080/v1/sessions \
   -H 'Content-Type: application/json' \
-  -d '{"browser": "chromium", "playwright_version": "1.62.1"}'
+  -d '{"browser": "chromium", "playwright_version": "1.63.0"}'
 # -> { "id": "..." }  connect: chromium.connect('ws://localhost:8080/sessions/<id>')
 
 curl -s localhost:8080/v1/sessions/<id>          # inspect it
